@@ -1,0 +1,47 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secret.json
+client_secret*.json
+.google_drive_token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Logs and runtime artifacts
+logs/
+*.log
+
+# Generated reports and outputs
+outputs/
+SEO Weekly Reports/
+*.docx
+
+# Build/distribution
+build/
+dist/
+
+# LangGraph / local graph exports if generated
+*.png
+*.svg

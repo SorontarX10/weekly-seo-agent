@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weekly-seo-agent"
+version = "0.1.0"
+description = "Weekly SEO intelligence agent for GSC + Senuto + external signals"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12.3",
+  "google-api-python-client>=2.160.0",
+  "google-auth>=2.38.0",
+  "google-auth-oauthlib>=1.2.0",
+  "langchain-openai>=0.3.0",
+  "langgraph>=0.2.75",
+  "python-docx>=1.1.2",
+  "python-dotenv>=1.0.1",
+  "requests>=2.32.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.4",
+]
+
+[project.scripts]
+weekly-seo-agent = "weekly_seo_agent.main:main"
+weekly-seo-gsc-token = "weekly_seo_agent.tools.gsc_refresh_token:main"
+weekly-seo-senuto-token = "weekly_seo_agent.tools.senuto_token:main"
+weekly-seo-news-agent = "weekly_seo_agent.news_agent:main"
+weekly-seo-gmail-token = "weekly_seo_agent.tools.gmail_refresh_token:main"
+weekly-people-manager-agent = "weekly_seo_agent.people_manager_agent:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.setuptools]
+packages = [
+  "weekly_seo_agent",
+  "weekly_seo_agent.clients",
+  "weekly_seo_agent.tools",
+]
