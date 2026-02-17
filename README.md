@@ -5,6 +5,9 @@ Tygodniowy agent SEO (LangGraph + GAIA), ktory analizuje:
 Pelna dokumentacja architektury i odtworzenia projektu:
 `docs/PROJECT_DOCUMENTATION.md`
 
+Szybki onboarding tylko dla agenta raportowania tygodniowego (share-ready):
+`agents/weekly-reporting-agent/README.md`
+
 1. GSC: `poprzedni pelny tydzien (pon-nd)`, `tydzien wczesniej`, `YoY = 52 tygodnie wstecz (te same dni tygodnia)`.
 2. Senuto visibility.
 3. Sygnaly zewnetrzne: pogoda, swieta/ferie (OpenHolidays API), status Google, scraping newsow per rynek + global.
