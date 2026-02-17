@@ -226,6 +226,12 @@ def main() -> None:
                 f"{uploaded.get('name')} | {uploaded.get('webViewLink', 'no-link')}"
             )
 
+    if not successful_runs:
+        raise SystemExit(
+            "Run failed: no country report was generated. "
+            "Check credentials/secrets and country-level errors above."
+        )
+
     if failed_countries:
         print("Run finished with country-level failures:")
         for code, message in failed_countries:

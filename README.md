@@ -206,6 +206,7 @@ Opcjonalne sekrety na pliki credentials (JSON content, nie sciezka):
 - `GSC_CREDENTIALS_JSON`
 - `GSC_OAUTH_CLIENT_SECRET_JSON`
 - `GOOGLE_DRIVE_CLIENT_SECRET_JSON`
+- `GOOGLE_DRIVE_TOKEN_JSON` (OAuth token cache; potrzebne, jesli Drive działa na OAuth bez interaktywnego logowania)
 
 Jesli ustawione, workflow odtworzy je do `.secrets/*.json` i nadpisze odpowiednie zmienne path przez `GITHUB_ENV`.
 
