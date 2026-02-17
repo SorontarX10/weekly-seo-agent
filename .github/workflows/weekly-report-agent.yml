@@ -44,7 +44,6 @@ jobs:
         env:
           GSC_CREDENTIALS_JSON: ${{ secrets.GSC_CREDENTIALS_JSON }}
           GSC_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GSC_OAUTH_CLIENT_SECRET_JSON }}
-          GA4_CREDENTIALS_JSON: ${{ secrets.GA4_CREDENTIALS_JSON }}
           GOOGLE_DRIVE_CLIENT_SECRET_JSON: ${{ secrets.GOOGLE_DRIVE_CLIENT_SECRET_JSON }}
         run: |
           mkdir -p .secrets
@@ -57,11 +56,6 @@ jobs:
           if [ -n "$GSC_OAUTH_CLIENT_SECRET_JSON" ]; then
             printf "%s" "$GSC_OAUTH_CLIENT_SECRET_JSON" > .secrets/gsc_oauth_client_secret.json
             echo "GSC_OAUTH_CLIENT_SECRET_PATH=.secrets/gsc_oauth_client_secret.json" >> "$GITHUB_ENV"
-          fi
-
-          if [ -n "$GA4_CREDENTIALS_JSON" ]; then
-            printf "%s" "$GA4_CREDENTIALS_JSON" > .secrets/ga4_credentials.json
-            echo "GA4_CREDENTIALS_PATH=.secrets/ga4_credentials.json" >> "$GITHUB_ENV"
           fi
 
           if [ -n "$GOOGLE_DRIVE_CLIENT_SECRET_JSON" ]; then

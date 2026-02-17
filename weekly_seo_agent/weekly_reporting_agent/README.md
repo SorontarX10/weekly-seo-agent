@@ -6,7 +6,7 @@ Możesz go wysłać komuś jako "tu jest agent + co robi + jak uruchomić".
 ## 1) Co robi ten agent
 
 Agent:
-- pobiera dane z GSC, Senuto, GA4, pogody, newsów, eventów i innych źródeł,
+- pobiera dane z GSC, Senuto, pogody, newsów, eventów i innych źródeł,
 - buduje raport tygodniowy (Executive Summary + analiza przyczynowa + driver scoreboard),
 - zapisuje raport lokalnie jako `.docx`,
 - opcjonalnie publikuje raport na Google Drive jako **Google Doc**.

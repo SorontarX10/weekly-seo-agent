@@ -12,7 +12,6 @@ flowchart TD
 
     C --> D1[GSC API]
     C --> D2[Senuto API]
-    C --> D3[GA4 API]
     C --> D4[Weather / Holidays / Events / News]
     C --> D5[Google Trends / CrUX / FX / Trade Plan]
     C --> D6[Allegro Trends API optional]
@@ -43,7 +42,7 @@ flowchart TD
   - Converts markdown-like content into DOCX.
 
 - `weekly_seo_agent/weekly_reporting_agent/clients/*`
-  - API integrations (GSC, Senuto, GA4, Drive, Trends, external signals, etc.).
+  - API integrations (GSC, Senuto, Drive, Trends, external signals, etc.).
 
 - `weekly_seo_agent/weekly_reporting_agent/config.py`
   - Centralized `.env` parsing and feature flags.

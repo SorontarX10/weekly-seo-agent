@@ -22,7 +22,7 @@ Szybki onboarding tylko dla agenta raportowania tygodniowego (share-ready):
 12. Dodaje trendy produktowe non-brand z Google Sheets: top trendy YoY (ten rok vs poprzedni), top current trends i top upcoming 31 dni.
 13. Dodaje analize akcji promocyjnych marketplace: Allegro (np. Black Week, Smart Week, Allegro Days, Megaraty) vs konkurencja.
 14. Dodaje modul Senuto competitor intelligence: competitor radar, content gap, keyword movers, acquired/lost, direct answers, seasonality, market ranking, trending keywords, SERP volatility.
-15. Dodaje GA4 (country-sliced) do raportu: sessions/users/transactions/revenue + top landing pages.
+15. Dodaje wielorynkowe raportowanie per kraj (`PL`, `CZ`, `SK`, `HU`) w jednym uruchomieniu.
 16. Generuje oddzielne raporty per kraj (`PL`, `CZ`, `SK`, `HU`) w jednym uruchomieniu.
 17. Dodaje kalendarz wydarzen rynkowych per kraj z API (`GDELT DOC API`) i ocene potencjalnego wplywu na GMV.
 18. Opcjonalnie dodaje sygnaly popytu z Allegro Trends API (VISIT/PV/OFFERS/GMV/DEALS) dla top mover queries.
@@ -82,14 +82,7 @@ W `.env` musisz miec:
 - `REPORT_COUNTRIES="PL,CZ,SK,HU"`
 - (opcjonalnie pojedynczy run) `REPORT_COUNTRY_CODE=PL`
 
-5. GA4:
-- `GA4_ENABLED=true`
-- `GA4_PROPERTY_ID=<fallback property id>`
-- `GA4_PROPERTY_ID_MAP="PL:<id>,CZ:<id>,SK:<id>,HU:<id>"` (recommended for multi-country runs)
-- `GA4_CREDENTIALS_PATH=secret.json` (service account z dostepem do property)
-- Service account musi miec co najmniej role `Viewer` / `Analyst` na kazdej property (PL/CZ/SK/HU) w GA4 Admin.
-
-6. Allegro Trends API (opcjonalnie):
+5. Allegro Trends API (opcjonalnie):
 - `ALLEGRO_TRENDS_ENABLED=true`
 - `ALLEGRO_TRENDS_BASIC_AUTH_LOGIN=search-trends-ui`
 - `ALLEGRO_TRENDS_BASIC_AUTH_PASSWORD=<basic auth password>`
@@ -98,14 +91,14 @@ W `.env` musisz miec:
 - Opcjonalnie: `ALLEGRO_TRENDS_INTERVAL=day`, `ALLEGRO_TRENDS_MEASURES="VISIT,PV,OFFERS,GMV,DEALS"`, `ALLEGRO_TRENDS_TOP_ROWS=10`
 - Raport pokazuje sekcje `Allegro Trends API (marketplace demand)` z metrykami dla top query movers.
 
-7. Holidays/Ferie source:
+6. Holidays/Ferie source:
 - `HOLIDAYS_COUNTRY_CODE=PL`
 - `HOLIDAYS_COUNTRY_CODE_MAP="PL:PL,CZ:CZ,SK:SK,HU:HU"`
 - `HOLIDAYS_API_BASE_URL=https://openholidaysapi.org`
 - `HOLIDAYS_LANGUAGE_CODE=PL`
 - `HOLIDAYS_LANGUAGE_CODE_MAP="PL:PL,CZ:CS,SK:SK,HU:HU"`
 
-8. Dodatkowe zrodla:
+7. Dodatkowe zrodla:
 - `PAGESPEED_API_KEY` (zalecany: aktywuj `Chrome UX Report API` i `PageSpeed Insights API` w Google Cloud; bez klucza mozliwe limity 429)
 - `GOOGLE_TRENDS_RSS_URL=https://trends.google.com/trending/rss?geo=PL`
 - `GOOGLE_TRENDS_RSS_URL_MAP="PL:...,CZ:...,SK:...,HU:..."`
@@ -116,7 +109,7 @@ W `.env` musisz miec:
 - `NBP_API_BASE_URL=https://api.nbp.pl/api`
 - `IMGW_WARNINGS_URL=https://danepubliczne.imgw.pl/api/data/warningsmeteo`
 
-9. Google Drive / Google Docs:
+8. Google Drive / Google Docs:
 - `GOOGLE_DRIVE_ENABLED=true`
 - `GOOGLE_DRIVE_CLIENT_SECRET_PATH=client_secret_*.json` (OAuth client)
 - `GOOGLE_DRIVE_TOKEN_PATH=.google_drive_token.json`
@@ -212,7 +205,6 @@ Workflow zapisuje ten sekret do lokalnego `.env` w runtime i uruchamia agenta.
 Opcjonalne sekrety na pliki credentials (JSON content, nie sciezka):
 - `GSC_CREDENTIALS_JSON`
 - `GSC_OAUTH_CLIENT_SECRET_JSON`
-- `GA4_CREDENTIALS_JSON`
 - `GOOGLE_DRIVE_CLIENT_SECRET_JSON`
 
 Jesli ustawione, workflow odtworzy je do `.secrets/*.json` i nadpisze odpowiednie zmienne path przez `GITHUB_ENV`.

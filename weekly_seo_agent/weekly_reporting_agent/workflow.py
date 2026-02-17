@@ -18,7 +18,6 @@ from weekly_seo_agent.weekly_reporting_agent.analysis import analyze_rows, summa
 from weekly_seo_agent.weekly_reporting_agent.additional_context import collect_additional_context
 from weekly_seo_agent.weekly_reporting_agent.clients.allegro_trends_client import AllegroTrendsClient
 from weekly_seo_agent.weekly_reporting_agent.clients.external_signals import ExternalSignalsClient
-from weekly_seo_agent.weekly_reporting_agent.clients.ga4_client import GA4Client
 from weekly_seo_agent.weekly_reporting_agent.clients.gsc_client import GSCClient
 from weekly_seo_agent.weekly_reporting_agent.clients.senuto_client import SenutoClient
 from weekly_seo_agent.weekly_reporting_agent.config import AgentConfig
@@ -1792,62 +1791,6 @@ def _allegro_trends_candidate_queries(
     return out
 
 
-def _ga4_metric_available(
-    metric: str,
-    *summaries: object,
-) -> bool:
-    for summary in summaries:
-        value = getattr(summary, metric, None)
-        if value is None:
-            return False
-    return True
-
-
-def _ga4_channel_yoy_deltas(
-    current_rows: list[dict[str, object]],
-    yoy_rows: list[dict[str, object]],
-    top_rows: int,
-) -> list[dict[str, object]]:
-    def as_float(value: object) -> float:
-        try:
-            if value is None:
-                return 0.0
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
-
-    current_map = {
-        str(row.get("channel", "")).strip(): row
-        for row in current_rows
-        if isinstance(row, dict) and str(row.get("channel", "")).strip()
-    }
-    yoy_map = {
-        str(row.get("channel", "")).strip(): row
-        for row in yoy_rows
-        if isinstance(row, dict) and str(row.get("channel", "")).strip()
-    }
-    all_channels = set(current_map.keys()).union(yoy_map.keys())
-    rows: list[dict[str, object]] = []
-    for channel in all_channels:
-        current = current_map.get(channel, {})
-        yoy = yoy_map.get(channel, {})
-        sessions_current = as_float(current.get("sessions"))
-        sessions_yoy = as_float(yoy.get("sessions"))
-        delta = sessions_current - sessions_yoy
-        delta_pct = (delta / sessions_yoy * 100.0) if sessions_yoy else None
-        rows.append(
-            {
-                "channel": channel,
-                "sessions_current": sessions_current,
-                "sessions_yoy": sessions_yoy,
-                "delta_vs_yoy": delta,
-                "delta_vs_yoy_pct": delta_pct,
-            }
-        )
-    rows.sort(key=lambda row: abs(float(row.get("delta_vs_yoy", 0.0) or 0.0)), reverse=True)
-    return rows[: max(1, int(top_rows))]
-
-
 def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     run_date = state["run_date"]
     config = state["config"]
@@ -2422,137 +2365,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
             }
     additional_context["allegro_trends"] = allegro_trends_context
 
-    ga4_context: dict[str, object] = {"enabled": False, "errors": []}
-    if config.ga4_reporting_enabled:
-        try:
-            ga4_client = GA4Client(
-                property_id=config.ga4_property_id,
-                credentials_path=config.ga4_credentials_path,
-                country_code=config.report_country_code,
-            )
-            ga4_current = ga4_client.fetch_summary(current_window)
-            ga4_previous = ga4_client.fetch_summary(previous_window)
-            ga4_yoy = ga4_client.fetch_summary(yoy_window)
-            ga4_pages = ga4_client.fetch_top_landing_pages(
-                current_window,
-                limit=max(1, config.ga4_top_rows),
-            )
-            ga4_channels_current = ga4_client.fetch_channel_performance(
-                current_window,
-                limit=max(1, config.ga4_top_rows),
-            )
-            ga4_channels_yoy = ga4_client.fetch_channel_performance(
-                yoy_window,
-                limit=max(1, config.ga4_top_rows),
-            )
-            ga4_channel_yoy = _ga4_channel_yoy_deltas(
-                ga4_channels_current,
-                ga4_channels_yoy,
-                top_rows=max(1, config.ga4_top_rows),
-            )
-            metric_availability = {
-                "sessions": _ga4_metric_available("sessions", ga4_current, ga4_previous, ga4_yoy),
-                "users": _ga4_metric_available("users", ga4_current, ga4_previous, ga4_yoy),
-                "engaged_sessions": _ga4_metric_available(
-                    "engaged_sessions", ga4_current, ga4_previous, ga4_yoy
-                ),
-                "transactions": _ga4_metric_available(
-                    "transactions", ga4_current, ga4_previous, ga4_yoy
-                ),
-                "revenue": _ga4_metric_available("revenue", ga4_current, ga4_previous, ga4_yoy),
-            }
-            ga4_errors: list[str] = []
-            missing_metrics = [
-                metric for metric, available in metric_availability.items() if not available
-            ]
-            if missing_metrics:
-                ga4_errors.append(
-                    "GA4 bug: missing metrics in API response: " + ", ".join(missing_metrics)
-                )
-
-            organic_row = next(
-                (row for row in ga4_channel_yoy if str(row.get("channel", "")).strip() == "Organic Search"),
-                None,
-            )
-            paid_keywords = ("Paid", "Cross-network", "Display", "Affiliates")
-            paid_current = sum(
-                float(row.get("sessions_current", 0.0) or 0.0)
-                for row in ga4_channel_yoy
-                if any(token in str(row.get("channel", "")) for token in paid_keywords)
-            )
-            paid_yoy = sum(
-                float(row.get("sessions_yoy", 0.0) or 0.0)
-                for row in ga4_channel_yoy
-                if any(token in str(row.get("channel", "")) for token in paid_keywords)
-            )
-            paid_delta = paid_current - paid_yoy
-            paid_delta_pct = (paid_delta / paid_yoy * 100.0) if paid_yoy else None
-            organic_delta = float(organic_row.get("delta_vs_yoy", 0.0) or 0.0) if isinstance(organic_row, dict) else 0.0
-            organic_delta_pct = (
-                float(organic_row.get("delta_vs_yoy_pct"))  # type: ignore[arg-type]
-                if isinstance(organic_row, dict) and organic_row.get("delta_vs_yoy_pct") is not None
-                else None
-            )
-            potential_cannibalization = bool(
-                isinstance(organic_row, dict)
-                and organic_delta < 0.0
-                and paid_delta > 0.0
-            )
-            ga4_context = {
-                "enabled": True,
-                "property_id": config.ga4_property_id,
-                "country_code": config.report_country_code,
-                "top_rows": max(1, config.ga4_top_rows),
-                "metric_availability": metric_availability,
-                "summary": {
-                    "current": {
-                        "sessions": ga4_current.sessions,
-                        "users": ga4_current.users,
-                        "engaged_sessions": ga4_current.engaged_sessions,
-                        "transactions": ga4_current.transactions,
-                        "revenue": ga4_current.revenue,
-                    },
-                    "previous": {
-                        "sessions": ga4_previous.sessions,
-                        "users": ga4_previous.users,
-                        "engaged_sessions": ga4_previous.engaged_sessions,
-                        "transactions": ga4_previous.transactions,
-                        "revenue": ga4_previous.revenue,
-                    },
-                    "yoy": {
-                        "sessions": ga4_yoy.sessions,
-                        "users": ga4_yoy.users,
-                        "engaged_sessions": ga4_yoy.engaged_sessions,
-                        "transactions": ga4_yoy.transactions,
-                        "revenue": ga4_yoy.revenue,
-                    },
-                },
-                "top_landing_pages": ga4_pages,
-                "channels": {
-                    "current": ga4_channels_current,
-                    "yoy": ga4_channels_yoy,
-                    "yoy_deltas": ga4_channel_yoy,
-                },
-                "cannibalization": {
-                    "potential": potential_cannibalization,
-                    "organic_delta": organic_delta,
-                    "organic_delta_pct": organic_delta_pct,
-                    "paid_delta": paid_delta,
-                    "paid_delta_pct": paid_delta_pct,
-                    "note": (
-                        "Organic Search down while paid channels up YoY; validate possible channel cannibalization."
-                        if potential_cannibalization
-                        else "No clear paid-vs-organic cannibalization signal in top channel rows."
-                    ),
-                },
-                "errors": ga4_errors,
-            }
-        except Exception as exc:
-            ga4_context = {
-                "enabled": False,
-                "errors": [str(exc)],
-            }
-    additional_context["ga4"] = ga4_context
+    # GA4 integration removed from weekly reporting workflow.
 
     query_current = gsc.fetch_rows(current_window, dimensions=("query",))
     query_previous = gsc.fetch_rows(previous_window, dimensions=("query",))

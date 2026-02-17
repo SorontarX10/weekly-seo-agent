@@ -77,10 +77,6 @@ def _build_country_config(config: AgentConfig, country_code: str) -> tuple[Agent
     senuto_country_id = config.senuto_country_id_map.get(
         country_code, config.senuto_country_id
     )
-    ga4_property_id = config.ga4_property_id_map.get(
-        country_code,
-        config.ga4_property_id,
-    )
     weather_latitude = config.weather_latitude_map.get(
         country_code,
         config.weather_latitude,
@@ -115,7 +111,6 @@ def _build_country_config(config: AgentConfig, country_code: str) -> tuple[Agent
         gsc_site_url=gsc_site_url,
         gsc_country_filter=gsc_country_filter,
         senuto_country_id=senuto_country_id,
-        ga4_property_id=ga4_property_id,
         weather_latitude=weather_latitude,
         weather_longitude=weather_longitude,
         weather_label=weather_label,
@@ -182,19 +177,6 @@ def main() -> None:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _clear_same_day_outputs(output_dir, run_date, country_codes)
-
-    if config.ga4_enabled:
-        missing_ga4_for = [
-            code
-            for code in country_codes
-            if not config.ga4_property_id_map.get(code) and not config.ga4_property_id
-        ]
-        if missing_ga4_for:
-            print(
-                "GA4 configuration warning: missing GA4 property ID for "
-                + ", ".join(missing_ga4_for)
-                + ". Set GA4_PROPERTY_ID_MAP or GA4_PROPERTY_ID."
-            )
 
     drive_client: GoogleDriveClient | None = None
     if config.google_drive_upload_enabled:
