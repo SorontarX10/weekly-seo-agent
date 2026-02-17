@@ -203,9 +203,11 @@ Wymagany sekret repo:
 Workflow zapisuje ten sekret do lokalnego `.env` w runtime i uruchamia agenta.
 
 Opcjonalne sekrety na pliki credentials (JSON content, nie sciezka):
-- `GSC_CREDENTIALS_JSON`
-- `GSC_OAUTH_CLIENT_SECRET_JSON`
-- `GOOGLE_DRIVE_CLIENT_SECRET_JSON`
+- `GSC_AUTH_CLIENT` (recommended; alias for OAuth client JSON used by GSC/Drive)
+- `SERVICE_ACCOUNT_JSON` (recommended; service account JSON)
+- `GSC_CREDENTIALS_JSON` (legacy)
+- `GSC_OAUTH_CLIENT_SECRET_JSON` (legacy)
+- `GOOGLE_DRIVE_CLIENT_SECRET_JSON` (legacy)
 - `GOOGLE_DRIVE_TOKEN_JSON` (OAuth token cache; potrzebne, jesli Drive działa na OAuth bez interaktywnego logowania)
 
 Jesli ustawione, workflow odtworzy je do `.secrets/*.json` i nadpisze odpowiednie zmienne path przez `GITHUB_ENV`.
