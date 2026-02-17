@@ -6,7 +6,7 @@ Pelna dokumentacja architektury i odtworzenia projektu:
 `docs/PROJECT_DOCUMENTATION.md`
 
 Szybki onboarding tylko dla agenta raportowania tygodniowego (share-ready):
-`agents/weekly-reporting-agent/README.md`
+`weekly_seo_agent/weekly_reporting_agent/README.md`
 
 1. GSC: `poprzedni pelny tydzien (pon-nd)`, `tydzien wczesniej`, `YoY = 52 tygodnie wstecz (te same dni tygodnia)`.
 2. Senuto visibility.
