@@ -1,0 +1,59 @@
+name: Weekly SEO News Agent
+
+on:
+  schedule:
+    # 09:00 Europe/Warsaw with DST-safe gating (runs at 07:00 and 08:00 UTC)
+    - cron: '0 7 * * 1'
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-seo-news-agent
+  cancel-in-progress: false
+
+jobs:
+  run-weekly-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Create .env from secret
+        env:
+          WEEKLY_SEO_ENV: ${{ secrets.WEEKLY_SEO_ENV }}
+        run: |
+          if [ -z "$WEEKLY_SEO_ENV" ]; then
+            echo "Missing required secret: WEEKLY_SEO_ENV"
+            exit 1
+          fi
+          printf "%s" "$WEEKLY_SEO_ENV" > .env
+
+      - name: Time gate (09:00 Europe/Warsaw, Monday)
+        id: gate
+        if: github.event_name == 'schedule'
+        run: |
+          DOW=$(TZ=Europe/Warsaw date +%u)
+          HOUR=$(TZ=Europe/Warsaw date +%H)
+          echo "Local Europe/Warsaw time: $(TZ=Europe/Warsaw date)"
+          if [ "$DOW" = "1" ] && [ "$HOUR" = "09" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run weekly SEO news agent
+        if: github.event_name == 'workflow_dispatch' || steps.gate.outputs.should_run == 'true'
+        run: |
+          weekly-seo-news-agent

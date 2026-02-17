@@ -196,6 +196,19 @@ Run z konkretna data:
 ./scripts/run_report.sh --run-date 2026-02-10
 ```
 
+## GitHub Actions (harmonogram)
+
+Skonfigurowane workflow:
+- `.github/workflows/weekly-report-agent.yml`  
+  Uruchamia `weekly-seo-agent` w kazdy wtorek o `09:00` czasu PL (Europe/Warsaw, CET/CEST-safe).
+- `.github/workflows/weekly-seo-news.yml`  
+  Uruchamia `weekly-seo-news-agent` w kazdy poniedzialek o `09:00` czasu PL (Europe/Warsaw, CET/CEST-safe).
+
+Wymagany sekret repo:
+- `WEEKLY_SEO_ENV` - pelna zawartosc pliku `.env` (multiline secret).
+
+Workflow zapisuje ten sekret do lokalnego `.env` w runtime i uruchamia agenta.
+
 Wynik:
 
 - Generowany jest tylko plik `.docx`.
