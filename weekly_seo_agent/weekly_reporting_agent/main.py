@@ -218,13 +218,25 @@ def main() -> None:
                 print(f"Country run failed: {country_code} | {exc}")
 
     if drive_client is not None:
+        drive_upload_errors: list[str] = []
         for result in successful_runs:
             docx_path = Path(result["docx_path"])
-            uploaded = drive_client.upload_docx_as_google_doc(docx_path)
-            print(
-                "Google Doc created: "
-                f"{uploaded.get('name')} | {uploaded.get('webViewLink', 'no-link')}"
-            )
+            try:
+                uploaded = drive_client.upload_docx_as_google_doc(docx_path)
+                print(
+                    "Google Doc created: "
+                    f"{uploaded.get('name')} | {uploaded.get('webViewLink', 'no-link')}"
+                )
+            except Exception as exc:
+                message = (
+                    f"{result.get('country_code', 'unknown')}: {exc}"
+                )
+                drive_upload_errors.append(message)
+                print(f"Google Drive upload failed: {message}")
+        if drive_upload_errors:
+            print("Google Drive upload completed with errors (local DOCX reports are still generated):")
+            for err in drive_upload_errors:
+                print(f"- {err}")
 
     if not successful_runs:
         raise SystemExit(

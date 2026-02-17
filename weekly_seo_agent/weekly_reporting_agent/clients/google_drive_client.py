@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import webbrowser
 
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
@@ -66,13 +67,33 @@ class GoogleDriveClient:
             creds.refresh(Request())
 
         if not creds or not creds.valid:
+            # GitHub Actions / CI is non-interactive. OAuth browser flow cannot run there.
+            if self._running_in_ci():
+                raise RuntimeError(
+                    "Google Drive OAuth requires a pre-generated token in CI. "
+                    "Provide GOOGLE_DRIVE_TOKEN_JSON (or use service account JSON in "
+                    "GOOGLE_DRIVE_CLIENT_SECRET_PATH with folder access)."
+                )
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(secret_path), self.SCOPES
             )
-            creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+            try:
+                creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+            except webbrowser.Error as exc:
+                raise RuntimeError(
+                    "Unable to start browser for Google OAuth flow. "
+                    "Run locally to create token file first (GOOGLE_DRIVE_TOKEN_PATH), "
+                    "then provide it in CI as GOOGLE_DRIVE_TOKEN_JSON."
+                ) from exc
 
         token_file.write_text(creds.to_json(), encoding="utf-8")
         return creds
+
+    @staticmethod
+    def _running_in_ci() -> bool:
+        import os
+        value = str(os.environ.get("CI", "")).strip().lower()
+        return value in {"1", "true", "yes"}
 
     def _get_service(self):
         if self._service is None:
