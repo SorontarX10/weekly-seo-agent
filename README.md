@@ -209,6 +209,14 @@ Wymagany sekret repo:
 
 Workflow zapisuje ten sekret do lokalnego `.env` w runtime i uruchamia agenta.
 
+Opcjonalne sekrety na pliki credentials (JSON content, nie sciezka):
+- `GSC_CREDENTIALS_JSON`
+- `GSC_OAUTH_CLIENT_SECRET_JSON`
+- `GA4_CREDENTIALS_JSON`
+- `GOOGLE_DRIVE_CLIENT_SECRET_JSON`
+
+Jesli ustawione, workflow odtworzy je do `.secrets/*.json` i nadpisze odpowiednie zmienne path przez `GITHUB_ENV`.
+
 Wynik:
 
 - Generowany jest tylko plik `.docx`.

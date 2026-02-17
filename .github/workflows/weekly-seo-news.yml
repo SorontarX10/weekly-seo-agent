@@ -40,6 +40,35 @@ jobs:
           fi
           printf "%s" "$WEEKLY_SEO_ENV" > .env
 
+      - name: Restore Google credential files from secrets (optional)
+        env:
+          GSC_CREDENTIALS_JSON: ${{ secrets.GSC_CREDENTIALS_JSON }}
+          GSC_OAUTH_CLIENT_SECRET_JSON: ${{ secrets.GSC_OAUTH_CLIENT_SECRET_JSON }}
+          GA4_CREDENTIALS_JSON: ${{ secrets.GA4_CREDENTIALS_JSON }}
+          GOOGLE_DRIVE_CLIENT_SECRET_JSON: ${{ secrets.GOOGLE_DRIVE_CLIENT_SECRET_JSON }}
+        run: |
+          mkdir -p .secrets
+
+          if [ -n "$GSC_CREDENTIALS_JSON" ]; then
+            printf "%s" "$GSC_CREDENTIALS_JSON" > .secrets/gsc_credentials.json
+            echo "GSC_CREDENTIALS_PATH=.secrets/gsc_credentials.json" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "$GSC_OAUTH_CLIENT_SECRET_JSON" ]; then
+            printf "%s" "$GSC_OAUTH_CLIENT_SECRET_JSON" > .secrets/gsc_oauth_client_secret.json
+            echo "GSC_OAUTH_CLIENT_SECRET_PATH=.secrets/gsc_oauth_client_secret.json" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "$GA4_CREDENTIALS_JSON" ]; then
+            printf "%s" "$GA4_CREDENTIALS_JSON" > .secrets/ga4_credentials.json
+            echo "GA4_CREDENTIALS_PATH=.secrets/ga4_credentials.json" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "$GOOGLE_DRIVE_CLIENT_SECRET_JSON" ]; then
+            printf "%s" "$GOOGLE_DRIVE_CLIENT_SECRET_JSON" > .secrets/google_drive_client_secret.json
+            echo "GOOGLE_DRIVE_CLIENT_SECRET_PATH=.secrets/google_drive_client_secret.json" >> "$GITHUB_ENV"
+          fi
+
       - name: Time gate (09:00 Europe/Warsaw, Monday)
         id: gate
         if: github.event_name == 'schedule'
