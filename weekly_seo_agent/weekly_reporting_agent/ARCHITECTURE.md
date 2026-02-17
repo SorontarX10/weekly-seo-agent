@@ -50,6 +50,9 @@ flowchart TD
 
 ## Google Docs write path (exact)
 
+Implementation reference:
+- `weekly_seo_agent/weekly_reporting_agent/clients/google_drive_client.py` (`GoogleDriveClient.upload_docx_as_google_doc`)
+
 1. Workflow returns report text.
 2. `write_docx(...)` creates local `.docx`.
 3. If Drive upload is enabled, `GoogleDriveClient` is initialized.
