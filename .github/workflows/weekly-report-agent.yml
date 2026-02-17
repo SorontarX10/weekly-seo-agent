@@ -48,25 +48,36 @@ jobs:
           GOOGLE_DRIVE_TOKEN_JSON: ${{ secrets.GOOGLE_DRIVE_TOKEN_JSON }}
         run: |
           mkdir -p .secrets
+          set -a
+          source .env
+          set +a
 
           if [ -n "$GSC_CREDENTIALS_JSON" ]; then
-            printf "%s" "$GSC_CREDENTIALS_JSON" > .secrets/gsc_credentials.json
-            echo "GSC_CREDENTIALS_PATH=.secrets/gsc_credentials.json" >> "$GITHUB_ENV"
+            target="${GSC_CREDENTIALS_PATH:-.secrets/gsc_credentials.json}"
+            mkdir -p "$(dirname "$target")"
+            printf "%s" "$GSC_CREDENTIALS_JSON" > "$target"
+            echo "GSC_CREDENTIALS_PATH=$target" >> "$GITHUB_ENV"
           fi
 
           if [ -n "$GSC_OAUTH_CLIENT_SECRET_JSON" ]; then
-            printf "%s" "$GSC_OAUTH_CLIENT_SECRET_JSON" > .secrets/gsc_oauth_client_secret.json
-            echo "GSC_OAUTH_CLIENT_SECRET_PATH=.secrets/gsc_oauth_client_secret.json" >> "$GITHUB_ENV"
+            target="${GSC_OAUTH_CLIENT_SECRET_PATH:-.secrets/gsc_oauth_client_secret.json}"
+            mkdir -p "$(dirname "$target")"
+            printf "%s" "$GSC_OAUTH_CLIENT_SECRET_JSON" > "$target"
+            echo "GSC_OAUTH_CLIENT_SECRET_PATH=$target" >> "$GITHUB_ENV"
           fi
 
           if [ -n "$GOOGLE_DRIVE_CLIENT_SECRET_JSON" ]; then
-            printf "%s" "$GOOGLE_DRIVE_CLIENT_SECRET_JSON" > .secrets/google_drive_client_secret.json
-            echo "GOOGLE_DRIVE_CLIENT_SECRET_PATH=.secrets/google_drive_client_secret.json" >> "$GITHUB_ENV"
+            target="${GOOGLE_DRIVE_CLIENT_SECRET_PATH:-.secrets/google_drive_client_secret.json}"
+            mkdir -p "$(dirname "$target")"
+            printf "%s" "$GOOGLE_DRIVE_CLIENT_SECRET_JSON" > "$target"
+            echo "GOOGLE_DRIVE_CLIENT_SECRET_PATH=$target" >> "$GITHUB_ENV"
           fi
 
           if [ -n "$GOOGLE_DRIVE_TOKEN_JSON" ]; then
-            printf "%s" "$GOOGLE_DRIVE_TOKEN_JSON" > .secrets/google_drive_token.json
-            echo "GOOGLE_DRIVE_TOKEN_PATH=.secrets/google_drive_token.json" >> "$GITHUB_ENV"
+            target="${GOOGLE_DRIVE_TOKEN_PATH:-.secrets/google_drive_token.json}"
+            mkdir -p "$(dirname "$target")"
+            printf "%s" "$GOOGLE_DRIVE_TOKEN_JSON" > "$target"
+            echo "GOOGLE_DRIVE_TOKEN_PATH=$target" >> "$GITHUB_ENV"
           fi
 
       - name: Time gate (09:00 Europe/Warsaw, Tuesday)
