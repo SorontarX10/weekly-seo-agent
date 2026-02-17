@@ -26,11 +26,11 @@ dev = [
 ]
 
 [project.scripts]
-weekly-seo-agent = "weekly_seo_agent.main:main"
-weekly-seo-gsc-token = "weekly_seo_agent.tools.gsc_refresh_token:main"
-weekly-seo-senuto-token = "weekly_seo_agent.tools.senuto_token:main"
-weekly-seo-news-agent = "weekly_seo_agent.news_agent:main"
-weekly-seo-gmail-token = "weekly_seo_agent.tools.gmail_refresh_token:main"
+weekly-seo-agent = "weekly_seo_agent.weekly_reporting_agent.main:main"
+weekly-seo-gsc-token = "weekly_seo_agent.weekly_reporting_agent.tools.gsc_refresh_token:main"
+weekly-seo-senuto-token = "weekly_seo_agent.weekly_reporting_agent.tools.senuto_token:main"
+weekly-seo-news-agent = "weekly_seo_agent.weekly_reporting_agent.news_agent:main"
+weekly-seo-gmail-token = "weekly_seo_agent.weekly_reporting_agent.tools.gmail_refresh_token:main"
 weekly-people-manager-agent = "weekly_seo_agent.people_manager_agent:main"
 
 [tool.pytest.ini_options]
@@ -42,4 +42,7 @@ packages = [
   "weekly_seo_agent",
   "weekly_seo_agent.clients",
   "weekly_seo_agent.tools",
+  "weekly_seo_agent.weekly_reporting_agent",
+  "weekly_seo_agent.weekly_reporting_agent.clients",
+  "weekly_seo_agent.weekly_reporting_agent.tools",
 ]

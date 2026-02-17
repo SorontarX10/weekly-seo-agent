@@ -14,11 +14,11 @@ Agent:
 ## 2) Gdzie jest kod agenta
 
 Ten folder jest "wejściem" i dokumentacją. Implementacja znajduje się tutaj:
-- `weekly_seo_agent/main.py` - orchestrator batch run (multi-country, równolegle),
-- `weekly_seo_agent/workflow.py` - pipeline zbierania danych i analizy,
-- `weekly_seo_agent/reporting.py` - generowanie sekcji raportu + render `.docx`,
-- `weekly_seo_agent/clients/google_drive_client.py` - publikacja `.docx` do Google Docs,
-- `weekly_seo_agent/config.py` - konfiguracja z `.env`.
+- `weekly_seo_agent/weekly_reporting_agent/main.py` - orchestrator batch run (multi-country, równolegle),
+- `weekly_seo_agent/weekly_reporting_agent/workflow.py` - pipeline zbierania danych i analizy,
+- `weekly_seo_agent/weekly_reporting_agent/reporting.py` - generowanie sekcji raportu + render `.docx`,
+- `weekly_seo_agent/weekly_reporting_agent/clients/google_drive_client.py` - publikacja `.docx` do Google Docs,
+- `weekly_seo_agent/weekly_reporting_agent/config.py` - konfiguracja z `.env`.
 
 ## 3) Jak uruchomić
 
@@ -59,13 +59,13 @@ Dla publikacji do Google Docs:
 
 Przepływ jest deterministyczny i wygląda tak:
 
-1. **Pipeline kończy analizę** i zwraca tekst raportu (`final_report` albo `markdown_report`) w `weekly_seo_agent/main.py`.
+1. **Pipeline kończy analizę** i zwraca tekst raportu (`final_report` albo `markdown_report`) w `weekly_seo_agent/weekly_reporting_agent/main.py`.
 2. Agent buduje nazwę pliku:
    - `YYYY_MM_DD_<country>_seo_weekly_report.docx`
 3. Tekst raportu jest renderowany do DOCX przez:
-   - `weekly_seo_agent/reporting.py` -> `write_docx(path, title, content)`
+   - `weekly_seo_agent/weekly_reporting_agent/reporting.py` -> `write_docx(path, title, content)`
 4. Jeśli `config.google_drive_upload_enabled` jest `true`, agent inicjalizuje:
-   - `GoogleDriveClient(...)` z `weekly_seo_agent/clients/google_drive_client.py`
+   - `GoogleDriveClient(...)` z `weekly_seo_agent/weekly_reporting_agent/clients/google_drive_client.py`
 5. Dla każdego wygenerowanego pliku `.docx` wywoływane jest:
    - `upload_docx_as_google_doc(local_docx_path)`
 6. Wewnątrz `upload_docx_as_google_doc`:
