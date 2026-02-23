@@ -1,20 +1,13 @@
 from __future__ import annotations
 
 import json
-import signal
-from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Sequence
 
-import httplib2
 from google.auth.credentials import Credentials
 from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2 import service_account
-try:
-    from google_auth_httplib2 import AuthorizedHttp
-except Exception:  # pragma: no cover
-    AuthorizedHttp = None
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -25,9 +18,6 @@ class GSCClient:
     """Thin wrapper for Search Console Search Analytics API."""
 
     SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
-    HTTP_TIMEOUT_SEC = 30
-    API_RETRIES = 3
-    REQUEST_HARD_TIMEOUT_SEC = 45
 
     def __init__(
         self,
@@ -78,46 +68,13 @@ class GSCClient:
             return self._service
 
         credentials = self._build_credentials()
-        http = None
-        if AuthorizedHttp is not None:
-            http = AuthorizedHttp(
-                credentials,
-                http=httplib2.Http(timeout=self.HTTP_TIMEOUT_SEC),
-            )
-        if http is not None:
-            self._service = build(
-                "searchconsole",
-                "v1",
-                http=http,
-                cache_discovery=False,
-            )
-        else:
-            self._service = build(
-                "searchconsole",
-                "v1",
-                credentials=credentials,
-                cache_discovery=False,
-            )
+        self._service = build(
+            "searchconsole",
+            "v1",
+            credentials=credentials,
+            cache_discovery=False,
+        )
         return self._service
-
-    @contextmanager
-    def _hard_timeout(self, seconds: int):
-        # Unix hard-timeout guard for blocking googleapiclient calls.
-        if seconds <= 0 or not hasattr(signal, "SIGALRM"):
-            yield
-            return
-
-        def _handler(signum, frame):  # noqa: ARG001
-            raise TimeoutError(f"GSC request exceeded hard timeout ({seconds}s).")
-
-        previous = signal.getsignal(signal.SIGALRM)
-        signal.signal(signal.SIGALRM, _handler)
-        signal.alarm(seconds)
-        try:
-            yield
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous)
 
     def _build_credentials(self) -> Credentials:
         if self.credentials_path:
@@ -186,16 +143,11 @@ class GSCClient:
             body["dimensionFilterGroups"] = filter_groups
 
         try:
-            with self._hard_timeout(self.REQUEST_HARD_TIMEOUT_SEC):
-                response = (
-                    service.searchanalytics()
-                    .query(siteUrl=self.site_url, body=body)
-                    .execute(num_retries=self.API_RETRIES)
-                )
-        except TimeoutError as exc:
-            raise RuntimeError(
-                f"GSC API timeout for dimensions {dimensions}: {exc}"
-            ) from exc
+            response = (
+                service.searchanalytics()
+                .query(siteUrl=self.site_url, body=body)
+                .execute()
+            )
         except HttpError as exc:
             raise RuntimeError(f"GSC API error for dimensions {dimensions}: {exc}") from exc
 
@@ -226,14 +178,11 @@ class GSCClient:
             body["dimensionFilterGroups"] = filter_groups
 
         try:
-            with self._hard_timeout(self.REQUEST_HARD_TIMEOUT_SEC):
-                response = (
-                    service.searchanalytics()
-                    .query(siteUrl=self.site_url, body=body)
-                    .execute(num_retries=self.API_RETRIES)
-                )
-        except TimeoutError as exc:
-            raise RuntimeError(f"GSC API totals timeout: {exc}") from exc
+            response = (
+                service.searchanalytics()
+                .query(siteUrl=self.site_url, body=body)
+                .execute()
+            )
         except HttpError as exc:
             raise RuntimeError(f"GSC API totals error: {exc}") from exc
 

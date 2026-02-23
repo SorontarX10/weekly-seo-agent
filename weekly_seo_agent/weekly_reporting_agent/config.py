@@ -625,7 +625,7 @@ class AgentConfig:
             llm_packet_max_chars=_env_int("LLM_PACKET_MAX_CHARS", 3200),
             llm_appendix_max_chars=_env_int("LLM_APPENDIX_MAX_CHARS", 1800),
             llm_map_max_packets=_env_int("LLM_MAP_MAX_PACKETS", 4),
-            llm_validation_max_rounds=_env_int("LLM_VALIDATION_MAX_ROUNDS", 4),
+            llm_validation_max_rounds=_env_int("LLM_VALIDATION_MAX_ROUNDS", 2),
             use_llm_validator=_env_bool("USE_LLM_VALIDATOR", True),
             cache_ttl_external_signals_sec=_env_int("CACHE_TTL_EXTERNAL_SIGNALS_SEC", 6 * 3600),
             cache_ttl_additional_context_sec=_env_int("CACHE_TTL_ADDITIONAL_CONTEXT_SEC", 6 * 3600),

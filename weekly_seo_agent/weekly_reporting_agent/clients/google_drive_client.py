@@ -1,17 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import time
 import webbrowser
 
-import httplib2
 from google.auth.transport.requests import Request
-try:
-    from google_auth_httplib2 import AuthorizedHttp
-except Exception:  # pragma: no cover - fallback for minimal envs
-    AuthorizedHttp = None
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -27,8 +20,6 @@ class GoogleDriveClient:
     DOCX_MIME = (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
-    HTTP_TIMEOUT_SEC = 30
-    API_RETRIES = 3
 
     def __init__(
         self,
@@ -68,7 +59,9 @@ class GoogleDriveClient:
         creds: Credentials | None = None
         token_file = Path(self.token_path)
         if token_file.exists():
-            creds = self._read_token_with_retry(token_file)
+            creds = Credentials.from_authorized_user_file(
+                str(token_file), self.SCOPES
+            )
 
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -93,75 +86,42 @@ class GoogleDriveClient:
                     "then provide it in CI as GOOGLE_DRIVE_TOKEN_JSON."
                 ) from exc
 
-        # In CI we can run multiple country processes in parallel; avoid token-file
-        # write races and rely on provided refresh token from secret.
-        if not self._running_in_ci():
-            self._write_token_atomically(token_file, creds.to_json())
+        token_file.write_text(creds.to_json(), encoding="utf-8")
         return creds
 
     @staticmethod
     def _running_in_ci() -> bool:
+        import os
         value = str(os.environ.get("CI", "")).strip().lower()
         return value in {"1", "true", "yes"}
-
-    def _read_token_with_retry(self, token_file: Path) -> Credentials | None:
-        attempts = 3
-        for attempt in range(1, attempts + 1):
-            try:
-                return Credentials.from_authorized_user_file(str(token_file), self.SCOPES)
-            except json.JSONDecodeError:
-                if attempt >= attempts:
-                    raise RuntimeError(
-                        f"Google Drive token JSON is invalid or truncated: {token_file}"
-                    )
-                time.sleep(0.2 * attempt)
-        return None
-
-    @staticmethod
-    def _write_token_atomically(token_file: Path, payload: str) -> None:
-        token_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = token_file.with_suffix(token_file.suffix + ".tmp")
-        tmp_path.write_text(payload, encoding="utf-8")
-        tmp_path.replace(token_file)
 
     def _get_service(self):
         if self._service is None:
             credentials = self._load_credentials()
-            http = None
-            if AuthorizedHttp is not None:
-                http = AuthorizedHttp(
-                    credentials,
-                    http=httplib2.Http(timeout=self.HTTP_TIMEOUT_SEC),
-                )
-            if http is not None:
-                self._service = build(
-                    "drive",
-                    "v3",
-                    http=http,
-                    cache_discovery=False,
-                )
-            else:
-                self._service = build(
-                    "drive",
-                    "v3",
-                    credentials=credentials,
-                    cache_discovery=False,
-                )
+            self._service = build(
+                "drive",
+                "v3",
+                credentials=credentials,
+                cache_discovery=False,
+            )
         return self._service
 
-    def _find_or_create_child_folder(self, parent_id: str, folder_name: str) -> str:
+    def _find_or_create_folder(self) -> str:
+        if self.folder_id:
+            return self.folder_id
+
         service = self._get_service()
-        escaped = self._escape_query_value(folder_name)
+        escaped = self._escape_query_value(self.folder_name)
         query = (
             f"mimeType='{self.FOLDER_MIME}' "
             f"and name='{escaped}' "
-            f"and trashed=false and '{parent_id}' in parents"
+            "and trashed=false and 'root' in parents"
         )
 
         response = (
             service.files()
             .list(q=query, spaces="drive", fields="files(id,name)", pageSize=1)
-            .execute(num_retries=self.API_RETRIES)
+            .execute()
         )
         files = response.get("files", [])
         if files:
@@ -170,36 +130,15 @@ class GoogleDriveClient:
         created = (
             service.files()
             .create(
-                body={
-                    "name": folder_name,
-                    "mimeType": self.FOLDER_MIME,
-                    "parents": [parent_id],
-                },
+                body={"name": self.folder_name, "mimeType": self.FOLDER_MIME},
                 fields="id,name",
             )
-            .execute(num_retries=self.API_RETRIES)
+            .execute()
         )
         folder_id = str(created.get("id", "")).strip()
         if not folder_id:
             raise RuntimeError("Failed to create Google Drive folder.")
         return folder_id
-
-    def _find_or_create_folder(self) -> str:
-        path_parts = [part.strip() for part in self.folder_name.split("/") if part.strip()]
-        if not path_parts:
-            raise RuntimeError("Google Drive target folder path is empty.")
-
-        if self.folder_id and len(path_parts) == 1:
-            return self.folder_id
-
-        parent_id = self.folder_id or "root"
-        current_id = parent_id
-        for part in path_parts:
-            current_id = self._find_or_create_child_folder(
-                parent_id=current_id,
-                folder_name=part,
-            )
-        return current_id
 
     def _delete_existing_docs(self, folder_id: str, doc_name: str) -> None:
         service = self._get_service()
@@ -211,14 +150,14 @@ class GoogleDriveClient:
         response = (
             service.files()
             .list(q=query, spaces="drive", fields="files(id,name)", pageSize=100)
-            .execute(num_retries=self.API_RETRIES)
+            .execute()
         )
         files = response.get("files", [])
         for file_row in files:
             file_id = str(file_row.get("id", "")).strip()
             if not file_id:
                 continue
-            service.files().delete(fileId=file_id).execute(num_retries=self.API_RETRIES)
+            service.files().delete(fileId=file_id).execute()
 
     def upload_docx_as_google_doc(self, local_docx_path: Path) -> dict:
         if not local_docx_path.exists():
@@ -249,7 +188,7 @@ class GoogleDriveClient:
                     media_body=media,
                     fields="id,name,webViewLink,mimeType,parents",
                 )
-                .execute(num_retries=self.API_RETRIES)
+                .execute()
             )
         except HttpError as exc:
             payload = str(exc)
