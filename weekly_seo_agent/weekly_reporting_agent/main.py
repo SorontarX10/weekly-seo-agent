@@ -191,32 +191,55 @@ def main() -> None:
     failed_countries: list[tuple[str, str]] = []
     successful_runs: list[dict[str, str]] = []
     max_workers = max(1, min(len(country_codes), 4))
-    print(f"Starting parallel batch: countries={','.join(country_codes)} | workers={max_workers}")
+    force_serial = len(country_codes) == 1
+    mode_label = "serial" if force_serial else "parallel"
+    print(
+        f"Starting {mode_label} batch: countries={','.join(country_codes)} | workers={1 if force_serial else max_workers}"
+    )
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(
-                _run_country_report,
-                run_date,
-                config,
-                country_code,
-                str(output_dir),
-            ): country_code
-            for country_code in country_codes
-        }
-        for future in as_completed(future_map):
-            country_code = future_map[future]
-            try:
-                result = future.result()
-                successful_runs.append(result)
-                print(
-                    "Report generated: "
-                    f"{result['docx_path']} | country={result['country_code']} | "
-                    f"GSC={result['gsc_country_filter']} | Senuto country_id={result['senuto_country_id']}"
-                )
-            except Exception as exc:
-                failed_countries.append((country_code, str(exc)))
-                print(f"Country run failed: {country_code} | {exc}")
+    if force_serial:
+        country_code = country_codes[0]
+        try:
+            result = _run_country_report(
+                run_date=run_date,
+                config=config,
+                country_code=country_code,
+                output_dir_str=str(output_dir),
+            )
+            successful_runs.append(result)
+            print(
+                "Report generated: "
+                f"{result['docx_path']} | country={result['country_code']} | "
+                f"GSC={result['gsc_country_filter']} | Senuto country_id={result['senuto_country_id']}"
+            )
+        except Exception as exc:
+            failed_countries.append((country_code, str(exc)))
+            print(f"Country run failed: {country_code} | {exc}")
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    _run_country_report,
+                    run_date,
+                    config,
+                    country_code,
+                    str(output_dir),
+                ): country_code
+                for country_code in country_codes
+            }
+            for future in as_completed(future_map):
+                country_code = future_map[future]
+                try:
+                    result = future.result()
+                    successful_runs.append(result)
+                    print(
+                        "Report generated: "
+                        f"{result['docx_path']} | country={result['country_code']} | "
+                        f"GSC={result['gsc_country_filter']} | Senuto country_id={result['senuto_country_id']}"
+                    )
+                except Exception as exc:
+                    failed_countries.append((country_code, str(exc)))
+                    print(f"Country run failed: {country_code} | {exc}")
 
     if drive_client is not None:
         drive_upload_errors: list[str] = []
@@ -253,7 +276,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    gsc_site_url = config.gsc_site_url_map.get(
-        country_code,
-        config.gsc_site_url,
-    )
