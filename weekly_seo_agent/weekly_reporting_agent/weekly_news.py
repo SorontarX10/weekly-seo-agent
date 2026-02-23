@@ -24,6 +24,34 @@ class NewsItem:
     topic: str
 
 
+def _normalize_title_for_dedup(title: str) -> str:
+    text = (title or "").strip().lower()
+    # Remove social tags and noisy suffixes that create near-duplicates.
+    text = re.sub(r"\s+via\s+@[\w, @.-]+$", "", text)
+    text = re.sub(r"\s*[–-]\s*search engine journal$", "", text)
+    text = re.sub(r"\s*[–-]\s*seo pulse$", "", text)
+    text = re.sub(r"\s*[–-]\s*ppc pulse$", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _clean_title(title: str) -> str:
+    text = (title or "").strip()
+    text = re.sub(r"\s+via\s+@[\w, @.-]+$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*[–-]\s*Search Engine Journal$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _clean_summary(summary: str, max_len: int = 220) -> str:
+    text = re.sub(r"\s+", " ", (summary or "")).strip()
+    text = re.sub(r"\bThe post .+? appeared first on .+?\.\s*$", "", text, flags=re.IGNORECASE)
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
 def _strip_html(text: str) -> str:
     cleaned = re.sub(r"<[^>]+>", " ", text or "")
     cleaned = html.unescape(cleaned)
@@ -150,21 +178,20 @@ def _collect_from_rss(
             if domain_check and not _domain_matches(domain_check, allowlist):
                 continue
 
-            if len(description) > 320:
-                description = description[:317] + "..."
-
             source_host = urlparse(url).netloc or "rss"
-            if domain == "news.google.com" and source_domain:
-                domain = source_domain
+            preferred_url = link
+            if domain == "news.google.com" and source_url:
+                preferred_url = source_url
+                domain = source_domain or domain
             source_label = source_text or domain or source_host
             items.append(
                 NewsItem(
-                    title=title or "Untitled",
-                    url=link,
+                    title=_clean_title(title or "Untitled"),
+                    url=preferred_url,
                     source=source_label,
                     published=published_date,
                     domain=domain or source_host,
-                    summary=description or "No description provided.",
+                    summary=_clean_summary(description or "No description provided."),
                     topic=topic,
                 )
             )
@@ -175,7 +202,7 @@ def _unique_items(items: list[NewsItem], limit: int) -> list[NewsItem]:
     seen: set[tuple[str, str]] = set()
     out: list[NewsItem] = []
     for item in sorted(items, key=lambda row: row.published or date.min, reverse=True):
-        key = (item.title.lower(), item.domain.lower())
+        key = (_normalize_title_for_dedup(item.title), item.domain.lower())
         if key in seen:
             continue
         seen.add(key)

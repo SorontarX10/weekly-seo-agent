@@ -640,8 +640,12 @@ def _fetch_market_event_calendar(
             "sort": "DateDesc",
             "maxrecords": str(max(top_rows * 6, 30)),
         }
-        response = requests.get(api_base_url, params=params, timeout=35)
-        response.raise_for_status()
+        try:
+            response = requests.get(api_base_url, params=params, timeout=15)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            continue
         try:
             payload = response.json()
         except Exception:

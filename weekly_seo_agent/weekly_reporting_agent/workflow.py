@@ -25,9 +25,13 @@ from weekly_seo_agent.weekly_reporting_agent.ferie import build_ferie_context, b
 from weekly_seo_agent.weekly_reporting_agent.llm import build_gaia_llm
 from weekly_seo_agent.weekly_reporting_agent.models import AnalysisResult, ExternalSignal, KeyDelta, MetricSummary
 from weekly_seo_agent.weekly_reporting_agent.query_filter import filter_irrelevant_query_rows
-from weekly_seo_agent.weekly_reporting_agent.reporting import _build_reasoning_hypotheses, build_markdown_report
+from weekly_seo_agent.weekly_reporting_agent.reporting import (
+    _adapt_text_for_monthly,
+    _build_reasoning_hypotheses,
+    build_markdown_report,
+)
 from weekly_seo_agent.weekly_reporting_agent.segmentation import build_segment_diagnostics
-from weekly_seo_agent.weekly_reporting_agent.time_windows import compute_windows
+from weekly_seo_agent.weekly_reporting_agent.time_windows import compute_monthly_windows, compute_windows
 from weekly_seo_agent.weekly_reporting_agent.weekly_news import NewsItem, collect_weekly_news
 from weekly_seo_agent.weekly_reporting_agent.news_agent import build_summary as build_weekly_news_summary
 
@@ -35,6 +39,9 @@ from weekly_seo_agent.weekly_reporting_agent.news_agent import build_summary as 
 class WorkflowState(TypedDict, total=False):
     run_date: date
     config: AgentConfig
+    report_mode: str
+    target_month: str
+    trends_from_date: str
 
     totals: dict[str, MetricSummary]
     scope_results: list[tuple[str, AnalysisResult]]
@@ -53,6 +60,7 @@ class WorkflowState(TypedDict, total=False):
     llm_validation_round: int
     llm_validation_passed: bool
     llm_validation_issues: list[str]
+    llm_validation_exhausted: bool
     llm_skip_validation: bool
     final_report: str
 
@@ -76,8 +84,8 @@ AI_SECTION_TITLES = (
     "Status-Log Updates",
 )
 
-EXTERNAL_SIGNALS_TIMEOUT_SEC = 120
-ADDITIONAL_CONTEXT_TIMEOUT_SEC = 180
+EXTERNAL_SIGNALS_TIMEOUT_SEC = 30
+ADDITIONAL_CONTEXT_TIMEOUT_SEC = 35
 LLM_CACHE_MAX_AGE_SEC = 60 * 60 * 24
 
 ALLEGRO_TRENDS_NOISE_EXACT = {
@@ -1638,6 +1646,33 @@ def _run_rule_based_report_checks(report_text: str) -> list[str]:
     if re.search(r"\b\d{1,3}(?:,\d{3})+\b", report_text):
         issues.append("[medium] Found comma-separated large integers; should use spaces.")
 
+    # Readability / business-implication checks for key narrative blocks.
+    vague_markers = (
+        "Campaign context: active campaign signals exist and can influence",
+        "Platform/regulatory pulse: external platform/regulation context is active",
+        "GSC feature split indicates distribution changes across SERP features rather than one uniform drop.",
+        "Weekly SEO/GEO context: external publications were reviewed for potential causal support",
+        "Use this to verify whether clicks moved between feature types.",
+        "Use this as timing context for near-term category demand.",
+    )
+    for marker in vague_markers:
+        if marker in report_text:
+            issues.append(
+                f"[high] Narrative too generic: `{marker}`. Replace with concrete business implication and specific examples."
+            )
+
+    if "**Causal chain**: Observation ->" in report_text:
+        issues.append(
+            "[medium] Causal chain is in one long sentence; format as structured bullets (Observation/Evidence/Hypothesis/Decision)."
+        )
+
+    is_monthly_report = "monthly seo intelligence report" in report_text.lower() or "monthly seo report" in report_text.lower()
+    if is_monthly_report:
+        if re.search(r"\bWoW\b|\bwow\b|week-over-week|week over week|this week|weekly", report_text, flags=re.IGNORECASE):
+            issues.append("[high] Monthly report still contains weekly wording (WoW/week/weekly).")
+        if re.search(r"Forward 30d|forward 30d|weather forecast", report_text, flags=re.IGNORECASE):
+            issues.append("[high] Monthly report should not include next-period weather forecast block.")
+
     return issues[:20]
 
 
@@ -1794,8 +1829,13 @@ def _allegro_trends_candidate_queries(
 def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     run_date = state["run_date"]
     config = state["config"]
-
-    windows = compute_windows(run_date)
+    report_mode = str(state.get("report_mode", "weekly")).strip().lower() or "weekly"
+    target_month = str(state.get("target_month", "")).strip() or None
+    trends_from_date = str(state.get("trends_from_date", "")).strip()
+    if report_mode == "monthly":
+        windows = compute_monthly_windows(run_date, target_month=target_month)
+    else:
+        windows = compute_windows(run_date)
     current_window = windows["current_28d"]
     previous_window = windows["previous_28d"]
     yoy_window = windows["yoy_52w"]
@@ -2068,55 +2108,56 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
             )
     else:
         # Parallel I/O for independent context fetches with bounded worker pool.
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_external = executor.submit(
-                external_client.collect,
-                current_window=current_window,
-                previous_window=previous_window,
-            )
-            future_context = executor.submit(
-                collect_additional_context,
-                target_site_url=config.target_site_url,
-                target_domain=config.target_domain,
-                report_country_code=config.report_country_code,
-                run_date=run_date,
-                current_window=current_window,
-                previous_window=previous_window,
-                google_drive_client_secret_path=config.google_drive_client_secret_path,
-                google_drive_token_path=config.google_drive_token_path,
-                google_drive_folder_name=config.google_drive_folder_name,
-                google_drive_folder_id=config.google_drive_folder_id,
-                seo_presentations_enabled=config.seo_presentations_enabled,
-                seo_presentations_folder_reference=config.seo_presentations_folder_reference,
-                seo_presentations_max_files_per_year=config.seo_presentations_max_files_per_year,
-                seo_presentations_max_text_files_per_year=config.seo_presentations_max_text_files_per_year,
-                historical_reports_enabled=config.historical_reports_enabled,
-                historical_reports_count=config.historical_reports_count,
-                historical_reports_yoy_tolerance_days=config.historical_reports_yoy_tolerance_days,
-                status_log_enabled=config.status_log_enabled,
-                status_file_reference=config.status_file_reference,
-                status_max_rows=config.status_max_rows,
-                product_trends_enabled=config.product_trends_enabled,
-                product_trends_comparison_sheet_reference=config.product_trends_comparison_sheet_reference,
-                product_trends_upcoming_sheet_reference=config.product_trends_upcoming_sheet_reference,
-                product_trends_current_sheet_reference=config.product_trends_current_sheet_reference,
-                product_trends_top_rows=config.product_trends_top_rows,
-                product_trends_horizon_days=config.product_trends_horizon_days,
-                trade_plan_enabled=config.trade_plan_enabled,
-                trade_plan_sheet_reference=config.trade_plan_sheet_reference,
-                trade_plan_tab_map=config.trade_plan_tab_map,
-                trade_plan_top_rows=config.trade_plan_top_rows,
-                platform_pulse_enabled=config.platform_pulse_enabled,
-                platform_pulse_rss_urls=config.platform_pulse_rss_urls,
-                platform_pulse_top_rows=config.platform_pulse_top_rows,
-                pagespeed_api_key=config.pagespeed_api_key,
-                google_trends_rss_url=config.google_trends_rss_url,
-                nbp_api_base_url=config.nbp_api_base_url,
-                imgw_warnings_url=config.imgw_warnings_url,
-                market_events_enabled=config.market_events_enabled,
-                market_events_api_base_url=config.market_events_api_base_url,
-                market_events_top_rows=config.market_events_top_rows,
-            )
+        executor = ThreadPoolExecutor(max_workers=2)
+        future_external = executor.submit(
+            external_client.collect,
+            current_window=current_window,
+            previous_window=previous_window,
+        )
+        future_context = executor.submit(
+            collect_additional_context,
+            target_site_url=config.target_site_url,
+            target_domain=config.target_domain,
+            report_country_code=config.report_country_code,
+            run_date=run_date,
+            current_window=current_window,
+            previous_window=previous_window,
+            google_drive_client_secret_path=config.google_drive_client_secret_path,
+            google_drive_token_path=config.google_drive_token_path,
+            google_drive_folder_name=config.google_drive_folder_name,
+            google_drive_folder_id=config.google_drive_folder_id,
+            seo_presentations_enabled=config.seo_presentations_enabled,
+            seo_presentations_folder_reference=config.seo_presentations_folder_reference,
+            seo_presentations_max_files_per_year=config.seo_presentations_max_files_per_year,
+            seo_presentations_max_text_files_per_year=config.seo_presentations_max_text_files_per_year,
+            historical_reports_enabled=config.historical_reports_enabled,
+            historical_reports_count=config.historical_reports_count,
+            historical_reports_yoy_tolerance_days=config.historical_reports_yoy_tolerance_days,
+            status_log_enabled=config.status_log_enabled,
+            status_file_reference=config.status_file_reference,
+            status_max_rows=config.status_max_rows,
+            product_trends_enabled=config.product_trends_enabled,
+            product_trends_comparison_sheet_reference=config.product_trends_comparison_sheet_reference,
+            product_trends_upcoming_sheet_reference=config.product_trends_upcoming_sheet_reference,
+            product_trends_current_sheet_reference=config.product_trends_current_sheet_reference,
+            product_trends_top_rows=config.product_trends_top_rows,
+            product_trends_horizon_days=config.product_trends_horizon_days,
+            trade_plan_enabled=config.trade_plan_enabled,
+            trade_plan_sheet_reference=config.trade_plan_sheet_reference,
+            trade_plan_tab_map=config.trade_plan_tab_map,
+            trade_plan_top_rows=config.trade_plan_top_rows,
+            platform_pulse_enabled=config.platform_pulse_enabled,
+            platform_pulse_rss_urls=config.platform_pulse_rss_urls,
+            platform_pulse_top_rows=config.platform_pulse_top_rows,
+            pagespeed_api_key=config.pagespeed_api_key,
+            google_trends_rss_url=config.google_trends_rss_url,
+            nbp_api_base_url=config.nbp_api_base_url,
+            imgw_warnings_url=config.imgw_warnings_url,
+            market_events_enabled=config.market_events_enabled,
+            market_events_api_base_url=config.market_events_api_base_url,
+            market_events_top_rows=config.market_events_top_rows,
+        )
+        try:
             try:
                 external_signals, weather_summary = future_external.result(
                     timeout=EXTERNAL_SIGNALS_TIMEOUT_SEC
@@ -2216,6 +2257,11 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                         severity="medium",
                     )
                 )
+        finally:
+            if future_external.cancelled() or future_context.cancelled():
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
         if not external_signals and stale_external:
             external_signals, weather_summary = _deserialize_external_cache(stale_external)
             external_cache_mode = "stale_fallback"
@@ -2611,6 +2657,8 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     markdown_report = build_markdown_report(
         run_date=run_date,
         report_country_code=config.report_country_code,
+        report_mode=report_mode,
+        trends_from_date=trends_from_date,
         windows=windows,
         totals=totals,
         scope_results=scope_results,
@@ -2663,11 +2711,26 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
 
     try:
         llm = build_gaia_llm(config)
-        commentary = _generate_three_step_llm_commentary(
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(
+            _generate_three_step_llm_commentary,
             llm,
             state,
-            feedback_notes=feedback_notes if isinstance(feedback_notes, list) else [],
+            feedback_notes if isinstance(feedback_notes, list) else [],
         )
+        try:
+            try:
+                commentary = future.result(timeout=max(20, int(config.gaia_timeout_sec)))
+            except FutureTimeoutError:
+                future.cancel()
+                raise TimeoutError(
+                    f"LLM generation timed out after {max(20, int(config.gaia_timeout_sec))}s"
+                )
+        finally:
+            if future.cancelled():
+                pool.shutdown(wait=False, cancel_futures=True)
+            else:
+                pool.shutdown(wait=True)
         commentary = _normalize_ai_commentary_markdown(commentary)
         executive_summary = _extract_markdown_section(
             markdown_report, "Executive summary"
@@ -2722,7 +2785,21 @@ def llm_validate_node(state: WorkflowState) -> WorkflowState:
             max_appendix_chars=max(600, int(config.llm_appendix_max_chars)),
         )
         rule_issues = _run_rule_based_report_checks(candidate_report)
-        validation = _run_llm_document_validator(llm, candidate_report, config)
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(_run_llm_document_validator, llm, candidate_report, config)
+        try:
+            try:
+                validation = future.result(timeout=max(20, int(config.gaia_timeout_sec)))
+            except FutureTimeoutError:
+                future.cancel()
+                raise TimeoutError(
+                    f"Validator timed out after {max(20, int(config.gaia_timeout_sec))}s"
+                )
+        finally:
+            if future.cancelled():
+                pool.shutdown(wait=False, cancel_futures=True)
+            else:
+                pool.shutdown(wait=True)
         llm_issues = validation.get("issues", [])
         unsupported_claims_count = int(validation.get("unsupported_claims_count", 0) or 0)
         issues: list[str] = []
@@ -2745,16 +2822,10 @@ def llm_validate_node(state: WorkflowState) -> WorkflowState:
             }
         max_rounds = max(1, int(config.llm_validation_max_rounds))
         if round_no >= max_rounds:
-            fallback_commentary = (
-                "LLM narrative omitted after validation retries due to unresolved QA issues. "
-                "Using deterministic report sections only."
-            )
             return {
-                "llm_validation_passed": True,
+                "llm_validation_passed": False,
+                "llm_validation_exhausted": True,
                 "llm_validation_issues": issues,
-                "llm_skip_validation": True,
-                "llm_commentary": fallback_commentary,
-                "final_report": markdown_report,
             }
         next_feedback: list[str] = []
         if isinstance(feedback, list):
@@ -2768,15 +2839,28 @@ def llm_validate_node(state: WorkflowState) -> WorkflowState:
         }
     except Exception as exc:
         return {
-            "llm_validation_passed": True,
-            "llm_validation_issues": [f"Validator skipped due to error: {exc}"],
+            "llm_validation_passed": False,
+            "llm_validation_exhausted": True,
+            "llm_validation_issues": [f"[high] Validator execution error: {exc}"],
         }
 
 
 def _route_after_validation(state: WorkflowState) -> str:
+    if bool(state.get("llm_validation_exhausted", False)):
+        return "llm_fail"
     if bool(state.get("llm_validation_passed", False)):
         return "llm_finalize"
     return "llm_generate"
+
+
+def llm_fail_node(state: WorkflowState) -> WorkflowState:
+    issues = state.get("llm_validation_issues", [])
+    lines = [str(item).strip() for item in issues if str(item).strip()]
+    details = "; ".join(lines[:6]) if lines else "no detailed validator issues available"
+    raise RuntimeError(
+        "LLM validator failed after maximum rewrite attempts. "
+        f"Run stopped without publishing report. Issues: {details}"
+    )
 
 
 def llm_finalize_node(state: WorkflowState) -> WorkflowState:
@@ -2794,6 +2878,9 @@ def llm_finalize_node(state: WorkflowState) -> WorkflowState:
             "final_report": markdown_report,
         }
     final_report = _compose_final_report(markdown_report, commentary)
+    report_mode = str(state.get("report_mode", "weekly")).strip().lower() or "weekly"
+    if report_mode == "monthly":
+        final_report = _adapt_report_terms_for_monthly(final_report)
     issues = state.get("llm_validation_issues", [])
     if isinstance(issues, list) and issues:
         diagnostics = "\n".join(f"- {str(item).strip()}" for item in issues[:8] if str(item).strip())
@@ -2805,12 +2892,90 @@ def llm_finalize_node(state: WorkflowState) -> WorkflowState:
     }
 
 
+def _adapt_report_terms_for_monthly(text: str) -> str:
+    import re
+
+    out = text
+    replacements = [
+        ("Weekly SEO Intelligence Report", "Monthly SEO Intelligence Report"),
+        ("weekly seo intelligence report", "monthly seo intelligence report"),
+        ("WoW", "MoM"),
+        ("wow", "mom"),
+        ("week-over-week", "month-over-month"),
+        ("week over week", "month over month"),
+        ("Current week (Mon-Sun)", "Current month"),
+        ("Previous week (Mon-Sun)", "Previous month"),
+        ("Current week", "Current month"),
+        ("Previous week", "Previous month"),
+        ("Decision this week", "Decision this month"),
+        ("Decision for this week", "Decision for this month"),
+        ("Decision this month: current data indicates an exposure/demand effect first", "Decision this month: current data indicates an exposure/demand effect first"),
+        ("this week", "this month"),
+        ("This week", "This month"),
+        ("this week's", "this month's"),
+        ("This week's", "This month's"),
+        ("analyzed week", "analyzed month"),
+        ("in analyzed week", "in analyzed month"),
+        ("current/previous weekly windows", "current/previous monthly windows"),
+        ("previous weekly windows", "previous monthly windows"),
+        ("weekly window", "monthly window"),
+        ("Weekly window", "Monthly window"),
+        ("weekly windows", "monthly windows"),
+        ("weekly demand allocation", "monthly demand allocation"),
+        ("weekly demand", "monthly demand"),
+        ("weekly traffic", "monthly traffic"),
+        ("weekly movement", "monthly movement"),
+        ("weekly demand timing", "monthly demand timing"),
+        ("Weekly SEO/GEO context", "Monthly SEO/GEO context"),
+        ("Trade-plan summary: Campaign overlap detected in analyzed week", "Trade-plan summary: Campaign overlap detected in analyzed month"),
+        ("Forward 7d", "Forward 30d"),
+        ("forward 7d", "forward 30d"),
+        ("next-week weather forecast", "next-month weather forecast"),
+        ("Next-week weather forecast", "Next-month weather forecast"),
+        ("weather moved moderately week over week", "weather moved moderately month over month"),
+        ("Weather moved moderately week over week", "Weather moved moderately month over month"),
+        ("vs previous week", "vs previous month"),
+        ("vs the previous week", "vs the previous month"),
+        ("Impact attribution (share of WoW click movement)", "Impact attribution (share of MoM click movement)"),
+        ("Delta vs WoW", "Delta vs MoM"),
+        ("Share of total WoW delta", "Share of total MoM delta"),
+        ("Query anomaly detection (WoW)", "Query anomaly detection (MoM)"),
+        ("Delta % vs WoW", "Delta % vs MoM"),
+        ("Page delta WoW", "Page delta MoM"),
+    ]
+    for old, new in replacements:
+        out = out.replace(old, new)
+    # Regex fallbacks for variants that appear after LLM rewriting.
+    regex_replacements = [
+        (r"(?i)\bwow\b", "MoM"),
+        (r"\bWoW\s+diagnosis\b", "MoM diagnosis"),
+        (r"\bweek-to-week\b", "month-to-month"),
+        (r"\bweek to week\b", "month to month"),
+        (r"\bweek over week\b", "month over month"),
+        (r"(?i)\bweekly\b", "monthly"),
+        (r"(?i)\bthis week\b", "this month"),
+        (r"(?i)\bthis week's\b", "this month's"),
+        (r"(?i)\bin the analyzed week\b", "in the analyzed month"),
+        (r"(?i)\bcurrent/previous weekly windows\b", "current/previous monthly windows"),
+        (r"(?i)\bprevious weekly window\b", "previous monthly window"),
+        (r"(?i)\bnext week\b", "next month"),
+        (r"(?i)\bdecision this week\b", "decision this month"),
+        (r"(?i)\bweek-over-week\b", "month-over-month"),
+    ]
+    for pattern, repl in regex_replacements:
+        out = re.sub(pattern, repl, out)
+    out = out.replace("# Weekly SEO Intelligence Report", "# Monthly SEO Intelligence Report")
+    out = out.replace("## Weekly SEO Intelligence Report", "## Monthly SEO Intelligence Report")
+    return out
+
+
 def build_workflow_app():
     workflow = StateGraph(WorkflowState)
     workflow.add_node("collect_and_analyze", collect_and_analyze_node)
     workflow.add_node("llm_generate", llm_generate_node)
     workflow.add_node("llm_validate", llm_validate_node)
     workflow.add_node("llm_finalize", llm_finalize_node)
+    workflow.add_node("llm_fail", llm_fail_node)
 
     workflow.set_entry_point("collect_and_analyze")
     workflow.add_edge("collect_and_analyze", "llm_generate")
@@ -2821,14 +2986,55 @@ def build_workflow_app():
         {
             "llm_generate": "llm_generate",
             "llm_finalize": "llm_finalize",
+            "llm_fail": "llm_fail",
         },
     )
     workflow.add_edge("llm_finalize", END)
+    workflow.add_edge("llm_fail", END)
 
     return workflow.compile()
 
 
 def run_weekly_workflow(run_date: date, config: AgentConfig) -> WorkflowState:
     app = build_workflow_app()
-    final_state = app.invoke({"run_date": run_date, "config": config})
+    final_state = app.invoke(
+        {
+            "run_date": run_date,
+            "config": config,
+            "report_mode": "weekly",
+            "target_month": "",
+            "trends_from_date": "",
+        }
+    )
+    return final_state
+
+
+def run_reporting_workflow(
+    run_date: date,
+    config: AgentConfig,
+    *,
+    report_mode: str = "weekly",
+    target_month: str = "",
+    trends_from_date: str = "",
+) -> WorkflowState:
+    app = build_workflow_app()
+    final_state = app.invoke(
+        {
+            "run_date": run_date,
+            "config": config,
+            "report_mode": report_mode,
+            "target_month": target_month,
+            "trends_from_date": trends_from_date,
+        }
+    )
+    mode = str(report_mode).strip().lower() or "weekly"
+    if mode == "monthly":
+        if isinstance(final_state.get("markdown_report"), str):
+            final_state["markdown_report"] = _adapt_text_for_monthly(
+                str(final_state.get("markdown_report", ""))
+            )
+        if isinstance(final_state.get("final_report"), str):
+            final_state["final_report"] = _adapt_text_for_monthly(
+                str(final_state.get("final_report", ""))
+            )
     return final_state

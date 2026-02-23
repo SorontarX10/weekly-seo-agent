@@ -6,13 +6,15 @@ from dataclasses import replace
 import shutil
 from datetime import date
 from pathlib import Path
+import sys
 
 from dotenv import find_dotenv, load_dotenv
 
 from weekly_seo_agent.weekly_reporting_agent.clients.google_drive_client import GoogleDriveClient
 from weekly_seo_agent.weekly_reporting_agent.config import AgentConfig
 from weekly_seo_agent.weekly_reporting_agent.reporting import write_docx
-from weekly_seo_agent.weekly_reporting_agent.workflow import run_weekly_workflow
+from weekly_seo_agent.weekly_reporting_agent.time_windows import compute_monthly_windows
+from weekly_seo_agent.weekly_reporting_agent.workflow import run_reporting_workflow
 
 
 def _parse_args() -> argparse.Namespace:
@@ -21,6 +23,23 @@ def _parse_args() -> argparse.Namespace:
         "--run-date",
         dest="run_date",
         help="Execution date in YYYY-MM-DD format (default: today)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("weekly", "monthly"),
+        default="weekly",
+        help="Reporting mode: weekly (default) or monthly",
+    )
+    parser.add_argument(
+        "--month",
+        dest="target_month",
+        help="Target month for monthly mode in YYYY-MM format. "
+        "If omitted, monthly mode uses last fully completed month.",
+    )
+    parser.add_argument(
+        "--trends-from-date",
+        dest="trends_from_date",
+        help="Start date (YYYY-MM-DD) for upcoming trends summary window.",
     )
     return parser.parse_args()
 
@@ -130,6 +149,9 @@ def _run_country_report(
     config: AgentConfig,
     country_code: str,
     output_dir_str: str,
+    report_mode: str,
+    target_month: str,
+    trends_from_date: str,
 ) -> dict[str, str]:
     country_config, senuto_country_id, gsc_country_filter = _build_country_config(
         config, country_code
@@ -137,13 +159,28 @@ def _run_country_report(
     output_dir = Path(output_dir_str)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    state = run_weekly_workflow(run_date, country_config)
+    state = run_reporting_workflow(
+        run_date,
+        country_config,
+        report_mode=report_mode,
+        target_month=target_month,
+        trends_from_date=trends_from_date,
+    )
     final_report = state.get("final_report") or state["markdown_report"]
-    report_stem = f"{run_date.strftime('%Y_%m_%d')}_{country_code.lower()}_seo_weekly_report"
+    if report_mode == "monthly":
+        windows = compute_monthly_windows(run_date, target_month=target_month or None)
+        current_window = windows["current_28d"]
+        report_stem = (
+            f"{current_window.start.strftime('%Y_%m')}_{country_code.lower()}_seo_report_Monthly"
+        )
+        title = f"Monthly SEO Report {current_window.start.strftime('%Y-%m')} ({country_code})"
+    else:
+        report_stem = f"{run_date.strftime('%Y_%m_%d')}_{country_code.lower()}_seo_weekly_report"
+        title = f"Weekly SEO Report {run_date.isoformat()} ({country_code})"
     docx_path = output_dir / f"{report_stem}.docx"
     write_docx(
         docx_path,
-        title=f"Weekly SEO Report {run_date.isoformat()} ({country_code})",
+        title=title,
         content=final_report,
     )
     return {
@@ -154,6 +191,23 @@ def _run_country_report(
     }
 
 
+def _progress_bar(done: int, total: int, width: int = 28) -> str:
+    total_safe = max(1, int(total))
+    done_clamped = max(0, min(int(done), total_safe))
+    filled = int(width * done_clamped / total_safe)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {done_clamped}/{total_safe}"
+
+
+def _print_progress(stage: str, done: int, total: int, *, finalize: bool = False) -> None:
+    line = f"{stage}: {_progress_bar(done, total)}"
+    if sys.stdout.isatty():
+        end = "\n" if finalize else "\r"
+        print(line, end=end, flush=True)
+    else:
+        # CI logs: keep each update as a separate line.
+        print(line, flush=True)
+
+
 def main() -> None:
     try:
         load_dotenv(find_dotenv(usecwd=True), override=False)
@@ -162,7 +216,16 @@ def main() -> None:
 
     args = _parse_args()
     run_date = _parse_run_date(args.run_date)
+    report_mode = str(args.mode).strip().lower() or "weekly"
+    target_month = str(args.target_month or "").strip()
+    trends_from_date = str(args.trends_from_date or "").strip()
     config = AgentConfig.from_env()
+
+    if report_mode == "monthly" and not trends_from_date:
+        raise SystemExit(
+            "Monthly mode requires --trends-from-date YYYY-MM-DD. "
+            "Provide the date you want for upcoming trends analysis."
+        )
 
     if not config.gsc_enabled:
         raise SystemExit(
@@ -180,10 +243,13 @@ def main() -> None:
 
     drive_client: GoogleDriveClient | None = None
     if config.google_drive_upload_enabled:
+        drive_folder_name = config.google_drive_folder_name
+        if report_mode == "monthly":
+            drive_folder_name = f"{drive_folder_name.rstrip('/')}/Monthly"
         drive_client = GoogleDriveClient(
             client_secret_path=config.google_drive_client_secret_path,
             token_path=config.google_drive_token_path,
-            folder_name=config.google_drive_folder_name,
+            folder_name=drive_folder_name,
             folder_id=config.google_drive_folder_id,
         )
 
@@ -191,6 +257,7 @@ def main() -> None:
     successful_runs: list[dict[str, str]] = []
     max_workers = max(1, min(len(country_codes), 4))
     print(f"Starting parallel batch: countries={','.join(country_codes)} | workers={max_workers}")
+    _print_progress("Generation progress", 0, len(country_codes))
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
@@ -200,9 +267,13 @@ def main() -> None:
                 config,
                 country_code,
                 str(output_dir),
+                report_mode,
+                target_month,
+                trends_from_date,
             ): country_code
             for country_code in country_codes
         }
+        completed_generation = 0
         for future in as_completed(future_map):
             country_code = future_map[future]
             try:
@@ -216,13 +287,54 @@ def main() -> None:
             except Exception as exc:
                 failed_countries.append((country_code, str(exc)))
                 print(f"Country run failed: {country_code} | {exc}")
+            finally:
+                completed_generation += 1
+                _print_progress(
+                    "Generation progress",
+                    completed_generation,
+                    len(country_codes),
+                    finalize=completed_generation >= len(country_codes),
+                )
+
+    # Retry failed countries once, sequentially (stabilizes transient API/process errors).
+    if failed_countries:
+        print("Retrying failed countries sequentially (single retry each)...")
+        remaining_failures: list[tuple[str, str]] = []
+        for country_code, first_error in failed_countries:
+            try:
+                result = _run_country_report(
+                    run_date,
+                    config,
+                    country_code,
+                    str(output_dir),
+                    report_mode,
+                    target_month,
+                    trends_from_date,
+                )
+                successful_runs.append(result)
+                print(
+                    "Retry success: "
+                    f"{result['docx_path']} | country={result['country_code']} | "
+                    f"GSC={result['gsc_country_filter']} | Senuto country_id={result['senuto_country_id']}"
+                )
+            except Exception as retry_exc:
+                message = f"initial={first_error} | retry={retry_exc}"
+                remaining_failures.append((country_code, message))
+                print(f"Retry failed: {country_code} | {message}")
+        failed_countries = remaining_failures
 
     if drive_client is not None:
         drive_upload_errors: list[str] = []
+        uploaded_countries: set[str] = set()
+        total_uploads = len(successful_runs)
+        completed_uploads = 0
+        if total_uploads > 0:
+            _print_progress("Upload progress", 0, total_uploads)
         for result in successful_runs:
             docx_path = Path(result["docx_path"])
             try:
                 uploaded = drive_client.upload_docx_as_google_doc(docx_path)
+                uploaded_countries.add(str(result.get("country_code", "")).upper())
                 print(
                     "Google Doc created: "
                     f"{uploaded.get('name')} | {uploaded.get('webViewLink', 'no-link')}"
@@ -233,6 +345,52 @@ def main() -> None:
                 )
                 drive_upload_errors.append(message)
                 print(f"Google Drive upload failed: {message}")
+            finally:
+                if total_uploads > 0:
+                    completed_uploads += 1
+                    _print_progress(
+                        "Upload progress",
+                        completed_uploads,
+                        total_uploads,
+                        finalize=completed_uploads >= total_uploads,
+                    )
+
+        # Retry missing uploads once (per country) to reduce partial-export cases.
+        expected_countries = {
+            str(result.get("country_code", "")).upper()
+            for result in successful_runs
+            if str(result.get("country_code", "")).strip()
+        }
+        missing_uploads = sorted(expected_countries - uploaded_countries)
+        if missing_uploads:
+            print(
+                "Retrying missing Google Drive uploads once for countries: "
+                + ",".join(missing_uploads)
+            )
+            for missing_country in missing_uploads:
+                candidate = next(
+                    (
+                        row
+                        for row in successful_runs
+                        if str(row.get("country_code", "")).upper() == missing_country
+                    ),
+                    None,
+                )
+                if not candidate:
+                    continue
+                docx_path = Path(str(candidate.get("docx_path", "")))
+                try:
+                    uploaded = drive_client.upload_docx_as_google_doc(docx_path)
+                    uploaded_countries.add(missing_country)
+                    print(
+                        "Google Doc retry success: "
+                        f"{uploaded.get('name')} | {uploaded.get('webViewLink', 'no-link')}"
+                    )
+                except Exception as retry_exc:
+                    message = f"{missing_country}: retry failed: {retry_exc}"
+                    drive_upload_errors.append(message)
+                    print(f"Google Drive upload retry failed: {message}")
+
         if drive_upload_errors:
             print("Google Drive upload completed with errors (local DOCX reports are still generated):")
             for err in drive_upload_errors:
@@ -252,7 +410,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    gsc_site_url = config.gsc_site_url_map.get(
-        country_code,
-        config.gsc_site_url,
-    )

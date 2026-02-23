@@ -288,6 +288,24 @@ Opcje:
 - `--status-max-topics 10`
 - `--status-llm-name-mapping` / `--no-status-llm-name-mapping`
 
+## Team manager agent (batch + upload do Drive)
+
+Agent generuje plan rozmowy dla calego zespolu na bazie plikow osobowych (Google Docs)
+i statusowego Google Sheeta, a nastepnie zapisuje wynik jako Google Docs w:
+`SEO Team Data/<YYYY-MM-DD>/`.
+
+Przykladowe uruchomienie:
+
+```bash
+source .venv/bin/activate
+set -a; source .env; set +a
+weekly-people-team-agent --exclude "Roksana"
+```
+
+Wynik:
+- lokalne kopie markdown w `outputs/people_manager/team_plans/<YYYY_MM_DD>/`,
+- Google Docs na Drive: po jednym pliku na osobe (nazwa pliku = imie osoby).
+
 ## Harmonogram (opcjonalnie)
 
 ```cron

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import html
+import io
 import json
 import os
 import re
@@ -17,6 +19,7 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -35,11 +38,10 @@ class NoteDoc:
 
 class PeopleNotesClient:
     SCOPES = [
-        "https://www.googleapis.com/auth/drive.readonly",
-        "https://www.googleapis.com/auth/documents.readonly",
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive",
     ]
     DOC_MIME = "application/vnd.google-apps.document"
+    FOLDER_MIME = "application/vnd.google-apps.folder"
 
     def __init__(self, credentials_path: str, token_path: str) -> None:
         self.credentials_path = credentials_path.strip()
@@ -138,6 +140,99 @@ class PeopleNotesClient:
                 cache_discovery=False,
             )
         return self._sheets
+
+    def _find_or_create_folder(self, folder_name: str, parent_id: str = "root") -> str:
+        drive = self._drive_service()
+        escaped = self._escape_query_value(folder_name.strip())
+        query = (
+            f"mimeType='{self.FOLDER_MIME}' and trashed=false and "
+            f"name='{escaped}' and '{parent_id}' in parents"
+        )
+        response = drive.files().list(
+            q=query,
+            spaces="drive",
+            fields="files(id,name)",
+            pageSize=1,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+        files = response.get("files", [])
+        if files:
+            folder_id = str(files[0].get("id", "")).strip()
+            if folder_id:
+                return folder_id
+
+        created = drive.files().create(
+            body={
+                "name": folder_name.strip(),
+                "mimeType": self.FOLDER_MIME,
+                "parents": [parent_id],
+            },
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        folder_id = str(created.get("id", "")).strip()
+        if not folder_id:
+            raise RuntimeError(f"Failed to create Drive folder: {folder_name}")
+        return folder_id
+
+    def ensure_output_folder(self, root_folder_name: str, date_label: str) -> str:
+        root_id = self._find_or_create_folder(root_folder_name.strip() or "SEO Team Data", "root")
+        return self._find_or_create_folder(date_label.strip(), root_id)
+
+    def _delete_existing_docs_by_name(self, folder_id: str, doc_name: str) -> None:
+        drive = self._drive_service()
+        escaped = self._escape_query_value(doc_name.strip())
+        query = (
+            f"mimeType='{self.DOC_MIME}' and trashed=false and "
+            f"name='{escaped}' and '{folder_id}' in parents"
+        )
+        response = drive.files().list(
+            q=query,
+            spaces="drive",
+            fields="files(id,name)",
+            pageSize=50,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+        for row in response.get("files", []):
+            file_id = str(row.get("id", "")).strip()
+            if file_id:
+                drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+
+    def create_google_doc_in_folder(
+        self,
+        folder_id: str,
+        title: str,
+        content: str,
+        replace_existing: bool = True,
+    ) -> dict[str, str]:
+        if replace_existing:
+            self._delete_existing_docs_by_name(folder_id, title)
+
+        drive = self._drive_service()
+        text = _render_html_for_google_doc(content)
+        media = MediaIoBaseUpload(
+            io.BytesIO(text.encode("utf-8")),
+            mimetype="text/html",
+            resumable=False,
+        )
+        moved = drive.files().create(
+            body={
+                "name": title.strip(),
+                "mimeType": self.DOC_MIME,
+                "parents": [folder_id],
+            },
+            media_body=media,
+            fields="id,name,webViewLink,parents",
+            supportsAllDrives=True,
+        ).execute()
+
+        return {
+            "id": str(moved.get("id", "")).strip(),
+            "name": str(moved.get("name", "")).strip(),
+            "webViewLink": str(moved.get("webViewLink", "")).strip(),
+        }
 
     def list_docs_in_folder(self, folder_reference: str, max_docs: int) -> list[dict[str, str]]:
         folder_id = self._extract_drive_id(folder_reference)
@@ -359,6 +454,248 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", ascii_text).strip()
 
 
+SECTION_TITLES = {
+    "performance snapshot",
+    "tematy na 1:1",
+    "tematy do performance review",
+    "tematy ze statusu",
+    "gotowość do awansu",
+    "gotowość do awansu",
+    "mocne strony (evidence)",
+    "ryzyka / blokery (evidence)",
+    "zrodla",
+    "źródła",
+    "rekomendowane cele rozwojowe na 30-60 dni",
+}
+
+YEARLY_REVIEW_TRIGGER_PATTERNS = (
+    r"\byearly review\b",
+    r"\bannual review\b",
+    r"\bhalf[- ]?year review\b",
+    r"\bmid[- ]?year review\b",
+    r"\bh1 review\b",
+    r"\bh2 review\b",
+    r"\broczna? ocena\b",
+    r"\broczne podsumowanie\b",
+    r"\broczny review\b",
+    r"\bocena p[óo]łroczna\b",
+    r"\bp[óo]łroczne podsumowanie\b",
+    r"\bpodsumowanie p[óo]łrocza\b",
+    r"\bocena okresowa\b",
+)
+
+
+def _apply_inline_formatting(text: str) -> str:
+    def format_fragment(value: str) -> str:
+        escaped = html.escape(value)
+        escaped = re.sub(
+            r"\*\*([^*]+)\*\*",
+            lambda m: f"<strong>{html.escape(m.group(1))}</strong>",
+            escaped,
+        )
+        escaped = re.sub(
+            r"\[([^\]]+)\]\(([^)]+)\)",
+            lambda m: f"{html.escape(m.group(1))}: {html.escape(m.group(2))}",
+            escaped,
+        )
+        return escaped
+
+    match = re.match(r"^\s*([^:]{2,80}):\s+(.+)$", text)
+    if match:
+        label = html.escape(match.group(1).strip())
+        value = format_fragment(match.group(2).strip())
+        return f"<strong>{label}:</strong> {value}"
+    return format_fragment(text)
+
+
+def _render_html_for_google_doc(content: str) -> str:
+    raw = content.strip()
+    if not raw:
+        return "<html><body><p>Brak tresci.</p></body></html>"
+
+    lines = [line.rstrip() for line in raw.splitlines()]
+    out: list[str] = [
+        "<html><head><meta charset='utf-8'></head><body>",
+    ]
+    in_list = False
+    title_written = False
+
+    def close_list() -> None:
+        nonlocal in_list
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            close_list()
+            continue
+
+        heading_match = re.match(r"^#{1,6}\s*(.+)$", stripped)
+        if heading_match:
+            close_list()
+            heading = heading_match.group(1).strip()
+            level = 1 if not title_written else 2
+            out.append(f"<h{level}>{html.escape(heading)}</h{level}>")
+            title_written = True
+            continue
+
+        normalized = _normalize_text(stripped).rstrip(":")
+        if normalized in SECTION_TITLES:
+            close_list()
+            if not title_written:
+                out.append(f"<h1>{html.escape(stripped.rstrip(':'))}</h1>")
+                title_written = True
+            else:
+                out.append(f"<h2>{html.escape(stripped.rstrip(':'))}</h2>")
+            continue
+
+        bullet = re.match(r"^\s*(?:[-•]|\d+\.)\s+(.+)$", line)
+        if bullet:
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append(f"<li>{_apply_inline_formatting(bullet.group(1).strip())}</li>")
+            continue
+
+        close_list()
+        out.append(f"<p>{_apply_inline_formatting(stripped)}</p>")
+
+    close_list()
+    out.append("</body></html>")
+    return "".join(out)
+
+
+def _detect_yearly_review_triggers(notes: list[NoteDoc], status_topics: list[str]) -> list[str]:
+    lines: list[str] = []
+    for note in notes:
+        lines.extend(note.text.splitlines())
+    lines.extend(status_topics)
+
+    hits: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        cleaned = re.sub(r"\s+", " ", str(line)).strip()
+        if len(cleaned) < 5:
+            continue
+        normalized = _normalize_text(cleaned)
+        if any(re.search(pattern, normalized) for pattern in YEARLY_REVIEW_TRIGGER_PATTERNS):
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            hits.append(cleaned[:220])
+            if len(hits) >= 3:
+                break
+    return hits
+
+
+def _extract_carryover_topics_from_last_meeting(
+    notes: list[NoteDoc],
+    status_topics: list[str],
+    max_items: int = 18,
+) -> list[str]:
+    candidates: list[str] = []
+
+    if notes:
+        latest = sorted(
+            notes,
+            key=lambda item: _parse_iso_datetime(item.modified_time) or datetime.min,
+            reverse=True,
+        )[0]
+        for raw in latest.text.splitlines():
+            cleaned = re.sub(r"\s+", " ", str(raw)).strip(" -*\t")
+            if len(cleaned) < 5:
+                continue
+            # Skip pure date heading lines.
+            if re.fullmatch(r"\d{4}[._-]\d{2}[._-]\d{2}", cleaned):
+                continue
+            candidates.append(cleaned)
+
+    for row in status_topics:
+        cleaned = re.sub(r"\s+", " ", str(row)).strip(" -*\t")
+        if len(cleaned) >= 5:
+            candidates.append(cleaned)
+
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = _normalize_text(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(item)
+        if len(dedup) >= max(1, max_items):
+            break
+    return dedup
+
+
+def _mandatory_yearly_review_topic(trigger_lines: list[str]) -> str:
+    base = (
+        "Ocena roczna/półroczna: zacznij spotkanie od omówienia oceny rocznej "
+        "i wniosków rozwojowych."
+    )
+    if trigger_lines:
+        return f"{base} Evidence: {trigger_lines[0]}"
+    return base
+
+
+def _enforce_yearly_review_first_topic(report_text: str, trigger_lines: list[str]) -> str:
+    if not trigger_lines:
+        return report_text
+
+    required = f"- {_mandatory_yearly_review_topic(trigger_lines)}"
+    if _normalize_text(required) in _normalize_text(report_text):
+        return report_text
+
+    lines = report_text.splitlines()
+    target_idx = -1
+    for idx, line in enumerate(lines):
+        normalized = _normalize_text(line).replace("## ", "").strip(": ")
+        if normalized in {
+            "tematy na 1:1",
+            "tematy na 1 1",
+            "2. agenda 1:1 (prowadzenie rozmowy)",
+            "2. agenda 1 1 (prowadzenie rozmowy)",
+            "3. agenda 1:1 (prowadzenie rozmowy)",
+            "3. agenda 1 1 (prowadzenie rozmowy)",
+        }:
+            target_idx = idx
+            break
+    if target_idx < 0:
+        return report_text
+
+    insert_idx = target_idx + 1
+    while insert_idx < len(lines) and not lines[insert_idx].strip():
+        insert_idx += 1
+    lines.insert(insert_idx, required)
+    return "\n".join(lines).strip() + "\n"
+
+
+def _coerce_bullet_only_report(report_text: str) -> str:
+    lines = report_text.splitlines()
+    out: list[str] = []
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        if stripped.startswith("#"):
+            out.append(stripped)
+            continue
+        if re.match(r"^\d+\.\s+", stripped):
+            out.append("- " + re.sub(r"^\d+\.\s+", "", stripped))
+            continue
+        if stripped.startswith(("-", "• ")):
+            out.append("- " + stripped.lstrip("-• ").strip())
+            continue
+        out.append("- " + stripped)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out).strip() + "\n"
+
+
 def _parse_iso_datetime(raw: str) -> datetime | None:
     text = str(raw).strip()
     if not text:
@@ -466,10 +803,10 @@ def _llm_pick_status_rows(person_name: str, rows: list[dict[str, str]], max_topi
                 "system",
                 (
                     "Otrzymasz liste wierszy statusowych. "
-                    "Wskaz tylko te, ktore dotycza wskazanej osoby. "
-                    "Dopuszczalne dopasowania: imie, imie+nazwisko, skroty, literowki. "
-                    "Jesli brak pewnosci, pomijaj. "
-                    "Zwroc TYLKO JSON: {\"row_ids\":[1,2,...]}."
+                    "Wskaż tylko te, które dotyczą wskazanej osoby. "
+                    "Dopuszczalne dopasowania: imię, imię+nazwisko, skróty, literówki. "
+                    "Jeśli brak pewności, pomijaj. "
+                    "Zwróć TYLKO JSON: {\"row_ids\":[1,2,...]}."
                 ),
             ),
             (
@@ -538,6 +875,8 @@ def _build_heuristic_assessment(
     status_sheet_reference: str = "",
 ) -> str:
     status_topics = status_topics or []
+    yearly_review_triggers = _detect_yearly_review_triggers(notes, status_topics)
+    carryover_topics = _extract_carryover_topics_from_last_meeting(notes, status_topics)
     positive_tokens = (
         "delivered",
         "dowioz",
@@ -601,13 +940,17 @@ def _build_heuristic_assessment(
     one_on_one_topics: list[str] = []
     review_topics: list[str] = []
 
+    if yearly_review_triggers:
+        one_on_one_topics.append(_mandatory_yearly_review_topic(yearly_review_triggers))
+        review_topics.append("Punkt startowy review: omówienie oceny rocznej/półrocznej i planu rozwojowego.")
+
     for line in strengths[:4]:
         one_on_one_topics.append(f"Podkresl i utrwal: {line}")
         review_topics.append(f"Mocna strona z okresu: {line}")
 
     for line in concerns[:4]:
         one_on_one_topics.append(f"Odblokowanie / wsparcie: {line}")
-        review_topics.append(f"Ryzyko do omowienia: {line}")
+        review_topics.append(f"Ryzyko do omówienia: {line}")
     for line in status_topics[:4]:
         one_on_one_topics.append(f"Status-log: {line}")
         review_topics.append(f"Status-log (evidence): {line}")
@@ -638,57 +981,107 @@ def _build_heuristic_assessment(
         source_list.append(f"- {date_label} | {doc.name} | {doc.web_view_link}")
 
     if not strengths:
-        strengths = ["Brak jednoznacznych sygnalow pozytywnego impactu w notatkach."]
+        strengths = ["Brak jednoznacznych sygnałów pozytywnego impactu w notatkach."]
     if not concerns:
-        concerns = ["Brak wyraznych blockerow w notatkach (warto potwierdzic na 1:1)."]
+        concerns = ["Brak wyraźnych blockerów w notatkach (warto potwierdzić na 1:1)."]
     if not promotion_evidence:
-        promotion_evidence = ["Brak silnych sygnalow poziomu wyzej niz obecna rola."]
+        promotion_evidence = ["Brak silnych sygnałów poziomu wyżej niż obecna rola."]
     if not promotion_gaps:
-        promotion_gaps = ["Doprecyzowac oczekiwania roli docelowej i plan rozwojowy."]
+        promotion_gaps = ["Doprecyzować oczekiwania roli docelowej i plan rozwojowy."]
 
     lines: list[str] = [
-        f"# Manager Support Report: {person_name}",
+        f"# Plan rozmowy 1:1 — {person_name}",
         "",
-        "## Performance Snapshot",
-        f"- Readiness sygnal (promocja): **{readiness}**",
-        f"- Pewnosc oceny (na bazie notatek): **{confidence}**",
-        f"- Liczba przeanalizowanych notatek: **{len(notes)}**",
-        f"- Tematy z pliku statusowego: **{len(status_topics)}**",
+        "## 0. Cel spotkania (1-2 min)",
+        f"- Powiedz: „Dziś przejdziemy przez priorytety, feedback i ustalenia na kolejny okres.”",
+        f"- Status gotowości do awansu: {readiness}.",
+        f"- Pewność oceny na bazie danych: {confidence}.",
+        f"- Dane wejściowe: notatki={len(notes)}, tematy statusowe={len(status_topics)}.",
         "",
-        "## Tematy na 1:1",
     ]
-    lines.extend(f"- {item}" for item in one_on_one_topics or ["Brak wystarczajacych danych."])
 
-    lines.append("")
-    lines.append("## Tematy do Performance Review")
-    lines.extend(f"- {item}" for item in review_topics or ["Brak wystarczajacych danych."])
+    if yearly_review_triggers:
+        lines.extend(
+            [
+                "## 1. Ocena roczna/półroczna (zacznij od tego tylko gdy to review)",
+                "- Powiedz: „Chcę zacząć od omówienia Twojej oceny rocznej/półrocznej.”",
+                f"- Powiedz: „Na dziś oceniam gotowość do kolejnego poziomu jako: {readiness}.”",
+                "- Powiedz: „Najmocniejsze obszary to poniższe przykłady z ostatniego okresu.”",
+                "- Powiedz: „Poniżej są też luki do domknięcia i konkretny plan rozwojowy.”",
+                "- Zapytaj: „Jak Ty oceniasz ten okres i co uznajesz za największy sukces?”",
+                "",
+            ]
+        )
 
-    lines.append("")
-    lines.append("## Tematy ze statusu")
-    lines.extend(f"- {item}" for item in status_topics or ["Brak wpisow statusowych dla tej osoby."])
+    lines.extend(
+        [
+            "## 2. Zacznij od otwartych tematów z poprzedniego 1:1",
+        ]
+    )
+    lines.extend(
+        f"- {topic}" for topic in carryover_topics[:12] or ["Brak otwartych tematów z poprzedniego spotkania."]
+    )
 
-    lines.append("")
-    lines.append("## Gotowosc do awansu")
-    lines.append("- Sygnaly za:")
+    lines.extend(
+        [
+            "",
+            "## 3. Agenda 1:1 (prowadzenie rozmowy)",
+        ]
+    )
+    lines.extend(f"- {item}" for item in one_on_one_topics or ["Brak wystarczających danych."])
+
+    lines.extend(
+        [
+            "",
+            "## 4. Punkty do performance review (ściągawka managera)",
+        ]
+    )
+    lines.extend(f"- {item}" for item in review_topics or ["Brak wystarczających danych."])
+
+    lines.extend(
+        [
+            "",
+            "## 5. Gotowe sformułowania feedbacku (powiedz to)",
+            f"- Powiedz: „Widzę, że Twoje najmocniejsze strony to: {strengths[0]}”.",
+            f"- Powiedz: „Obszar do poprawy, który chcę żebyśmy domknęli: {promotion_gaps[0]}”.",
+            "- Powiedz: „Ustalmy konkretny plan na kolejne 30-60 dni i miernik postępu.”",
+            "",
+            "## 6. Decyzja o gotowości do awansu",
+            f"- Sygnał końcowy: {readiness}.",
+            "- Sygnały za:",
+        ]
+    )
     lines.extend(f"- {item}" for item in promotion_evidence)
-    lines.append("- Luki do domkniecia:")
+    lines.append("- Luki do domknięcia:")
     lines.extend(f"- {item}" for item in promotion_gaps)
 
-    lines.append("")
-    lines.append("## Mocne strony (evidence)")
+    lines.extend(["", "## 7. Follow-up po spotkaniu (checklista)"])
+    lines.extend(
+        [
+            "- Potwierdź 2-3 konkretne cele na następny okres.",
+            "- Ustal właścicieli i terminy dla tematów blokujących.",
+            "- Wyślij krótkie podsumowanie po spotkaniu.",
+        ]
+    )
+
+    lines.extend(["", "## Ściągawka dowodowa"])
+    lines.append("- Mocne strony (evidence):")
     lines.extend(f"- {item}" for item in strengths)
-
-    lines.append("")
-    lines.append("## Ryzyka / blokery (evidence)")
+    lines.append("- Ryzyka / blokery (evidence):")
     lines.extend(f"- {item}" for item in concerns)
+    if status_topics:
+        lines.append("- Tematy ze statusu:")
+        lines.extend(f"- {item}" for item in status_topics)
 
-    lines.append("")
-    lines.append("## Zrodla")
+    lines.extend(["", "## Źródła"])
     lines.extend(source_list)
+    if yearly_review_triggers:
+        lines.append("- Trigger yearly/half-year:")
+        lines.extend(f"- {line}" for line in yearly_review_triggers)
     if status_sheet_reference.strip():
-        lines.append(f"- status sheet: {status_sheet_reference.strip()}")
+        lines.append(f"- Status sheet: {status_sheet_reference.strip()}")
 
-    return "\n".join(lines).strip() + "\n"
+    return _coerce_bullet_only_report("\n".join(lines).strip() + "\n")
 
 
 def _llm_assessment(
@@ -696,10 +1089,12 @@ def _llm_assessment(
     notes: list[NoteDoc],
     baseline_report: str,
     status_topics: list[str] | None = None,
+    yearly_review_triggers: list[str] | None = None,
 ) -> str:
     config = AgentConfig.from_env()
     llm = build_gaia_llm(config)
     status_topics = status_topics or []
+    yearly_review_triggers = yearly_review_triggers or []
 
     notes_blob_parts: list[str] = []
     for idx, doc in enumerate(notes, start=1):
@@ -710,6 +1105,7 @@ def _llm_assessment(
 
     notes_blob = "\n\n".join(notes_blob_parts)
     status_blob = "\n".join(f"- {row}" for row in status_topics) if status_topics else "No status topics."
+    yearly_blob = "\n".join(f"- {line}" for line in yearly_review_triggers) if yearly_review_triggers else "No yearly/half-year trigger."
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -717,10 +1113,15 @@ def _llm_assessment(
                 (
                     "Jestes manager-coachem. Analizujesz notatki o pracowniku i tworzysz material dla managera. "
                     "Nie wymyslaj faktow, uzywaj tylko danych ze zrodel. "
-                    "Pisz po polsku. "
-                    "Uzyj markdown. W kazdym punkcie odwolyj sie do evidence z notatek. "
-                    "Sekcje wymagane: Performance Snapshot, Tematy na 1:1, Tematy do Performance Review, "
-                    "Gotowosc do awansu, Mocne strony (evidence), Ryzyka/blokery (evidence), Rekomendowane cele rozwojowe na 30-60 dni."
+                    "Pisz po polsku i używaj polskich znaków diakrytycznych. "
+                    "Zwracaj czysty tekst w formie sciagawki do prowadzenia rozmowy. "
+                    "Uzywaj TYLKO podpunktow (krotkie linie). "
+                    "W kazdym punkcie odwolyj sie do evidence z notatek. "
+                    "Jesli wykryto yearly/half-year review trigger, PIERWSZY punkt w sekcji "
+                    "'Tematy na 1:1' musi zaczynac sie od omowienia oceny rocznej/polrocznej. "
+                    "Sekcje wymagane: 0. Cel spotkania, 1. Ocena roczna/polroczna (jesli trigger), "
+                    "2. Agenda 1:1, 3. Punkty do performance review, 4. Gotowe sformulowania feedbacku, "
+                    "5. Decyzja o gotowosci do awansu, 6. Follow-up, Sciagawka dowodowa."
                 ),
             ),
             (
@@ -731,6 +1132,8 @@ def _llm_assessment(
                     f"{baseline_report}\n\n"
                     "Status topics from spreadsheet:\n"
                     f"{status_blob}\n\n"
+                    "Yearly/Half-year trigger lines:\n"
+                    f"{yearly_blob}\n\n"
                     "Source notes:\n"
                     f"{notes_blob}"
                 ),
@@ -938,6 +1341,8 @@ def main() -> None:
         status_topics=status_topics,
         status_sheet_reference=status_ref,
     )
+    yearly_review_triggers = _detect_yearly_review_triggers(note_docs, status_topics)
+    heuristic_report = _enforce_yearly_review_first_topic(heuristic_report, yearly_review_triggers)
     final_report = heuristic_report
 
     use_llm = not args.no_llm
@@ -948,7 +1353,10 @@ def main() -> None:
                 note_docs,
                 heuristic_report,
                 status_topics=status_topics,
+                yearly_review_triggers=yearly_review_triggers,
             )
+            final_report = _enforce_yearly_review_first_topic(final_report, yearly_review_triggers)
+            final_report = _coerce_bullet_only_report(final_report)
         except Exception:
             final_report = heuristic_report
 

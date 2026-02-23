@@ -131,8 +131,8 @@ class ExternalSignalsClient:
         self.news_keywords = tuple(keyword.lower() for keyword in news_keywords)
         self.news_max_signals = news_max_signals
         self._subdivision_name_cache: dict[str, str] | None = None
-        self._http_retry_attempts = 3
-        self._http_retry_backoff_sec = 1.2
+        self._http_retry_attempts = 2
+        self._http_retry_backoff_sec = 0.8
 
     def _http_get(
         self,
@@ -140,7 +140,7 @@ class ExternalSignalsClient:
         *,
         params: dict[str, object] | None = None,
         headers: dict[str, str] | None = None,
-        timeout: int = 30,
+        timeout: int = 18,
     ) -> requests.Response:
         last_error: Exception | None = None
         for attempt in range(1, self._http_retry_attempts + 1):

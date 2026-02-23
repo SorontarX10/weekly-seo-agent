@@ -38,33 +38,37 @@ def _parse_run_date(raw: str | None) -> date:
 
 def _format_item(item: NewsItem) -> str:
     date_label = item.published.isoformat() if item.published else "unknown date"
+    source_label = item.source or item.domain or "unknown source"
+    summary = re.sub(r"\s+", " ", (item.summary or "")).strip()
     lines = [
-        f"{date_label} | {item.title}",
-        f"Źródło: {item.url}",
-        f"Opis: {item.summary}",
+        f"- {date_label} | {item.title}",
+        f"  Source: {source_label}",
+        f"  Link: {item.url}",
+        f"  Why it matters: {summary}",
     ]
     return "\n".join(lines)
 
 
 def _fallback_summary(seo_items: list[NewsItem], geo_items: list[NewsItem]) -> str:
-    lines: list[str] = []
-    lines.append("SEO")
-    if seo_items:
-        for idx, item in enumerate(seo_items, start=1):
-            lines.append(f"{idx}. {_format_item(item)}")
-            lines.append("")
-    else:
-        lines.append("Brak istotnych publikacji w tym tygodniu.")
+    def section(title: str, items: list[NewsItem], max_display: int) -> list[str]:
+        lines: list[str] = [f"{title}"]
+        if not items:
+            lines.append("- Brak istotnych publikacji w tym tygodniu.")
+            return lines
 
+        display = items[:max_display]
+        for item in display:
+            lines.append(_format_item(item))
+        hidden = max(0, len(items) - len(display))
+        if hidden:
+            lines.append(f"- (+{hidden} więcej pozycji pominiętych dla czytelności)")
+        return lines
+
+    lines: list[str] = []
+    lines.extend(section("SEO", seo_items, max_display=8))
     lines.append("")
-    lines.append("GEO")
-    if geo_items:
-        for idx, item in enumerate(geo_items, start=1):
-            lines.append(f"{idx}. {_format_item(item)}")
-            lines.append("")
-    else:
-        lines.append("Brak istotnych publikacji w tym tygodniu.")
-    return "\n".join(line for line in lines if line.strip() != "")
+    lines.extend(section("GEO", geo_items, max_display=6))
+    return "\n".join(lines).strip()
 
 
 def _llm_summary(config: AgentConfig, seo_items: list[NewsItem], geo_items: list[NewsItem]) -> str:
@@ -88,21 +92,22 @@ def _llm_summary(config: AgentConfig, seo_items: list[NewsItem], geo_items: list
                     "Podsumuj kluczowe newsy z ostatniego pelnego tygodnia. "
                     "Zasady: nie wymyslaj faktow, nie dopisuj danych spoza listy. "
                     "Uzyj jezyka polskiego. "
-                    "W kazdym punkcie podaj date publikacji i zrodlo (pelny URL). "
-                    "Skup sie na tym, co ma wplyw na SEO lub GEO, i dodaj 1-2 zdania "
+                    "Skup sie na tym, co ma wplyw na SEO lub GEO, i dodaj 1 zdanie "
                     "o potencjalnym znaczeniu dla strategii. "
-                    "Uzyj CZYSTEGO TEKSTU (bez markdown, bez gwiazdek i bez list punktowanych). "
+                    "Uzyj CZYSTEGO TEKSTU. Zachowaj bardzo czytelny i krotki format. "
+                    "Maks: 8 pozycji SEO i 6 pozycji GEO. "
                     "Format dokladnie:\n"
                     "SEO\n"
-                    "1. <data> | <tytul>\n"
-                    "Źródło: <pelny URL>\n"
-                    "Podsumowanie: <1-2 zdania>\n"
-                    "2. ...\n"
+                    "- <data> | <tytul>\n"
+                    "  Source: <nazwa zrodla>\n"
+                    "  Link: <URL>\n"
+                    "  Why it matters: <1 zdanie>\n"
                     "\n"
                     "GEO\n"
-                    "1. <data> | <tytul>\n"
-                    "Źródło: <pelny URL>\n"
-                    "Podsumowanie: <1-2 zdania>"
+                    "- <data> | <tytul>\n"
+                    "  Source: <nazwa zrodla>\n"
+                    "  Link: <URL>\n"
+                    "  Why it matters: <1 zdanie>"
                 ),
             ),
             (
@@ -122,8 +127,9 @@ def _llm_summary(config: AgentConfig, seo_items: list[NewsItem], geo_items: list
 def _sanitize_output(text: str) -> str:
     sanitized = text.replace("**", "").replace("__", "").replace("`", "")
     sanitized = re.sub(r"^#+\s*", "", sanitized, flags=re.MULTILINE)
-    sanitized = re.sub(r"^\s*[-*]\s*", "", sanitized, flags=re.MULTILINE)
+    sanitized = re.sub(r"^\s*\*\s+", "- ", sanitized, flags=re.MULTILINE)
     sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+    sanitized = re.sub(r"^\s*No items\.\s*$", "- Brak istotnych publikacji w tym tygodniu.", sanitized, flags=re.MULTILINE)
     return sanitized.strip()
 
 

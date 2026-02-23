@@ -32,6 +32,7 @@ weekly-seo-senuto-token = "weekly_seo_agent.weekly_reporting_agent.tools.senuto_
 weekly-seo-news-agent = "weekly_seo_agent.weekly_reporting_agent.news_agent:main"
 weekly-seo-gmail-token = "weekly_seo_agent.weekly_reporting_agent.tools.gmail_refresh_token:main"
 weekly-people-manager-agent = "weekly_seo_agent.people_manager_agent:main"
+weekly-people-team-agent = "weekly_seo_agent.people_team_agent:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
