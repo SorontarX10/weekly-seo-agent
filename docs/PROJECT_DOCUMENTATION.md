@@ -219,6 +219,41 @@ Current safety/quality patterns:
 
 To reuse this project beyond SEO:
 
+## 14. Free Public Source Hub (20 sources)
+
+The workflow now includes `free_public_source_hub` in `additional_context` and report appendix.
+
+Purpose:
+
+- track availability and payload quality of free/public APIs + RSS,
+- enrich weekly reasoning with external context without paid subscriptions,
+- keep one inventory table with status (`ok` / `empty` / `error` / `integrated` / `skipped`).
+
+Main env toggles:
+
+- `FREE_PUBLIC_SOURCES_ENABLED=true`
+- `FREE_PUBLIC_SOURCES_TOP_ROWS=3`
+- `NAGER_HOLIDAYS_COUNTRY_CODE=PL`
+- `EIA_API_KEY=` (optional; only if you want EIA data)
+
+Credentials needed (and how to get them):
+
+1. **No credential required** (public endpoints):
+   - Google News RSS, Google Search Central RSS, Search Engine Journal RSS, Search Engine Land RSS,
+   - Search Engine Roundtable RSS, Reuters RSS, Eurostat RSS/API endpoint checks, OECD RSS/API endpoint checks,
+   - Nager.Date API, Frankfurter API, Open-Meteo API, Wikimedia Pageviews API, Wikidata API, OpenSky API.
+
+2. **Optional API key**:
+   - `EIA_API_KEY` for U.S. Energy Information Administration.
+   - Get key at: `https://www.eia.gov/opendata/register.php`
+   - Put it in `.env`: `EIA_API_KEY=...`
+
+3. **Existing project credentials still required for non-free internal sources**:
+   - Google Drive / Docs OAuth (`GOOGLE_DRIVE_*`),
+   - GSC OAuth / service account (`GSC_*`),
+   - GA4 service account (`GA4_*`),
+   - Senuto (`SENUTO_*`) if used.
+
 1. Keep `workflow.py` orchestration pattern (collect -> analyze -> synthesize -> validate -> publish).
 2. Replace/extend source clients with:
    - paid channels,

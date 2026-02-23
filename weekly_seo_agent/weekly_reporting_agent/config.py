@@ -232,6 +232,10 @@ class AgentConfig:
     market_events_enabled: bool
     market_events_api_base_url: str
     market_events_top_rows: int
+    free_public_sources_enabled: bool
+    free_public_sources_top_rows: int
+    nager_holidays_country_code: str
+    eia_api_key: str
     nbp_api_base_url: str
     imgw_warnings_url: str
     news_scraping_enabled: bool
@@ -559,6 +563,10 @@ class AgentConfig:
                 "https://api.gdeltproject.org/api/v2/doc/doc",
             ),
             market_events_top_rows=_env_int("MARKET_EVENTS_TOP_ROWS", 12),
+            free_public_sources_enabled=_env_bool("FREE_PUBLIC_SOURCES_ENABLED", True),
+            free_public_sources_top_rows=_env_int("FREE_PUBLIC_SOURCES_TOP_ROWS", 3),
+            nager_holidays_country_code=_env("NAGER_HOLIDAYS_COUNTRY_CODE", _env("HOLIDAYS_COUNTRY_CODE", "PL")).upper(),
+            eia_api_key=_env("EIA_API_KEY"),
             nbp_api_base_url=_env("NBP_API_BASE_URL", "https://api.nbp.pl/api"),
             imgw_warnings_url=_env(
                 "IMGW_WARNINGS_URL",

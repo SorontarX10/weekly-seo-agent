@@ -115,6 +115,7 @@ def _build_country_config(config: AgentConfig, country_code: str) -> tuple[Agent
         weather_longitude=weather_longitude,
         weather_label=weather_label,
         holidays_country_code=holidays_country_code,
+        nager_holidays_country_code=holidays_country_code,
         holidays_language_code=holidays_language_code,
         google_trends_rss_url=google_trends_rss_url,
         nbp_api_base_url=nbp_api_base_url,

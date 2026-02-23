@@ -55,6 +55,25 @@ DUCKDUCKGO_API_URL = "https://api.duckduckgo.com/"
 GOOGLE_TRENDS_BRAND_CACHE_TTL_SEC = 24 * 3600
 GOOGLE_TRENDS_BRAND_THROTTLE_SEC = 0.9
 
+FREE_PUBLIC_CITY_COORDS: dict[str, tuple[float, float]] = {
+    "PL": (52.2297, 21.0122),  # Warsaw
+    "CZ": (50.0755, 14.4378),  # Prague
+    "SK": (48.1486, 17.1077),  # Bratislava
+    "HU": (47.4979, 19.0402),  # Budapest
+}
+
+FREE_PUBLIC_RSS_SOURCES: tuple[tuple[str, str, str], ...] = (
+    ("Google Search Central Blog", "https://developers.google.com/search/blog/rss.xml", "high"),
+    ("Search Engine Roundtable", "https://www.seroundtable.com/index.xml", "medium"),
+    ("Search Engine Journal", "https://www.searchenginejournal.com/feed/", "medium"),
+    ("Search Engine Land", "https://searchengineland.com/feed", "medium"),
+    ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews", "medium"),
+    ("Eurostat News", "https://ec.europa.eu/eurostat/web/main/news/rss", "info"),
+    ("OECD Newsroom", "https://www.oecd.org/newsroom/rss.xml", "info"),
+    ("ECB Press", "https://www.ecb.europa.eu/rss/press.html", "info"),
+    ("Wikidata Status", "https://www.wikidata.org/w/index.php?title=Special:RecentChanges&feed=rss", "info"),
+)
+
 CAMPAIGN_KEYWORDS = (
     "allegro days",
     "allegro day",
@@ -561,6 +580,439 @@ def _fetch_macro_backdrop(country_code: str) -> dict[str, Any]:
     return out
 
 
+def _safe_get_json(
+    *,
+    url: str,
+    params: dict[str, object] | None = None,
+    timeout: int = 25,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    response = requests.get(url, params=params or {}, timeout=timeout, headers=headers or {})
+    response.raise_for_status()
+    return response.json()
+
+
+def _collect_free_public_rss_signals(
+    *,
+    since: date,
+    top_rows: int,
+) -> tuple[list[dict[str, str]], list[ExternalSignal]]:
+    rows: list[dict[str, str]] = []
+    signals: list[ExternalSignal] = []
+    for label, url, severity in FREE_PUBLIC_RSS_SOURCES:
+        items = _fetch_generic_rss_signals(
+            url=url,
+            source_label=f"Free RSS: {label}",
+            since=since,
+            max_rows=max(1, top_rows),
+            severity=severity,
+        )
+        rows.append(
+            {
+                "source": label,
+                "type": "rss",
+                "status": "ok" if items else "empty",
+                "details": f"rows={len(items)}",
+                "url": url,
+            }
+        )
+        signals.extend(items[: max(1, min(3, top_rows))])
+    return rows, signals
+
+
+def _collect_free_public_api_rows(
+    *,
+    country_code: str,
+    run_date: date,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    target_domain: str,
+    nager_country_code: str,
+    eia_api_key: str,
+) -> tuple[list[dict[str, str]], list[ExternalSignal]]:
+    rows: list[dict[str, str]] = []
+    signals: list[ExternalSignal] = []
+    coords = FREE_PUBLIC_CITY_COORDS.get(country_code.strip().upper(), FREE_PUBLIC_CITY_COORDS["PL"])
+
+    # 1) Nager.Date public holidays
+    try:
+        holidays_url = f"https://date.nager.at/api/v3/PublicHolidays/{run_date.year}/{nager_country_code}"
+        payload = _safe_get_json(url=holidays_url, timeout=25)
+        count = len(payload) if isinstance(payload, list) else 0
+        rows.append(
+            {
+                "source": "Nager.Date Holidays API",
+                "type": "api",
+                "status": "ok",
+                "details": f"year={run_date.year}; rows={count}",
+                "url": holidays_url,
+            }
+        )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "Nager.Date Holidays API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://date.nager.at/Api",
+            }
+        )
+
+    # 2) Frankfurter FX
+    try:
+        fx = _safe_get_json(
+            url="https://api.frankfurter.app/latest",
+            params={"from": "EUR", "to": "PLN,CZK,HUF"},
+        )
+        rates = fx.get("rates", {}) if isinstance(fx, dict) else {}
+        rows.append(
+            {
+                "source": "Frankfurter FX API",
+                "type": "api",
+                "status": "ok",
+                "details": f"rates={','.join(sorted(str(k) for k in rates.keys()))}" if isinstance(rates, dict) else "rates=n/a",
+                "url": "https://www.frankfurter.app/docs/",
+            }
+        )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "Frankfurter FX API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://www.frankfurter.app/docs/",
+            }
+        )
+
+    # 3) Open-Meteo forecast
+    try:
+        weather = _safe_get_json(
+            url="https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": coords[0],
+                "longitude": coords[1],
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
+                "forecast_days": 7,
+                "timezone": "UTC",
+            },
+        )
+        daily = weather.get("daily", {}) if isinstance(weather, dict) else {}
+        days = len(daily.get("time", [])) if isinstance(daily, dict) and isinstance(daily.get("time", []), list) else 0
+        rows.append(
+            {
+                "source": "Open-Meteo API",
+                "type": "api",
+                "status": "ok",
+                "details": f"forecast_days={days}",
+                "url": "https://open-meteo.com/en/docs",
+            }
+        )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "Open-Meteo API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://open-meteo.com/en/docs",
+            }
+        )
+
+    # 4) OpenAQ latest (public)
+    try:
+        openaq = _safe_get_json(
+            url="https://api.openaq.org/v3/latest",
+            params={"limit": 5, "coordinates": f"{coords[0]},{coords[1]}", "radius": 25000},
+            headers={"X-API-Key": ""},
+        )
+        results = openaq.get("results", []) if isinstance(openaq, dict) else []
+        rows.append(
+            {
+                "source": "OpenAQ API",
+                "type": "api",
+                "status": "ok",
+                "details": f"results={len(results) if isinstance(results, list) else 0}",
+                "url": "https://docs.openaq.org/",
+            }
+        )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "OpenAQ API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://docs.openaq.org/",
+            }
+        )
+
+    # 5) Wikimedia pageviews
+    try:
+        project = "en.wikipedia.org"
+        article = "Allegro"
+        start = previous_window.start.strftime("%Y%m%d") + "00"
+        end = current_window.end.strftime("%Y%m%d") + "00"
+        pageviews_url = (
+            f"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
+            f"{project}/all-access/user/{article}/daily/{start}/{end}"
+        )
+        pageviews = _safe_get_json(url=pageviews_url)
+        items = pageviews.get("items", []) if isinstance(pageviews, dict) else []
+        total = 0
+        if isinstance(items, list):
+            for row in items:
+                if isinstance(row, dict):
+                    total += int(row.get("views", 0) or 0)
+        rows.append(
+            {
+                "source": "Wikimedia Pageviews API",
+                "type": "api",
+                "status": "ok",
+                "details": f"article={article}; total_views={total}",
+                "url": "https://wikitech.wikimedia.org/wiki/Analytics/AQS/Pageviews",
+            }
+        )
+        if total > 0:
+            signals.append(
+                ExternalSignal(
+                    source=f"Wikimedia Pageviews ({country_code})",
+                    day=run_date,
+                    title="Public interest proxy: Allegro pageviews",
+                    details=f"Wikipedia pageviews in analysis window: {total}.",
+                    severity="info",
+                    url="https://www.wikidata.org/wiki/Q78131",
+                )
+            )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "Wikimedia Pageviews API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://wikitech.wikimedia.org/wiki/Analytics/AQS/Pageviews",
+            }
+        )
+
+    # 6) Wikidata entity lookup
+    try:
+        wikidata_url = "https://www.wikidata.org/w/api.php"
+        payload = _safe_get_json(
+            url=wikidata_url,
+            params={"action": "wbsearchentities", "search": target_domain.split(".")[0], "language": "en", "format": "json", "limit": 3},
+        )
+        search_rows = payload.get("search", []) if isinstance(payload, dict) else []
+        rows.append(
+            {
+                "source": "Wikidata API",
+                "type": "api",
+                "status": "ok",
+                "details": f"entities={len(search_rows) if isinstance(search_rows, list) else 0}",
+                "url": "https://www.wikidata.org/w/api.php",
+            }
+        )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "Wikidata API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://www.wikidata.org/w/api.php",
+            }
+        )
+
+    # 7) Eurostat SDMX (simple availability check)
+    try:
+        eurostat_url = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/3.0/data/"
+        response = requests.get(eurostat_url, timeout=20)
+        response.raise_for_status()
+        rows.append(
+            {
+                "source": "Eurostat SDMX API",
+                "type": "api",
+                "status": "ok",
+                "details": "endpoint reachable",
+                "url": eurostat_url,
+            }
+        )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "Eurostat SDMX API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://ec.europa.eu/eurostat/api/dissemination/sdmx/3.0/",
+            }
+        )
+
+    # 8) OECD SDMX API
+    try:
+        oecd_url = "https://sdmx.oecd.org/public/rest/dataflow"
+        response = requests.get(oecd_url, timeout=20)
+        response.raise_for_status()
+        rows.append(
+            {
+                "source": "OECD SDMX API",
+                "type": "api",
+                "status": "ok",
+                "details": "endpoint reachable",
+                "url": oecd_url,
+            }
+        )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "OECD SDMX API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://sdmx.oecd.org/public/rest/",
+            }
+        )
+
+    # 9) OpenSky API
+    try:
+        states = _safe_get_json(url="https://opensky-network.org/api/states/all", timeout=20)
+        total_states = len(states.get("states", [])) if isinstance(states, dict) and isinstance(states.get("states", []), list) else 0
+        rows.append(
+            {
+                "source": "OpenSky Network API",
+                "type": "api",
+                "status": "ok",
+                "details": f"states={total_states}",
+                "url": "https://openskynetwork.github.io/opensky-api/rest.html",
+            }
+        )
+    except Exception as exc:
+        rows.append(
+            {
+                "source": "OpenSky Network API",
+                "type": "api",
+                "status": "error",
+                "details": str(exc)[:180],
+                "url": "https://openskynetwork.github.io/opensky-api/rest.html",
+            }
+        )
+
+    # 10) EIA Open Data (optional API key)
+    if eia_api_key.strip():
+        try:
+            eia_url = "https://api.eia.gov/v2/total-energy/data/"
+            eia_payload = _safe_get_json(
+                url=eia_url,
+                params={"api_key": eia_api_key, "frequency": "monthly", "data[0]": "value", "length": 1},
+                timeout=25,
+            )
+            data_rows = (((eia_payload or {}).get("response", {}) if isinstance(eia_payload, dict) else {}).get("data", []))
+            rows.append(
+                {
+                    "source": "EIA Open Data API",
+                    "type": "api",
+                    "status": "ok",
+                    "details": f"rows={len(data_rows) if isinstance(data_rows, list) else 0}",
+                    "url": "https://www.eia.gov/opendata/",
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "source": "EIA Open Data API",
+                    "type": "api",
+                    "status": "error",
+                    "details": str(exc)[:180],
+                    "url": "https://www.eia.gov/opendata/",
+                }
+            )
+    else:
+        rows.append(
+            {
+                "source": "EIA Open Data API",
+                "type": "api",
+                "status": "skipped",
+                "details": "missing EIA_API_KEY",
+                "url": "https://www.eia.gov/opendata/",
+            }
+        )
+
+    return rows, signals
+
+
+def _collect_free_public_source_hub(
+    *,
+    country_code: str,
+    run_date: date,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    target_domain: str,
+    enabled: bool,
+    top_rows_per_source: int,
+    nager_country_code: str,
+    eia_api_key: str,
+) -> tuple[dict[str, Any], list[ExternalSignal]]:
+    if not enabled:
+        return {
+            "enabled": False,
+            "source": "Free public source hub",
+            "rows": [],
+            "errors": [],
+            "note": "Disabled by configuration.",
+        }, []
+
+    rows: list[dict[str, str]] = []
+    signals: list[ExternalSignal] = []
+    errors: list[str] = []
+
+    try:
+        rss_rows, rss_signals = _collect_free_public_rss_signals(
+            since=previous_window.start,
+            top_rows=max(1, top_rows_per_source),
+        )
+        rows.extend(rss_rows)
+        signals.extend(rss_signals)
+    except Exception as exc:
+        errors.append(f"RSS group failed: {exc}")
+
+    try:
+        api_rows, api_signals = _collect_free_public_api_rows(
+            country_code=country_code,
+            run_date=run_date,
+            current_window=current_window,
+            previous_window=previous_window,
+            target_domain=target_domain,
+            nager_country_code=nager_country_code,
+            eia_api_key=eia_api_key,
+        )
+        rows.extend(api_rows)
+        signals.extend(api_signals)
+    except Exception as exc:
+        errors.append(f"API group failed: {exc}")
+
+    # Explicitly track sources already integrated elsewhere in pipeline,
+    # so this hub represents full 20-source inventory in one place.
+    rows.extend(
+        [
+            {"source": "Google News RSS queries", "type": "native", "status": "integrated", "details": "campaign + competitor + operational", "url": "https://news.google.com/rss"},
+            {"source": "GDELT DOC API", "type": "native", "status": "integrated", "details": "market_event_calendar", "url": "https://api.gdeltproject.org/api/v2/doc/doc"},
+            {"source": "OpenHolidays API", "type": "native", "status": "integrated", "details": "public holidays + school breaks", "url": "https://openholidaysapi.org"},
+            {"source": "NBP API", "type": "native", "status": "integrated", "details": "fx in macro context", "url": "https://api.nbp.pl/api"},
+            {"source": "World Bank API", "type": "native", "status": "integrated", "details": "macro_backdrop", "url": "https://api.worldbank.org"},
+        ]
+    )
+
+    return {
+        "enabled": True,
+        "source": "Free public source hub",
+        "country_code": country_code,
+        "rows": rows[:80],
+        "errors": errors,
+        "top_rows_per_source": max(1, top_rows_per_source),
+    }, signals[:40]
+
+
 def _market_event_type(text: str) -> str:
     lowered = text.lower()
     if any(token in lowered for token in ("black friday", "cyber monday", "sale", "promotion", "discount", "smart week", "allegro days", "megaraty")):
@@ -951,6 +1403,10 @@ def collect_additional_context(
     market_events_enabled: bool = True,
     market_events_api_base_url: str = "https://api.gdeltproject.org/api/v2/doc/doc",
     market_events_top_rows: int = 12,
+    free_public_sources_enabled: bool = True,
+    free_public_sources_top_rows: int = 3,
+    nager_holidays_country_code: str = "PL",
+    eia_api_key: str = "",
 ) -> tuple[dict[str, Any], list[ExternalSignal]]:
     country_code = report_country_code.strip().upper() or "PL"
     context: dict[str, Any] = {
@@ -972,6 +1428,7 @@ def collect_additional_context(
         "product_trends": {},
         "trade_plan": {},
         "platform_regulatory_pulse": {},
+        "free_public_source_hub": {},
         "errors": [],
     }
     signals: list[ExternalSignal] = []
@@ -1329,6 +1786,23 @@ def collect_additional_context(
                 "errors": [str(exc)],
             }
             context["errors"].append(f"Platform/regulatory pulse fetch failed: {exc}")
+
+    try:
+        free_public_ctx, free_public_signals = _collect_free_public_source_hub(
+            country_code=country_code,
+            run_date=run_date,
+            current_window=current_window,
+            previous_window=previous_window,
+            target_domain=target_domain,
+            enabled=free_public_sources_enabled,
+            top_rows_per_source=max(1, int(free_public_sources_top_rows)),
+            nager_country_code=(nager_holidays_country_code or country_code).strip().upper() or country_code,
+            eia_api_key=eia_api_key,
+        )
+        context["free_public_source_hub"] = free_public_ctx
+        signals.extend(free_public_signals)
+    except Exception as exc:
+        context["errors"].append(f"Free public source hub fetch failed: {exc}")
 
     # DuckDuckGo as fallback-only context source: run only when stronger sources are sparse.
     stronger_signal_count = sum(

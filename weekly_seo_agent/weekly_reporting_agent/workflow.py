@@ -1131,6 +1131,10 @@ def _extract_key_data_packets(
                 additional_context.get("competitor_promo_radar", {}) if isinstance(additional_context, dict) else {},
                 top_n=6,
             ),
+            "free_public_source_hub": _compact_ctx_rows(
+                additional_context.get("free_public_source_hub", {}) if isinstance(additional_context, dict) else {},
+                top_n=10,
+            ),
             "status_log": _compact_ctx_rows(
                 additional_context.get("status_log", {}) if isinstance(additional_context, dict) else {},
                 top_n=6,
@@ -2116,6 +2120,10 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 market_events_enabled=config.market_events_enabled,
                 market_events_api_base_url=config.market_events_api_base_url,
                 market_events_top_rows=config.market_events_top_rows,
+                free_public_sources_enabled=config.free_public_sources_enabled,
+                free_public_sources_top_rows=config.free_public_sources_top_rows,
+                nager_holidays_country_code=config.nager_holidays_country_code,
+                eia_api_key=config.eia_api_key,
             )
             try:
                 external_signals, weather_summary = future_external.result(

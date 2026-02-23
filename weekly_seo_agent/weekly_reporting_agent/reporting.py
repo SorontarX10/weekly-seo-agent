@@ -440,6 +440,213 @@ def _campaign_event_context(
     }
 
 
+def _parse_iso_date(value: object) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _shorten(value: object, limit: int = 120) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _extract_country_hint(text: str, fallback_country: str) -> str:
+    normalized = str(text or "").upper()
+    token = re.search(r"\b(PL|CZ|SK|HU)\b", normalized)
+    if token:
+        return token.group(1)
+    return (fallback_country or "PL").strip().upper() or "PL"
+
+
+def _marketplace_timeline_rows(
+    *,
+    additional_context: dict[str, object] | None,
+    campaign_context: dict[str, object] | None,
+    report_country_code: str,
+    max_rows: int = 40,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    base_country = (report_country_code or "PL").strip().upper() or "PL"
+
+    market_events = (additional_context or {}).get("market_event_calendar", {})
+    if isinstance(market_events, dict):
+        market_country = str(market_events.get("country_code", "")).strip().upper() or base_country
+        market_rows = market_events.get("events", [])
+        if isinstance(market_rows, list):
+            for row in market_rows:
+                if not isinstance(row, dict):
+                    continue
+                day = _parse_iso_date(row.get("date"))
+                if not isinstance(day, date):
+                    continue
+                conf = int(row.get("confidence", 0) or 0)
+                impact = (
+                    f"{str(row.get('impact_level', 'LOW')).strip().upper()}/"
+                    f"{str(row.get('impact_direction', 'Mixed')).strip()} ({conf}/100)"
+                )
+                rows.append(
+                    {
+                        "day": day,
+                        "country": market_country,
+                        "track": "Market event",
+                        "event": _shorten(row.get("title", ""), 130) or "Market signal",
+                        "source": _shorten(row.get("source", "GDELT DOC API"), 50),
+                        "impact": impact,
+                    }
+                )
+
+    if isinstance(campaign_context, dict):
+        allegro_events = campaign_context.get("allegro_events", [])
+        if isinstance(allegro_events, list):
+            for signal in allegro_events:
+                if not isinstance(signal, ExternalSignal):
+                    continue
+                country = _extract_country_hint(
+                    f"{signal.source} {signal.title} {signal.details}",
+                    base_country,
+                )
+                rows.append(
+                    {
+                        "day": signal.day,
+                        "country": country,
+                        "track": "Allegro campaign",
+                        "event": _shorten(signal.title, 130),
+                        "source": _shorten(signal.source, 50),
+                        "impact": str(signal.severity or "info").strip().lower(),
+                    }
+                )
+
+        competitor_events = campaign_context.get("competitor_events", [])
+        if isinstance(competitor_events, list):
+            for entry in competitor_events:
+                if (
+                    not isinstance(entry, tuple)
+                    or len(entry) != 2
+                    or not isinstance(entry[0], ExternalSignal)
+                ):
+                    continue
+                signal, competitor = entry
+                country = _extract_country_hint(
+                    f"{signal.source} {signal.title} {signal.details}",
+                    base_country,
+                )
+                rows.append(
+                    {
+                        "day": signal.day,
+                        "country": country,
+                        "track": f"Competitor promo ({competitor})",
+                        "event": _shorten(signal.title, 130),
+                        "source": _shorten(signal.source, 50),
+                        "impact": str(signal.severity or "info").strip().lower(),
+                    }
+                )
+
+    promo_radar = (additional_context or {}).get("competitor_promo_radar", {})
+    if isinstance(promo_radar, dict):
+        promo_rows = promo_radar.get("rows", [])
+        if isinstance(promo_rows, list):
+            for row in promo_rows:
+                if not isinstance(row, dict):
+                    continue
+                day = _parse_iso_date(row.get("date"))
+                if not isinstance(day, date):
+                    continue
+                title = str(row.get("title", "")).strip()
+                competitor = "market"
+                title_norm = _normalize_text(title)
+                for token, label in COMPETITOR_NAME_TOKENS:
+                    if token in title_norm:
+                        competitor = label
+                        break
+                country = _extract_country_hint(
+                    f"{row.get('source', '')} {title}",
+                    base_country,
+                )
+                rows.append(
+                    {
+                        "day": day,
+                        "country": country,
+                        "track": f"Promo radar ({competitor})",
+                        "event": _shorten(title, 130),
+                        "source": _shorten(row.get("source", "Google News RSS query"), 50),
+                        "impact": "medium",
+                    }
+                )
+
+    deduped: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            item.get("day") if isinstance(item.get("day"), date) else date.min,
+            str(item.get("track", "")),
+        ),
+    ):
+        day = row.get("day")
+        if not isinstance(day, date):
+            continue
+        key = (
+            day.isoformat(),
+            _normalize_text(str(row.get("country", ""))),
+            _normalize_text(str(row.get("track", ""))),
+            _normalize_text(str(row.get("event", ""))),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped[: max(1, max_rows)]
+
+
+def _priority_action_for_hypothesis(row: dict[str, object]) -> tuple[str, str]:
+    category = _normalize_text(str(row.get("category", "")))
+    if "campaign" in category:
+        return (
+            "Validate campaign timing and paid-share overlap for the top impacted clusters.",
+            "SEO + Commercial | 3d",
+        )
+    if "algorithm" in category:
+        return (
+            "Run before/after checks on affected page/query clusters since the update date.",
+            "SEO | 48h",
+        )
+    if "technical" in category or "ux" in category:
+        return (
+            "Prioritize technical audit for the weakest device/page segments.",
+            "SEO + Web Performance | 5d",
+        )
+    if "data quality" in category:
+        return (
+            "Fix missing data source and rerun confidence-sensitive hypotheses.",
+            "SEO Ops | 24h",
+        )
+    if "seasonality" in category or "events" in category:
+        return (
+            "Align content and merchandising timing with demand rotation drivers.",
+            "SEO + Merchandising | this week",
+        )
+    return ("Validate the hypothesis with the next weekly window before escalation.", "SEO Team | next run")
+
+
+def _top_priority_actions(
+    hypotheses: list[dict[str, object]],
+    limit: int = 3,
+) -> list[str]:
+    out: list[str] = []
+    for row in hypotheses[: max(1, limit)]:
+        action, owner_eta = _priority_action_for_hypothesis(row)
+        category = str(row.get("category", "Unknown")).strip() or "Unknown"
+        out.append(f"{category}: {action} ({owner_eta})")
+    return out
+
+
 def _cluster_label_for_query(query: str) -> str:
     normalized = _normalize_text(query)
     for label, tokens in QUERY_CLUSTER_RULES:
@@ -2271,6 +2478,40 @@ def _build_executive_summary_lines(
     if brand_note:
         business_text += f" {brand_note}"
     lines.append("- **Business implication**: " + business_text)
+
+    campaign_context = _campaign_event_context(
+        external_signals=external_signals,
+        query_scope=query_scope,
+    )
+    country_hint = str((additional_context or {}).get("country_code", "")).strip().upper() or "PL"
+    timeline_rows = _marketplace_timeline_rows(
+        additional_context=additional_context,
+        campaign_context=campaign_context,
+        report_country_code=country_hint,
+        max_rows=20,
+    )
+    if timeline_rows:
+        first_day = timeline_rows[0].get("day")
+        last_day = timeline_rows[-1].get("day")
+        if isinstance(first_day, date) and isinstance(last_day, date):
+            lines.append(
+                "- **Marketplace timeline (market events + promo calendar)**: "
+                f"{_fmt_int(len(timeline_rows))} events on one axis "
+                f"({first_day.isoformat()} to {last_day.isoformat()}) across countries."
+            )
+
+    if hypotheses:
+        top_signals = "; ".join(
+            f"{str(row.get('category', 'Unknown')).strip()} ({int(row.get('confidence', 0) or 0)}/100)"
+            for row in hypotheses[:3]
+            if isinstance(row, dict)
+        )
+        if top_signals:
+            lines.append(f"- **Top signals (confidence-ranked)**: {top_signals}.")
+        actions = _top_priority_actions(hypotheses, limit=3)
+        if actions:
+            lines.append("- **Priority actions (owner | ETA)**: " + "; ".join(actions) + ".")
+
     if isinstance(trade_plan_signal, dict):
         lines.append(
             "- **Trade-plan hypothesis**: "
@@ -2363,6 +2604,19 @@ def _build_executive_summary_lines(
                     f"({str(market_events.get('country_code', '')).strip() or 'market'}) captured "
                     f"{_fmt_int(len(rows))} items, including {_fmt_int(high_count)} high-impact GMV candidates."
                 )
+    free_public_hub = (additional_context or {}).get("free_public_source_hub", {})
+    if isinstance(free_public_hub, dict) and free_public_hub.get("enabled"):
+        hub_rows = free_public_hub.get("rows", [])
+        if isinstance(hub_rows, list) and hub_rows:
+            ok_count = sum(
+                1
+                for row in hub_rows
+                if isinstance(row, dict) and str(row.get("status", "")).strip().lower() in {"ok", "integrated"}
+            )
+            lines.append(
+                "- **Free-source coverage**: "
+                f"{_fmt_int(ok_count)}/{_fmt_int(len(hub_rows))} public sources delivered usable context in this run."
+            )
 
     ga4 = (additional_context or {}).get("ga4", {})
     if USE_GA4_IN_REPORT and isinstance(ga4, dict) and ga4.get("enabled"):
@@ -2422,7 +2676,7 @@ def _build_executive_summary_lines(
     elif senuto_error:
         lines.append("- Senuto visibility missing or inconsistent in this run; treat Senuto-derived opportunities as directional only.")
 
-    return lines[:6]
+    return lines[:9]
 
 
 def _build_leadership_snapshot_lines(
@@ -2798,6 +3052,26 @@ def _build_what_is_happening_lines(
             "Campaign context: active campaign signals exist and can influence weekly demand allocation. "
             f"(Allegro={_fmt_int(allegro_count)}, competitors={_fmt_int(competitor_count)}, query movers={_fmt_int(query_count)}).{period}"
         )
+    unified_timeline = _marketplace_timeline_rows(
+        additional_context=additional_context,
+        campaign_context=campaign_context,
+        report_country_code=country_code or "PL",
+        max_rows=24,
+    )
+    if unified_timeline:
+        first_day = unified_timeline[0].get("day")
+        last_day = unified_timeline[-1].get("day")
+        if isinstance(first_day, date) and isinstance(last_day, date):
+            lines.append(
+                "Unified marketplace timeline (market events + promo calendar): "
+                f"{_fmt_int(len(unified_timeline))} events on one date axis ({first_day.isoformat()} to {last_day.isoformat()})."
+            )
+            preview = "; ".join(
+                f"{str(row.get('day', '')).strip()} [{row.get('country', '')}] {row.get('track', '')}: {row.get('event', '')}"
+                for row in unified_timeline[:4]
+            )
+            if preview:
+                lines.append("Timeline highlights: " + preview + ".")
 
     pulse_line = _top_platform_pulse_line(additional_context)
     if pulse_line:
@@ -3034,6 +3308,38 @@ def _build_what_is_happening_lines(
                     "Competitive context: Senuto overlap shows strongest competitor pressure from "
                     f"`{top_comp.get('domain', '')}` ({_fmt_int(top_comp.get('common_keywords', 0.0))} common keywords)."
                 )
+
+    lines.append("")
+    lines.append("**Reasoning ledger (facts -> hypotheses -> validation)**")
+    lines.append(
+        "- Facts observed: "
+        f"clicks {_fmt_signed_compact(current.clicks - previous.clicks)} WoW ({wow_pct}), "
+        f"CTR {ctr_wow_pp:+.2f} pp WoW, avg position {pos_wow_delta:+.2f} WoW."
+    )
+    if hypotheses:
+        ranked_hypotheses = "; ".join(
+            f"{str(row.get('category', 'Unknown')).strip()} ({int(row.get('confidence', 0) or 0)}/100)"
+            for row in hypotheses[:3]
+            if isinstance(row, dict)
+        )
+        if ranked_hypotheses:
+            lines.append("- Primary hypotheses: " + ranked_hypotheses + ".")
+    alt_explanations: list[str] = []
+    if query_count == 0 and allegro_count == 0 and competitor_count == 0:
+        alt_explanations.append("campaign impact may be underestimated because no explicit campaign mentions were captured")
+    if brand_enabled is False and not isinstance(brand_proxy, dict):
+        alt_explanations.append("brand-demand baseline is weak (Google Trends + GSC brand proxy unavailable)")
+    if senuto_intelligence == {}:
+        alt_explanations.append("competitive SERP pressure may be under-detected without Senuto intelligence rows")
+    if alt_explanations:
+        lines.append("- Alternative explanations to falsify: " + "; ".join(alt_explanations[:2]) + ".")
+    source_errors = (additional_context or {}).get("errors", [])
+    if isinstance(source_errors, list) and source_errors:
+        lines.append("- Data gaps affecting certainty: " + "; ".join(str(row).strip() for row in source_errors[:2]) + ".")
+    lines.append(
+        "- Validation plan (next run): verify top 3 hypotheses against refreshed campaign timeline, brand-demand baseline, "
+        "and segment-level GSC deltas before escalating technical actions."
+    )
 
     return lines
 
@@ -4327,6 +4633,32 @@ def build_markdown_report(
     else:
         lines.append("- Market event calendar not configured or unavailable in this run.")
 
+    free_public_hub = (additional_context or {}).get("free_public_source_hub", {})
+    lines.append("")
+    lines.append("### Free public source hub (20-source inventory)")
+    if isinstance(free_public_hub, dict) and free_public_hub.get("enabled"):
+        hub_rows = free_public_hub.get("rows", [])
+        lines.append("| Source | Type | Status | Details | URL |")
+        lines.append("|---|---|---|---|---|")
+        if isinstance(hub_rows, list) and hub_rows:
+            for row in hub_rows[:30]:
+                if not isinstance(row, dict):
+                    continue
+                lines.append(
+                    f"| {row.get('source', '')} | {row.get('type', '')} | {row.get('status', '')} | "
+                    f"{row.get('details', '')} | {row.get('url', '')} |"
+                )
+            if len(hub_rows) > 30:
+                lines.append(f"- +{_fmt_int(len(hub_rows) - 30)} additional source-status rows.")
+        else:
+            lines.append("| (no source rows) | - | - | - | - |")
+        errors = free_public_hub.get("errors", [])
+        if isinstance(errors, list):
+            for err in errors[:5]:
+                lines.append(f"- Free-source hub warning: {err}")
+    else:
+        lines.append("- Free public source hub disabled or unavailable in this run.")
+
     lines.append("")
     lines.append("### SEO update early analyses (external SEO media)")
     seo_update_rows = [
@@ -4759,6 +5091,29 @@ def build_markdown_report(
                 lines.append(f"| {row.get('date', '')} | {row.get('title', '')} |")
     else:
         lines.append("- No competitor promo-radar mentions in this run.")
+
+    unified_timeline_rows = _marketplace_timeline_rows(
+        additional_context=additional_context,
+        campaign_context=campaign_context,
+        report_country_code=country_label,
+        max_rows=50,
+    )
+    lines.append("")
+    lines.append("### Unified marketplace timeline (market events + promo calendar)")
+    lines.append("| Date | Country | Track | Event | Impact/confidence | Source |")
+    lines.append("|---|---|---|---|---|---|")
+    if unified_timeline_rows:
+        for row in unified_timeline_rows[:30]:
+            day = row.get("day")
+            day_label = day.isoformat() if isinstance(day, date) else str(day or "")
+            lines.append(
+                f"| {day_label} | {row.get('country', '')} | {row.get('track', '')} | "
+                f"{row.get('event', '')} | {row.get('impact', '')} | {row.get('source', '')} |"
+            )
+        if len(unified_timeline_rows) > 30:
+            lines.append(f"- +{_fmt_int(len(unified_timeline_rows) - 30)} additional timeline events in raw context.")
+    else:
+        lines.append("| (no timeline rows) | - | - | - | - | - |")
 
     source_errors = (additional_context or {}).get("errors", [])
     if isinstance(source_errors, list):
