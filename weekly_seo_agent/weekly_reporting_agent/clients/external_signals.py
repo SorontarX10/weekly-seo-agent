@@ -185,11 +185,16 @@ class ExternalSignalsClient:
         self,
         current_window: DateWindow,
         previous_window: DateWindow,
+        yoy_window: DateWindow | None = None,
     ) -> tuple[list[ExternalSignal], dict[str, float]]:
         signals: list[ExternalSignal] = []
         weather_summary: dict[str, float] = {}
         try:
-            weather_summary = self._weather_summary(current_window, previous_window)
+            weather_summary = self._weather_summary(
+                current_window=current_window,
+                previous_window=previous_window,
+                yoy_window=yoy_window,
+            )
             weather_summary.update(
                 self._weather_forecast_summary(reference_day=current_window.end, days=7)
             )
@@ -482,8 +487,11 @@ class ExternalSignalsClient:
         self,
         current_window: DateWindow,
         previous_window: DateWindow,
+        yoy_window: DateWindow | None = None,
     ) -> dict[str, float]:
         start = previous_window.start
+        if isinstance(yoy_window, DateWindow) and yoy_window.start < start:
+            start = yoy_window.start
         end = current_window.end
         url = "https://archive-api.open-meteo.com/v1/archive"
         params = {
@@ -525,18 +533,27 @@ class ExternalSignalsClient:
 
         current_avg_temp, current_precip = summarize(current_window)
         previous_avg_temp, previous_precip = summarize(previous_window)
+        yoy_avg_temp, yoy_precip = summarize(yoy_window) if isinstance(yoy_window, DateWindow) else (0.0, 0.0)
 
         precip_change_pct = 0.0
         if previous_precip:
             precip_change_pct = ((current_precip - previous_precip) / previous_precip) * 100
 
+        precip_change_pct_yoy = 0.0
+        if yoy_precip:
+            precip_change_pct_yoy = ((current_precip - yoy_precip) / yoy_precip) * 100
+
         return {
             "avg_temp_current_c": current_avg_temp,
             "avg_temp_previous_c": previous_avg_temp,
             "avg_temp_diff_c": current_avg_temp - previous_avg_temp,
+            "avg_temp_yoy_c": yoy_avg_temp,
+            "avg_temp_diff_yoy_c": current_avg_temp - yoy_avg_temp,
             "precip_current_mm": current_precip,
             "precip_previous_mm": previous_precip,
             "precip_change_pct": precip_change_pct,
+            "precip_yoy_mm": yoy_precip,
+            "precip_change_pct_yoy": precip_change_pct_yoy,
         }
 
     def _weather_forecast_summary(self, reference_day: date, days: int = 7) -> dict[str, float | str]:

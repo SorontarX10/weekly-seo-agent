@@ -131,6 +131,11 @@ jobs:
         run: |
           weekly-seo-agent
 
+      - name: Evaluate generated reports (quality gate)
+        if: github.event_name == 'workflow_dispatch' || steps.gate.outputs.should_run == 'true'
+        run: |
+          python scripts/eval_reports.py --dir "SEO Weekly Reports" --min-score 75
+
       - name: Upload generated report artifacts
         if: always()
         uses: actions/upload-artifact@v4

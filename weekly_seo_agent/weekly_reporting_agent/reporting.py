@@ -1330,6 +1330,149 @@ def _safe_float(row: dict[str, object], key: str, default: float = 0.0) -> float
         return default
 
 
+def _position_delta_label(delta: float) -> str:
+    if delta > 0:
+        return f"worsened by {abs(delta):.2f}"
+    if delta < 0:
+        return f"improved by {abs(delta):.2f}"
+    return "unchanged (0.00)"
+
+
+def _sanitize_data_gap_message(message: object) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"https?://\S+", "[url redacted]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 220:
+        text = text[:217].rstrip() + "..."
+    return text
+
+
+def _format_count_yoy_change(current: float, yoy: float) -> str:
+    current_n = int(round(float(current)))
+    yoy_n = int(round(float(yoy)))
+    if yoy_n <= 0:
+        if current_n <= 0:
+            return f"{current_n} vs {yoy_n} (no activity in both periods)."
+        return f"{current_n} vs {yoy_n} (new activity vs no YoY baseline; % change n/a)."
+    delta_pct = ((current_n - yoy_n) / yoy_n) * 100.0
+    return f"{current_n} vs {yoy_n} ({delta_pct:+.1f}%)."
+
+
+def _confidence_bucket(value: int | float | None) -> str:
+    try:
+        score = int(float(value or 0))
+    except (TypeError, ValueError):
+        score = 0
+    if score >= 75:
+        return "High"
+    if score >= 60:
+        return "Medium"
+    return "Low"
+
+
+def _comparability_summary(
+    additional_context: dict[str, object] | None,
+    *,
+    brand_trends_available: bool,
+    brand_proxy_available: bool,
+) -> str:
+    parts: list[str] = []
+    coverage = (additional_context or {}).get("gsc_data_coverage", {})
+    if isinstance(coverage, dict) and coverage.get("p52w_mode") == "masked_to_days_with_data":
+        days_with_data = int(coverage.get("days_with_data", 0) or 0)
+        days_total = int(coverage.get("days_total", 0) or 0)
+        if days_total > 0:
+            parts.append(f"GSC YoY is aligned only to available current-week days ({days_with_data}/{days_total}).")
+    if brand_trends_available:
+        parts.append("Google Trends is an index (0-100), so use it directionally, not as absolute demand volume.")
+    if brand_proxy_available:
+        parts.append("GSC totals can differ by chosen dimensions in UI/API breakdowns.")
+    return " ".join(parts).strip()
+
+
+def _source_quality_summary(additional_context: dict[str, object] | None) -> str:
+    rows = _source_freshness_rows(additional_context)
+    if not rows:
+        return ""
+    fresh = sum(1 for row in rows if str(row.get("status", "")).strip().lower() == "fresh")
+    stale = sum(1 for row in rows if str(row.get("status", "")).strip().lower() == "stale")
+    degraded = sum(1 for row in rows if str(row.get("status", "")).strip().lower() == "degraded")
+    total = len(rows)
+    if stale == 0 and degraded == 0:
+        return f"Data quality check: all core sources are fresh ({fresh}/{total})."
+    return (
+        "Data quality check: some sources are delayed or degraded "
+        f"(fresh={fresh}, stale={stale}, degraded={degraded}; total={total})."
+    )
+
+
+def _compact_manager_section(lines: list[str], max_lines: int = 24) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    skip_prefixes = (
+        "DuckDuckGo context scan:",
+        "Channel pressure signal:",
+        "Campaign YoY signal (trade plan):",
+        "Trade-plan YoY hypotheses (channels):",
+        "Trade-plan YoY hypotheses (campaigns active this week):",
+        "Trade-plan YoY hypotheses (upcoming campaigns, not active this week):",
+        "SEO/GEO publication context:",
+    )
+
+    def _norm(text: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[`*#|]", "", text)).strip().lower()
+
+    idx = 0
+    while idx < len(lines):
+        row = lines[idx]
+        stripped = row.strip()
+        if stripped.startswith("|"):
+            idx += 1
+            continue
+        if any(stripped.startswith(prefix) for prefix in skip_prefixes):
+            idx += 1
+            continue
+        key = _norm(row)
+        if key and key in seen and not stripped.startswith("**"):
+            idx += 1
+            continue
+        if key:
+            seen.add(key)
+        out.append(row)
+
+        if stripped == "**Confirmed vs hypothesis**":
+            look_ahead = idx + 1
+            while look_ahead < len(lines):
+                candidate = lines[look_ahead]
+                cand_strip = candidate.strip()
+                if cand_strip.startswith("**") and cand_strip != "**Confirmed vs hypothesis**":
+                    break
+                if (
+                    cand_strip.startswith("Confirmed facts from data:")
+                    or cand_strip.startswith("Working hypotheses:")
+                    or cand_strip.startswith("- ")
+                ):
+                    cand_key = _norm(candidate)
+                    if cand_key not in seen:
+                        seen.add(cand_key)
+                        out.append(candidate)
+                look_ahead += 1
+                if len(out) >= max_lines:
+                    break
+            idx = look_ahead
+            if len(out) >= max_lines:
+                break
+            continue
+
+        idx += 1
+        if len(out) >= max_lines:
+            break
+
+    return out[:max_lines]
+
+
 def _source_freshness_rows(additional_context: dict[str, object] | None) -> list[dict[str, object]]:
     payload = (additional_context or {}).get("source_freshness", [])
     if not isinstance(payload, list):
@@ -1338,20 +1481,111 @@ def _source_freshness_rows(additional_context: dict[str, object] | None) -> list
     for row in payload:
         if not isinstance(row, dict):
             continue
-        source = str(row.get("source", "")).strip()
-        if not source:
-            continue
         rows.append(
             {
-                "source": source,
-                "status": str(row.get("status", "")).strip().lower() or "unknown",
+                "source": str(row.get("source", "")).strip(),
+                "status": str(row.get("status", "")).strip(),
                 "last_day": str(row.get("last_day", "")).strip(),
-                "ttl_hours": _safe_float(row, "ttl_hours"),
-                "cache_mode": str(row.get("cache_mode", "")).strip() or "-",
-                "note": str(row.get("note", "")).strip() or "-",
+                "ttl_hours": float(row.get("ttl_hours", 0.0) or 0.0),
+                "cache_mode": str(row.get("cache_mode", "")).strip(),
+                "note": str(row.get("note", "")).strip(),
             }
         )
     return rows
+
+
+def _build_evidence_ledger(
+    *,
+    windows: dict[str, DateWindow],
+    external_signals: list[ExternalSignal],
+    additional_context: dict[str, object] | None,
+    limit: int = 12,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    current = windows.get("current_28d")
+    previous = windows.get("previous_28d")
+    if isinstance(current, DateWindow):
+        rows.append(
+            {
+                "id": "E1",
+                "source": "GSC weekly window",
+                "date": f"{current.start.isoformat()}..{current.end.isoformat()}",
+                "note": "Primary KPI baseline window.",
+            }
+        )
+    analysis_start = previous.start if isinstance(previous, DateWindow) else (current.start if isinstance(current, DateWindow) else None)
+    analysis_end = current.end if isinstance(current, DateWindow) else None
+    forward_end = analysis_end + timedelta(days=14) if isinstance(analysis_end, date) else None
+    filtered_signals: list[ExternalSignal] = []
+    for signal in external_signals:
+        if isinstance(analysis_start, date) and signal.day < analysis_start:
+            continue
+        if isinstance(forward_end, date) and signal.day > forward_end:
+            continue
+        filtered_signals.append(signal)
+    for signal in filtered_signals[: max(1, limit - len(rows))]:
+        note = str(signal.title).strip()[:140]
+        if isinstance(analysis_end, date) and signal.day > analysis_end:
+            note = f"Forward context: {note}"
+        rows.append(
+            {
+                "id": f"E{len(rows) + 1}",
+                "source": str(signal.source).strip(),
+                "date": signal.day.isoformat(),
+                "note": note,
+            }
+        )
+    if isinstance(additional_context, dict):
+        trade_plan = additional_context.get("trade_plan", {})
+        if isinstance(trade_plan, dict) and trade_plan.get("enabled"):
+            rows.append(
+                {
+                    "id": f"E{len(rows) + 1}",
+                    "source": "Trade plan sheet",
+                    "date": str(((trade_plan.get("windows", {}) or {}).get("current", {}) or {}).get("start", "")).strip(),
+                    "note": str(((trade_plan.get("sheet", {}) or {}).get("tab", "")).strip() or "trade-plan context"),
+                }
+            )
+        weekly_news = additional_context.get("weekly_news_digest", {})
+        if isinstance(weekly_news, dict) and weekly_news.get("enabled"):
+            rows.append(
+                {
+                    "id": f"E{len(rows) + 1}",
+                    "source": "Weekly SEO/GEO digest",
+                    "date": f"{weekly_news.get('window_start','')}..{weekly_news.get('window_end','')}",
+                    "note": f"rows={len(weekly_news.get('rows', []) if isinstance(weekly_news.get('rows', []), list) else [])}",
+                }
+            )
+    return rows[: max(1, limit)]
+
+
+def _governance_lines(
+    *,
+    run_date: date,
+    report_country_code: str,
+    windows: dict[str, DateWindow],
+    additional_context: dict[str, object] | None,
+) -> list[str]:
+    lines: list[str] = []
+    lines.append("## Governance and provenance")
+    lines.append(f"- Report date: {run_date.isoformat()} | Country: {report_country_code.strip().upper() or 'PL'}.")
+    model_name = str((additional_context or {}).get("gaia_model", "")).strip() if isinstance(additional_context, dict) else ""
+    if model_name:
+        lines.append(f"- Model version: {model_name}.")
+    current = windows.get("current_28d")
+    previous = windows.get("previous_28d")
+    yoy = windows.get("yoy_52w")
+    if isinstance(current, DateWindow) and isinstance(previous, DateWindow) and isinstance(yoy, DateWindow):
+        lines.append(
+            "- Data windows: "
+            f"current {current.start.isoformat()}..{current.end.isoformat()}, "
+            f"previous {previous.start.isoformat()}..{previous.end.isoformat()}, "
+            f"YoY {yoy.start.isoformat()}..{yoy.end.isoformat()}."
+        )
+    reviewer = str((additional_context or {}).get("governance_human_reviewer", "")).strip() if isinstance(additional_context, dict) else ""
+    lines.append(f"- Human reviewer: {reviewer or 'not assigned'}")
+    lines.append("- Known limitations: external signals can be delayed/noisy; causal claims are probabilistic and require next-run validation.")
+    return lines
 
 
 def _impact_attribution_rows(
@@ -1673,16 +1907,29 @@ def _top_platform_pulse_line(additional_context: dict[str, object] | None) -> st
     valid_rows = [row for row in rows if isinstance(row, dict)]
     if not valid_rows:
         return ""
-    high_count = sum(
-        1 for row in valid_rows if str(row.get("severity", "")).strip().lower() == "high"
-    )
-    medium_count = sum(
-        1 for row in valid_rows if str(row.get("severity", "")).strip().lower() == "medium"
-    )
+    severities = [
+        str(row.get("severity", "")).strip().lower()
+        for row in valid_rows
+        if isinstance(row, dict)
+    ]
+    if "high" in severities:
+        impact = "high"
+    elif "medium" in severities:
+        impact = "medium"
+    else:
+        impact = "low"
+    examples = []
+    for row in valid_rows[:2]:
+        title = str(row.get("title", "")).strip()
+        if title:
+            examples.append(f"`{title}`")
+    example_text = "; ".join(examples) if examples else "platform and regulatory signals"
     return (
-        "Platform/regulatory pulse: external platform/regulation context is active "
-        f"({_fmt_int(len(valid_rows))} signals; high={_fmt_int(high_count)}, medium={_fmt_int(medium_count)}). "
-        "Use as supporting context, not standalone root cause."
+        "Platform/regulatory context: "
+        + example_text
+        + ". Likely weekly impact: "
+        + impact
+        + "; treat this as context, not primary root cause."
     )
 
 
@@ -2434,7 +2681,7 @@ def _build_executive_summary_lines(
                     brand_yoy = float(brand_summary.get("delta_pct_vs_yoy", 0.0))
                     brand_enabled = bool(brand_context.get("enabled")) if isinstance(brand_context, dict) else False
                     if brand_wow > 0:
-                        brand_note = "Brand demand is up WoW in Google Trends, so routing/SERP mix is more likely than demand collapse."
+                        brand_note = "Brand demand is up WoW in Google Trends, so clicks likely moved across search-result placements rather than demand collapsing."
                     elif brand_wow < 0:
                         brand_note = "Brand demand is also down WoW in Google Trends, so part of homepage softness is likely demand-side."
 
@@ -2452,7 +2699,7 @@ def _build_executive_summary_lines(
         f"{_fmt_compact(current.clicks)} ({click_wow_pct} WoW; {click_yoy_pct} YoY)**, "
         f"impressions {_fmt_compact(current.impressions)} ({impr_wow_pct} WoW; {impr_yoy_pct} YoY), "
         f"CTR {_pct(current.ctr)} ({ctr_wow_pp:+.2f} pp WoW; {ctr_yoy_pp:+.2f} pp YoY), "
-        f"avg position {current.position:.2f} ({pos_yoy_delta:+.2f} YoY)."
+        f"avg position {current.position:.2f} ({_position_delta_label(pos_yoy_delta)} YoY). [E1]"
     )
     why_parts: list[str] = []
     if growth_themes:
@@ -2461,7 +2708,7 @@ def _build_executive_summary_lines(
         why_parts.append(f"decline themes: {decline_themes}")
     why_text = "; ".join(why_parts) if why_parts else "cluster-level pattern shows category-level demand rotation rather than one systemic SEO failure mode"
     lines.append(
-        "- **Why**: current movement is **driven by category-level demand rotation with stable efficiency**; "
+        "- **Why**: current movement is **driven by category-level demand rotation with broadly stable short-term efficiency**; "
         + why_text
         + "."
         + (f" {val_timing_line}" if val_timing_line else "")
@@ -2478,6 +2725,10 @@ def _build_executive_summary_lines(
     if brand_note:
         business_text += f" {brand_note}"
     lines.append("- **Business implication**: " + business_text)
+    lines.append(
+        "- **In plain language**: this looks mainly like a **demand timing and traffic mix shift**, "
+        "not a broad SEO technical breakdown."
+    )
 
     campaign_context = _campaign_event_context(
         external_signals=external_signals,
@@ -2497,28 +2748,28 @@ def _build_executive_summary_lines(
             lines.append(
                 "- **Marketplace timeline (market events + promo calendar)**: "
                 f"{_fmt_int(len(timeline_rows))} events on one axis "
-                f"({first_day.isoformat()} to {last_day.isoformat()}) across countries."
+                f"({first_day.isoformat()} to {last_day.isoformat()}) for {country_hint}."
             )
 
     if hypotheses:
         top_signals = "; ".join(
-            f"{str(row.get('category', 'Unknown')).strip()} ({int(row.get('confidence', 0) or 0)}/100)"
+            f"{str(row.get('category', 'Unknown')).strip()} ({_confidence_bucket(row.get('confidence', 0))})"
             for row in hypotheses[:3]
             if isinstance(row, dict)
         )
         if top_signals:
-            lines.append(f"- **Top signals (confidence-ranked)**: {top_signals}.")
+            lines.append(f"- **Top signals**: {top_signals}.")
         actions = _top_priority_actions(hypotheses, limit=3)
         if actions:
             lines.append("- **Priority actions (owner | ETA)**: " + "; ".join(actions) + ".")
 
+    brand_proxy = _brand_proxy_from_gsc(segment_diagnostics)
     if isinstance(trade_plan_signal, dict):
         lines.append(
-            "- **Trade-plan hypothesis**: "
+            "- **Campaign & trade-plan context**: "
             + str(trade_plan_signal.get("statement", "")).strip()
-            + f" (confidence {int(trade_plan_signal.get('confidence', 0) or 0)}/100)."
+            + f" (impact likelihood: {_confidence_bucket(trade_plan_signal.get('confidence', 0))})."
         )
-    brand_proxy = _brand_proxy_from_gsc(segment_diagnostics)
     if brand_enabled and brand_proxy:
         lines.append(
             "- **Brand demand baseline (Google Trends + GSC brand queries)**: "
@@ -2557,6 +2808,23 @@ def _build_executive_summary_lines(
             "and GSC brand-proxy segment was not available."
         )
 
+    demand_read = "brand demand is unavailable this week"
+    if brand_enabled:
+        if brand_wow > 0.5:
+            demand_read = "brand demand is up WoW"
+        elif brand_wow < -0.5:
+            demand_read = "brand demand is down WoW"
+        else:
+            demand_read = "brand demand is broadly flat WoW"
+    elif isinstance(brand_proxy, dict):
+        brand_proxy_wow = float(brand_proxy.get("delta_pct_vs_previous", 0.0) or 0.0)
+        if brand_proxy_wow > 0.5:
+            demand_read = "GSC brand proxy is up WoW"
+        elif brand_proxy_wow < -0.5:
+            demand_read = "GSC brand proxy is down WoW"
+        else:
+            demand_read = "GSC brand proxy is broadly flat WoW"
+
     country_code = str((additional_context or {}).get("country_code", "")).strip().upper()
     brand_ctr_proxy = _brand_ctr_proxy_from_gsc(segment_diagnostics)
     if (
@@ -2579,104 +2847,51 @@ def _build_executive_summary_lines(
         lines.append(
             "- **Brand Ads overlap hypothesis (WoW)**: "
             f"{str(brand_ads_hyp.get('statement', '')).strip()} "
-            f"(confidence {int(brand_ads_hyp.get('confidence', 0) or 0)}/100; "
-            f"evidence: {str(brand_ads_hyp.get('evidence', '')).strip()})."
+            f"(evidence: {str(brand_ads_hyp.get('evidence', '')).strip()})."
         )
     lines.append(
         "- **Decision this week**: current data indicates an exposure/demand effect first "
-        "(brand demand + impressions/CTR), while campaign timing and paid activity are likely incremental factors; "
+        f"({demand_read}; impressions/CTR trend), while campaign timing and paid activity are likely incremental factors; "
         "treat technical SEO escalation as second step unless efficiency signals deteriorate."
     )
-
-    market_events = (additional_context or {}).get("market_event_calendar", {})
-    if isinstance(market_events, dict) and market_events.get("enabled"):
-        rows = market_events.get("events", [])
-        if isinstance(rows, list) and rows:
-            high_count = sum(
-                1
-                for row in rows
-                if isinstance(row, dict)
-                and str(row.get("impact_level", "")).strip().upper() == "HIGH"
-            )
-            if high_count > 0:
-                lines.append(
-                    "- `Context`: market-event calendar "
-                    f"({str(market_events.get('country_code', '')).strip() or 'market'}) captured "
-                    f"{_fmt_int(len(rows))} items, including {_fmt_int(high_count)} high-impact GMV candidates."
-                )
-    free_public_hub = (additional_context or {}).get("free_public_source_hub", {})
-    if isinstance(free_public_hub, dict) and free_public_hub.get("enabled"):
-        hub_rows = free_public_hub.get("rows", [])
-        if isinstance(hub_rows, list) and hub_rows:
-            ok_count = sum(
-                1
-                for row in hub_rows
-                if isinstance(row, dict) and str(row.get("status", "")).strip().lower() in {"ok", "integrated"}
-            )
-            lines.append(
-                "- **Free-source coverage**: "
-                f"{_fmt_int(ok_count)}/{_fmt_int(len(hub_rows))} public sources delivered usable context in this run."
-            )
-
-    ga4 = (additional_context or {}).get("ga4", {})
-    if USE_GA4_IN_REPORT and isinstance(ga4, dict) and ga4.get("enabled"):
-        summary = ga4.get("summary", {})
-        if isinstance(summary, dict):
-            current_ga4 = summary.get("current", {})
-            yoy_ga4 = summary.get("yoy", {})
-            if isinstance(current_ga4, dict) and isinstance(yoy_ga4, dict):
-                ga4_parts: list[str] = []
-                sessions_current = _ga4_num(current_ga4, "sessions")
-                sessions_yoy = _ga4_num(yoy_ga4, "sessions")
-                if sessions_current is not None and sessions_yoy is not None:
-                    ga4_parts.append(
-                        f"sessions {_fmt_int(sessions_current)} ({_signed_pct(_ratio_delta(sessions_current, sessions_yoy))})"
-                    )
-                transactions_current = _ga4_num(current_ga4, "transactions")
-                transactions_yoy = _ga4_num(yoy_ga4, "transactions")
-                if transactions_current is not None and transactions_yoy is not None:
-                    ga4_parts.append(
-                        f"transactions {_fmt_int(transactions_current)} ({_signed_pct(_ratio_delta(transactions_current, transactions_yoy))})"
-                    )
-                revenue_current = _ga4_num(current_ga4, "revenue")
-                revenue_yoy = _ga4_num(yoy_ga4, "revenue")
-                if revenue_current is not None and revenue_yoy is not None:
-                    ga4_parts.append(
-                        f"purchase revenue {_fmt_int(revenue_current)} ({_signed_pct(_ratio_delta(revenue_current, revenue_yoy))})"
-                    )
-                if ga4_parts:
-                    lines.append("- `YoY` (GA4): " + ", ".join(ga4_parts) + " vs aligned 52W window.")
-    # When GA4 is excluded by policy, keep Executive Summary concise and avoid policy-only filler lines.
-
-    if hypotheses:
-        top_hypothesis = hypotheses[0] if hypotheses else {}
-        thesis = str(top_hypothesis.get("thesis", "")).strip()
-        confidence = int(top_hypothesis.get("confidence", 0))
-        if thesis:
-            thesis_short = thesis.split(".")[0].strip()
-            lines.append(
-                f"- Primary interpretation [{confidence}/100]: {thesis_short}."
-            )
-
-    if senuto_summary:
-        if "avg_delta_vs_yoy_pct" in senuto_summary:
-            delta = float(senuto_summary.get("avg_delta_vs_yoy_pct", 0.0))
-            if abs(delta) >= 0.01:
-                lines.append(
-                    "- Senuto visibility check (YoY): "
-                    f"avg {delta:+.2f}% vs YoY."
-                )
+    source_quality = _source_quality_summary(additional_context)
+    comparability = _comparability_summary(
+        additional_context,
+        brand_trends_available=brand_enabled,
+        brand_proxy_available=isinstance(brand_proxy, dict),
+    )
+    if source_quality:
+        if comparability:
+            lines.append(f"- **Data reliability & comparability**: {source_quality} {comparability}")
         else:
-            delta = float(senuto_summary.get("avg_delta_pct", 0.0))
-            if abs(delta) >= 0.01:
-                lines.append(
-                    "- Senuto visibility check: "
-                    f"avg {delta:+.2f}% vs previous week."
-                )
-    elif senuto_error:
-        lines.append("- Senuto visibility missing or inconsistent in this run; treat Senuto-derived opportunities as directional only.")
+            lines.append(f"- **Data reliability & comparability**: {source_quality}")
+    elif comparability:
+        lines.append(f"- **Data reliability & comparability**: {comparability}")
 
-    return lines[:9]
+    # Manager-friendly ordering to avoid truncating key decision lines.
+    priority_prefixes = (
+        "- **What changed**:",
+        "- **Why**:",
+        "- **Business implication**:",
+        "- **In plain language**:",
+        "- **Decision this week**:",
+        "- **Data reliability & comparability**:",
+        "- **Top signals**:",
+        "- **Priority actions",
+        "- **Campaign & trade-plan context**:",
+        "- **Brand demand baseline",
+        "- **Brand demand proxy",
+        "- **Brand search trend",
+        "- **Marketplace timeline",
+    )
+    selected: list[str] = []
+    for prefix in priority_prefixes:
+        row = next((line for line in lines if line.startswith(prefix)), None)
+        if row and row not in selected:
+            selected.append(row)
+    if not selected:
+        selected = lines
+    return selected[:9]
 
 
 def _build_leadership_snapshot_lines(
@@ -2867,7 +3082,7 @@ def _build_what_is_happening_lines(
         if brand_wow > 0:
             brand_note = (
                 f"Google Trends brand demand is up WoW ({brand_wow:+.2f}%), "
-                "which strengthens routing/SERP-mix hypothesis over pure demand collapse."
+                "which supports a click-distribution effect in search results rather than pure demand collapse."
             )
         elif brand_wow < 0:
             brand_note = (
@@ -2891,13 +3106,21 @@ def _build_what_is_happening_lines(
     lines.append(
         (
             "**WoW diagnosis**: **clicks changed by "
-            f"{_fmt_signed_compact(current.clicks - previous.clicks)} ({wow_pct})**, with CTR {ctr_wow_pp:+.2f} pp and avg position {pos_wow_delta:+.2f}. "
+            f"{_fmt_signed_compact(current.clicks - previous.clicks)} ({wow_pct})**, with CTR {ctr_wow_pp:+.2f} pp and avg position {_position_delta_label(pos_wow_delta)}. [E1] "
             "This pattern indicates category-level demand rotation, not broad quality collapse. "
             + (f"Growth clusters: {gain_text}. " if gain_text else "")
             + (f"Decline clusters: {loss_text}. " if loss_text else "")
             + (f"Window: {period_label}." if period_label else "")
         ).strip()
     )
+    gsc_coverage = (additional_context or {}).get("gsc_data_coverage", {})
+    if isinstance(gsc_coverage, dict) and gsc_coverage.get("p52w_mode") == "masked_to_days_with_data":
+        days_with_data = int(gsc_coverage.get("days_with_data", 0) or 0)
+        days_total = int(gsc_coverage.get("days_total", 0) or 0)
+        lines.append(
+            "P52W comparison was computed only for days with available GSC data in the analyzed week: "
+            f"{days_with_data}/{days_total} days."
+        )
 
     yoy_line = (
         f"**YoY diagnosis**: **clicks are {_fmt_signed_compact(current.clicks - yoy.clicks)} ({yoy_pct})**. "
@@ -2975,31 +3198,50 @@ def _build_what_is_happening_lines(
             "**Brand Ads overlap hypothesis (WoW)**: "
             f"{str(brand_ads_hyp.get('statement', '')).strip()} "
             f"Evidence: {str(brand_ads_hyp.get('evidence', '')).strip()}. "
-            f"Confidence: {int(brand_ads_hyp.get('confidence', 0) or 0)}/100."
+            f"Confidence: {_confidence_bucket(brand_ads_hyp.get('confidence', 0))}."
         )
 
-    trend_summary = _build_product_trend_summary(
-        scope_results=scope_results,
-        external_signals=external_signals,
-        additional_context=additional_context,
-    )
-    concise_trend = trend_summary.get("executive_line", "").strip()
-    if concise_trend:
-        lines.append("Non-brand trend conclusion: " + concise_trend)
-
+    movement_direction = "up" if (current.clicks - previous.clicks) >= 0 else "down"
     causal_chain = (
-        "**Causal chain**: Observation -> traffic is down while efficiency is stable. "
-        "Evidence -> cluster deltas and stable CTR/position indicate a theme-level demand rotation. "
+        f"**Causal chain**: Observation -> traffic is {movement_direction} while efficiency signals are mixed-but-stable WoW. "
+        "Evidence -> cluster deltas and CTR/position behavior indicate a theme-level demand rotation. "
         "Hypothesis -> seasonality/event timing plus paid/campaign timing explain most movement. "
-        "Decision -> treat current decline as demand/exposure-led first and quantify paid/campaign incremental effect before escalating technical SEO."
+        "Decision -> treat this as demand/exposure-led first and quantify paid/campaign incremental effect before escalating technical SEO."
     )
     if page_name_line:
         causal_chain += f" {page_name_line}"
     if brand_note:
         causal_chain += f" {brand_note}"
     if template_conf is not None:
-        causal_chain += f" Confidence (template/routing): {template_conf}/100."
+        causal_chain += f" Confidence (template/routing): {_confidence_bucket(template_conf)}."
     lines.append(causal_chain)
+
+    causal_confidence = int(hypotheses[0].get("confidence", 65)) if hypotheses else 65
+    conflict_flags: list[str] = []
+    if (current.clicks - previous.clicks) > 0 and home_wow < 0:
+        conflict_flags.append("overall clicks up while home template is down")
+    if brand_enabled and brand_wow < 0 and (current.clicks - previous.clicks) > 0:
+        conflict_flags.append("brand demand down while total clicks are up")
+    freshness_rows = _source_freshness_rows(additional_context)
+    stale_or_degraded = sum(
+        1
+        for row in freshness_rows
+        if str(row.get("status", "")).strip().lower() in {"stale", "degraded"}
+    )
+    causal_confidence -= 6 * len(conflict_flags)
+    if stale_or_degraded > 0:
+        causal_confidence -= 4
+    causal_confidence = max(45, min(95, causal_confidence))
+    if conflict_flags:
+        lines.append(
+            "Causality confidence: "
+            f"{_confidence_bucket(causal_confidence)} ({causal_confidence}/100). Mixed signals detected ({'; '.join(conflict_flags[:2])}); "
+            "keep this as a working explanation until next-run validation."
+        )
+    else:
+        lines.append(
+            f"Causality confidence: {_confidence_bucket(causal_confidence)} ({causal_confidence}/100). Main signals are directionally consistent in this run."
+        )
 
     update_signal = _latest_google_update_signal(external_signals)
     if update_signal:
@@ -3008,25 +3250,8 @@ def _build_what_is_happening_lines(
             "Treat as a contributing context signal and validate only where cluster/page behavior changed after the update date."
         )
         if algorithm_conf is not None:
-            update_line += f" Confidence: {algorithm_conf}/100."
+            update_line += f" Confidence: {_confidence_bucket(algorithm_conf)}."
         lines.append(update_line)
-
-    ddg_context = (additional_context or {}).get("duckduckgo_context", {})
-    if isinstance(ddg_context, dict) and ddg_context.get("enabled"):
-        ddg_rows = ddg_context.get("rows", [])
-        if isinstance(ddg_rows, list) and ddg_rows:
-            headings: list[str] = []
-            for row in ddg_rows[:2]:
-                if not isinstance(row, dict):
-                    continue
-                heading = str(row.get("heading", "")).strip() or str(row.get("query", "")).strip()
-                if heading:
-                    headings.append(f"`{heading}`")
-            if headings:
-                lines.append(
-                    "DuckDuckGo context scan: external cause-oriented signals were found and should be used as supporting hypotheses, "
-                    "not as standalone evidence. Top hints: " + "; ".join(headings) + "."
-                )
 
     campaign_context = _campaign_event_context(external_signals=external_signals, query_scope=query_scope)
     allegro_campaign_events = campaign_context.get("allegro_events", [])
@@ -3036,21 +3261,25 @@ def _build_what_is_happening_lines(
     competitor_count = len(competitor_campaign_events) if isinstance(competitor_campaign_events, list) else 0
     query_count = len(campaign_query_events) if isinstance(campaign_query_events, list) else 0
     if allegro_count >= 3 or competitor_count > 0 or query_count > 0:
-        campaign_days: list[date] = []
+        campaign_examples: list[str] = []
         if isinstance(allegro_campaign_events, list):
-            campaign_days.extend(row.day for row in allegro_campaign_events if isinstance(row, ExternalSignal))
+            for row in allegro_campaign_events[:2]:
+                if isinstance(row, ExternalSignal) and str(row.title).strip():
+                    campaign_examples.append(f"`{row.title}`")
         if isinstance(competitor_campaign_events, list):
-            campaign_days.extend(
-                row[0].day
-                for row in competitor_campaign_events
-                if isinstance(row, tuple) and len(row) == 2 and isinstance(row[0], ExternalSignal)
-            )
-        period = ""
-        if campaign_days:
-            period = f" Window: {min(campaign_days).isoformat()} to {max(campaign_days).isoformat()}."
+            for row in competitor_campaign_events[:1]:
+                if isinstance(row, tuple) and len(row) == 2 and isinstance(row[0], ExternalSignal):
+                    campaign_examples.append(f"`{row[0].title}`")
+        if isinstance(campaign_query_events, list):
+            for row in campaign_query_events[:1]:
+                query_name = str(getattr(row, "key", "")).strip()
+                if query_name:
+                    campaign_examples.append(f"query mover `{query_name}`")
+        examples_text = "; ".join(campaign_examples[:3]) if campaign_examples else "active sales campaign signals"
         lines.append(
-            "Campaign context: active campaign signals exist and can influence weekly demand allocation. "
-            f"(Allegro={_fmt_int(allegro_count)}, competitors={_fmt_int(competitor_count)}, query movers={_fmt_int(query_count)}).{period}"
+            "Campaign context: this week included signals such as "
+            + examples_text
+            + ". Likely impact on demand allocation: medium."
         )
     unified_timeline = _marketplace_timeline_rows(
         additional_context=additional_context,
@@ -3059,19 +3288,29 @@ def _build_what_is_happening_lines(
         max_rows=24,
     )
     if unified_timeline:
-        first_day = unified_timeline[0].get("day")
-        last_day = unified_timeline[-1].get("day")
-        if isinstance(first_day, date) and isinstance(last_day, date):
+        preview = "; ".join(
+            f"{str(row.get('day', '')).strip()} [{row.get('country', '')}] {row.get('track', '')}: {row.get('event', '')}"
+            for row in unified_timeline[:4]
+        )
+        if preview:
             lines.append(
-                "Unified marketplace timeline (market events + promo calendar): "
-                f"{_fmt_int(len(unified_timeline))} events on one date axis ({first_day.isoformat()} to {last_day.isoformat()})."
+                "Weekly market storyline on one timeline: "
+                + preview
+                + ". Use this timeline as context for demand shifts, not as a standalone root cause."
             )
-            preview = "; ".join(
-                f"{str(row.get('day', '')).strip()} [{row.get('country', '')}] {row.get('track', '')}: {row.get('event', '')}"
-                for row in unified_timeline[:4]
-            )
-            if preview:
-                lines.append("Timeline highlights: " + preview + ".")
+    market_events_ctx = (additional_context or {}).get("market_event_calendar", {})
+    if isinstance(market_events_ctx, dict):
+        counts = market_events_ctx.get("counts", {})
+        if isinstance(counts, dict):
+            current_events = int(counts.get("current", 0) or 0)
+            yoy_events = int(counts.get("yoy", 0) or 0)
+            delta_events = int(counts.get("delta_vs_yoy", 0) or 0)
+            delta_events_pct = float(counts.get("delta_pct_vs_yoy", 0.0) or 0.0)
+            if current_events > 0 or yoy_events > 0:
+                lines.append(
+                    "Marketplace events YoY context: "
+                    f"{current_events} events now vs {yoy_events} YoY ({delta_events:+d}; {delta_events_pct:+.1f}%)."
+                )
 
     pulse_line = _top_platform_pulse_line(additional_context)
     if pulse_line:
@@ -3085,28 +3324,77 @@ def _build_what_is_happening_lines(
             statement = str(trade_plan_signal.get("statement", "")).strip()
             confidence = int(trade_plan_signal.get("confidence", 0) or 0)
             if summary:
-                lines.append("Trade-plan summary: " + summary)
+                lines.append("Trade-plan signal: " + summary)
             if statement:
                 lines.append(
-                    "Trade-plan hypothesis: "
+                    "Trade-plan interpretation: "
                     + statement
-                    + f" Confidence: {confidence}/100."
+                    + f" Likelihood: {_confidence_bucket(confidence)}."
                 )
         channel_split = trade_plan.get("channel_split", [])
         if isinstance(channel_split, list) and channel_split:
-            top_channel = next((row for row in channel_split if isinstance(row, dict)), None)
-            if isinstance(top_channel, dict):
-                channel_name = str(top_channel.get("channel", "")).strip() or "channel"
-                delta_pct = top_channel.get("delta_spend_pct")
-                if (
-                    channel_name
-                    and channel_name.strip() not in {"-", "Unknown channel"}
-                    and isinstance(delta_pct, (int, float))
-                ):
-                    lines.append(
-                        "Channel pressure signal: "
-                        f"strongest shift in **{channel_name}** ({float(delta_pct):+.2f}% planned spend vs previous week)."
+            yoy_channel_hypotheses: list[str] = []
+            for row in channel_split[:3]:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("channel", "")).strip()
+                if not name:
+                    continue
+                impact = str(row.get("yoy_hypothesis_impact", "")).strip().lower()
+                reason = str(row.get("yoy_hypothesis_reason", "")).strip()
+                confidence = int(row.get("yoy_hypothesis_confidence", 0) or 0)
+                delta_pct_yoy = row.get("delta_spend_pct_vs_yoy")
+                if not impact or not reason:
+                    continue
+                yoy_channel_hypotheses.append(
+                    f"`{name}`: {impact} impact"
+                    + (
+                        f" ({float(delta_pct_yoy):+.2f}% spend vs YoY)"
+                        if isinstance(delta_pct_yoy, (int, float))
+                        else ""
                     )
+                    + f" -> {reason} (confidence {confidence}/100)"
+                )
+            if yoy_channel_hypotheses:
+                lines.append("Trade-plan YoY hypotheses (channels): " + "; ".join(yoy_channel_hypotheses) + ".")
+        campaign_rows = trade_plan.get("campaign_rows", [])
+        if isinstance(campaign_rows, list) and campaign_rows:
+            yoy_campaign_hypotheses_current: list[str] = []
+            yoy_campaign_hypotheses_upcoming: list[str] = []
+            for row in campaign_rows[:6]:
+                if not isinstance(row, dict):
+                    continue
+                campaign_name = str(row.get("campaign", "")).strip()
+                if not campaign_name:
+                    continue
+                impact = str(row.get("yoy_hypothesis_impact", "")).strip().lower()
+                reason = str(row.get("yoy_hypothesis_reason", "")).strip()
+                confidence = int(row.get("yoy_hypothesis_confidence", 0) or 0)
+                delta_pct_yoy = row.get("delta_spend_pct_vs_yoy")
+                if not impact or not reason:
+                    continue
+                hypothesis_line = (
+                    f"`{campaign_name}`: {impact} impact"
+                    + (
+                        f" ({float(delta_pct_yoy):+.2f}% spend vs YoY)"
+                        if isinstance(delta_pct_yoy, (int, float))
+                        else ""
+                    )
+                    + f" -> {reason} (confidence {confidence}/100)"
+                )
+                in_current_window = (
+                    float(row.get("current_spend", 0.0) or 0.0) > 0.0
+                    or float(row.get("current_impressions", 0.0) or 0.0) > 0.0
+                    or float(row.get("current_clicks", 0.0) or 0.0) > 0.0
+                )
+                if in_current_window:
+                    yoy_campaign_hypotheses_current.append(hypothesis_line)
+                else:
+                    yoy_campaign_hypotheses_upcoming.append(hypothesis_line)
+            if yoy_campaign_hypotheses_current:
+                lines.append("Trade-plan YoY hypotheses (campaigns active this week): " + "; ".join(yoy_campaign_hypotheses_current[:3]) + ".")
+            if yoy_campaign_hypotheses_upcoming:
+                lines.append("Trade-plan YoY hypotheses (upcoming campaigns, not active this week): " + "; ".join(yoy_campaign_hypotheses_upcoming[:2]) + ".")
     elif isinstance(trade_plan, dict):
         errors = trade_plan.get("errors", [])
         if isinstance(errors, list) and errors:
@@ -3134,29 +3422,52 @@ def _build_what_is_happening_lines(
                     if str(row.get("feature", "")).strip()
                 )
                 lines.append(
-                    "GSC feature split indicates distribution changes across SERP features rather than one uniform drop. "
-                    + (f"Feature gains: {gain_text}. " if gain_text else "")
-                    + (f"Feature declines: {loss_text}. " if loss_text else "")
-                    + "Use this to verify whether clicks moved between feature types."
+                    "GSC signals suggest visibility shifted across SERP result types rather than one uniform drop. "
+                    + (f"Strengthening signals: {gain_text}. " if gain_text else "")
+                    + (f"Weakening signals: {loss_text}. " if loss_text else "")
+                    + "Likely impact on traffic mix: medium."
                 )
 
     weekly_news = (additional_context or {}).get("weekly_news_digest", {})
     if isinstance(weekly_news, dict) and weekly_news.get("enabled"):
-        seo_count = int(weekly_news.get("seo_count", 0) or 0)
-        geo_count = int(weekly_news.get("geo_count", 0) or 0)
-        lines.append(
-            "Weekly SEO/GEO context: external publications were reviewed for potential causal support "
-            f"(SEO items={_fmt_int(seo_count)}, GEO items={_fmt_int(geo_count)}). "
-            "Interpretation uses this only as secondary evidence."
-        )
+        rows = weekly_news.get("rows", [])
+        headlines: list[str] = []
+        if isinstance(rows, list):
+            for row in rows[:3]:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("title", "")).strip()
+                if title:
+                    headlines.append(f"`{title}`")
+        if headlines:
+            news_yoy_text = ""
+            current_count = weekly_news.get("total_count")
+            yoy_count = weekly_news.get("total_count_yoy")
+            if isinstance(current_count, (int, float)) and isinstance(yoy_count, (int, float)):
+                news_yoy_text = " YoY volume context: " + _format_count_yoy_change(float(current_count), float(yoy_count))
+            lines.append(
+                "SEO/GEO publication context: "
+                + "; ".join(headlines)
+                + "."
+                + news_yoy_text
+                + " Direct impact this week is likely low-to-medium; use as supporting context only."
+            )
 
     temp_diff = float(weather_summary.get("avg_temp_diff_c", 0.0))
     precip_change = float(weather_summary.get("precip_change_pct", 0.0))
+    temp_diff_yoy = float(weather_summary.get("avg_temp_diff_yoy_c", 0.0))
+    precip_change_yoy = float(weather_summary.get("precip_change_pct_yoy", 0.0))
     lines.append(
-        "Weather context: week-over-week weather moved "
-        f"({temp_diff:+.1f}C temperature delta; {precip_change:+.1f}% precipitation delta), "
-        "which supports demand-timing interpretation, not direct technical SEO impact."
-        + (f" Confidence: {weather_conf}/100." if weather_conf is not None else "")
+        "Weather context: week-over-week conditions changed "
+        f"({temp_diff:+.1f}C; precipitation {precip_change:+.1f}%). "
+        f"YoY weather delta: {temp_diff_yoy:+.1f}C; precipitation {precip_change_yoy:+.1f}%. "
+        "This supports demand-timing interpretation "
+        "rather than a direct technical SEO issue. "
+        + (
+            f"Likely impact on demand timing: {_confidence_bucket(weather_conf)}."
+            if weather_conf is not None
+            else "Likely impact on demand timing: Medium."
+        )
     )
 
     macro = (additional_context or {}).get("macro", {})
@@ -3174,6 +3485,71 @@ def _build_what_is_happening_lines(
                         f"(EUR/PLN {eur_delta:+.2f}%, USD/PLN {usd_delta:+.2f}%). "
                         "This can affect price competitiveness and conversion in import-heavy categories."
                     )
+    macro_backdrop = (additional_context or {}).get("macro_backdrop", {})
+    if isinstance(macro_backdrop, dict):
+        macro_rows = macro_backdrop.get("rows", {})
+        if isinstance(macro_rows, dict):
+            inflation = macro_rows.get("inflation_cpi_pct", {})
+            unemployment = macro_rows.get("unemployment_pct", {})
+            if isinstance(inflation, dict) and inflation.get("latest_value") is not None:
+                inf_latest = float(inflation.get("latest_value", 0.0) or 0.0)
+                inf_prev = float(inflation.get("previous_value", 0.0) or 0.0)
+                lines.append(
+                    "Macro backdrop (annual): "
+                    f"inflation is {inf_latest:.2f}% vs {inf_prev:.2f}% in prior available year. "
+                    "Higher inflation usually means more price-sensitive shopping behavior."
+                )
+            if isinstance(unemployment, dict) and unemployment.get("latest_value") is not None:
+                un_latest = float(unemployment.get("latest_value", 0.0) or 0.0)
+                lines.append(
+                    "Labor-market backdrop: "
+                    f"unemployment is {un_latest:.2f}% in latest available year; "
+                    "treat as supporting context for medium-term demand."
+                )
+
+    promo_radar = (additional_context or {}).get("competitor_promo_radar", {})
+    if isinstance(promo_radar, dict) and promo_radar.get("enabled"):
+        promo_rows = promo_radar.get("rows", [])
+        if isinstance(promo_rows, list) and promo_rows:
+            top_titles: list[str] = []
+            for row in promo_rows[:2]:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("title", "")).strip()
+                if title:
+                    top_titles.append(f"`{title}`")
+            lines.append(
+                "Competitor promo radar: "
+                f"{len(promo_rows)} relevant promo mentions in the analyzed period"
+                + (f" (examples: {', '.join(top_titles)})." if top_titles else ".")
+                + " This can redirect clicks between marketplaces."
+            )
+
+    long_window = (additional_context or {}).get("long_window_context", {})
+    if isinstance(long_window, dict) and long_window.get("enabled"):
+        kpi = long_window.get("kpi", {})
+        if isinstance(kpi, dict):
+            lw_clicks_pct = kpi.get("clicks_delta_pct_vs_previous")
+            lw_clicks_yoy_pct = kpi.get("clicks_delta_pct_vs_yoy")
+            if isinstance(lw_clicks_pct, (int, float)) and isinstance(lw_clicks_yoy_pct, (int, float)):
+                lines.append(
+                    "Broader 28d context: "
+                    f"clicks are {float(lw_clicks_pct):+.2f}% vs previous 28d and {float(lw_clicks_yoy_pct):+.2f}% YoY. "
+                    "This helps separate short weekly noise from longer trend direction."
+                )
+
+    tracker = (additional_context or {}).get("hypothesis_tracker", {})
+    if isinstance(tracker, dict):
+        counts = tracker.get("counts", {})
+        if isinstance(counts, dict):
+            new_n = int(counts.get("new", 0) or 0)
+            confirmed_n = int(counts.get("confirmed", 0) or 0)
+            rejected_n = int(counts.get("rejected", 0) or 0)
+            lines.append(
+                "Hypothesis continuity: "
+                f"{confirmed_n} recurring signals, {new_n} new signals, {rejected_n} rejected since last run. "
+                "Recurring signals are usually more reliable than one-off observations."
+            )
 
     forecast_start = str(weather_summary.get("forecast_start", "")).strip()
     forecast_end = str(weather_summary.get("forecast_end", "")).strip()
@@ -3203,7 +3579,7 @@ def _build_what_is_happening_lines(
     if isinstance(brand_ads_hyp, dict):
         hypothesis_points.append(
             str(brand_ads_hyp.get("statement", "")).strip()
-            + f" (confidence {int(brand_ads_hyp.get('confidence', 0) or 0)}/100)."
+            + f" (confidence: {_confidence_bucket(brand_ads_hyp.get('confidence', 0))})."
         )
     if update_signal:
         hypothesis_points.append(
@@ -3218,12 +3594,12 @@ def _build_what_is_happening_lines(
         lines.append("")
         lines.append("**Confirmed vs hypothesis**")
         if confirmed_points:
-            lines.append("Confirmed by data:")
-            for item in confirmed_points[:3]:
+            lines.append("Confirmed facts from data:")
+            for item in confirmed_points[:2]:
                 lines.append(f"- {item}")
         if hypothesis_points:
             lines.append("Working hypotheses:")
-            for item in hypothesis_points[:3]:
+            for item in hypothesis_points[:2]:
                 lines.append(f"- {item}")
 
     # Dynamic driver table (only active/contextual drivers for this run).
@@ -3236,17 +3612,17 @@ def _build_what_is_happening_lines(
             "Demand mix",
             demand_direction,
             f"Organic clicks {wow_pct} WoW; efficiency change limited (CTR {ctr_wow_pp:+.2f} pp).",
-            f"{demand_conf}/100",
+            _confidence_bucket(demand_conf),
             demand_impact,
         )
     )
     if page_name_line:
         driver_rows.append(
             (
-                "Page routing",
+                "Page mix",
                 "Down" if home_wow < 0 else "Up",
                 page_name_line,
-                f"{template_conf if template_conf is not None else 72}/100",
+                _confidence_bucket(template_conf if template_conf is not None else 72),
                 "High",
             )
         )
@@ -3256,7 +3632,7 @@ def _build_what_is_happening_lines(
                 "Brand paid overlap",
                 "Mixed",
                 str(brand_ads_hyp.get("statement", "")).strip(),
-                f"{int(brand_ads_hyp.get('confidence', 0) or 0)}/100",
+                _confidence_bucket(brand_ads_hyp.get("confidence", 0)),
                 "Medium",
             )
         )
@@ -3266,7 +3642,7 @@ def _build_what_is_happening_lines(
                 "Trade plan timing",
                 "Mixed",
                 str(trade_plan_signal.get("statement", "")).strip(),
-                f"{int(trade_plan_signal.get('confidence', 0) or 0)}/100",
+                _confidence_bucket(trade_plan_signal.get("confidence", 0)),
                 "Medium",
             )
         )
@@ -3276,7 +3652,7 @@ def _build_what_is_happening_lines(
                 "Algorithm context",
                 "Mixed",
                 f"Post-update monitoring needed after {update_signal.day.isoformat()}.",
-                f"{algorithm_conf if algorithm_conf is not None else 68}/100",
+                _confidence_bucket(algorithm_conf if algorithm_conf is not None else 68),
                 "Medium",
             )
         )
@@ -3286,39 +3662,29 @@ def _build_what_is_happening_lines(
                 "Weather timing",
                 "Mixed",
                 f"Weather shift vs previous week: temp {temp_diff:+.1f}C, precip {precip_change:+.1f}%.",
-                f"{weather_conf if weather_conf is not None else 64}/100",
+                _confidence_bucket(weather_conf if weather_conf is not None else 64),
                 "Low-Med",
             )
         )
 
-    lines.append("")
-    lines.append("**Driver Scoreboard**")
-    lines.append("| Driver | Direction | Evidence | Confidence | Expected impact on traffic |")
-    lines.append("|---|---|---|---:|---|")
-    for row in driver_rows[:6]:
-        lines.append(f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} | {row[4]} |")
-
-    senuto_intelligence = (additional_context or {}).get("senuto_intelligence", {})
-    if isinstance(senuto_intelligence, dict) and senuto_intelligence.get("enabled"):
-        competitors = senuto_intelligence.get("competitors_overview", [])
-        if isinstance(competitors, list) and competitors:
-            top_comp = next((row for row in competitors if isinstance(row, dict)), None)
-            if isinstance(top_comp, dict):
-                lines.append(
-                    "Competitive context: Senuto overlap shows strongest competitor pressure from "
-                    f"`{top_comp.get('domain', '')}` ({_fmt_int(top_comp.get('common_keywords', 0.0))} common keywords)."
-                )
+    if driver_rows:
+        top_driver_bits = [
+            f"{row[0]} ({row[1].lower()}, confidence {row[3]})"
+            for row in driver_rows[:3]
+        ]
+        lines.append("")
+        lines.append("Top drivers this week: " + "; ".join(top_driver_bits) + ".")
 
     lines.append("")
     lines.append("**Reasoning ledger (facts -> hypotheses -> validation)**")
     lines.append(
         "- Facts observed: "
         f"clicks {_fmt_signed_compact(current.clicks - previous.clicks)} WoW ({wow_pct}), "
-        f"CTR {ctr_wow_pp:+.2f} pp WoW, avg position {pos_wow_delta:+.2f} WoW."
+        f"CTR {ctr_wow_pp:+.2f} pp WoW, avg position {_position_delta_label(pos_wow_delta)} WoW. [E1]"
     )
     if hypotheses:
         ranked_hypotheses = "; ".join(
-            f"{str(row.get('category', 'Unknown')).strip()} ({int(row.get('confidence', 0) or 0)}/100)"
+            f"{str(row.get('category', 'Unknown')).strip()} ({_confidence_bucket(row.get('confidence', 0))})"
             for row in hypotheses[:3]
             if isinstance(row, dict)
         )
@@ -3329,19 +3695,20 @@ def _build_what_is_happening_lines(
         alt_explanations.append("campaign impact may be underestimated because no explicit campaign mentions were captured")
     if brand_enabled is False and not isinstance(brand_proxy, dict):
         alt_explanations.append("brand-demand baseline is weak (Google Trends + GSC brand proxy unavailable)")
-    if senuto_intelligence == {}:
-        alt_explanations.append("competitive SERP pressure may be under-detected without Senuto intelligence rows")
     if alt_explanations:
         lines.append("- Alternative explanations to falsify: " + "; ".join(alt_explanations[:2]) + ".")
     source_errors = (additional_context or {}).get("errors", [])
     if isinstance(source_errors, list) and source_errors:
-        lines.append("- Data gaps affecting certainty: " + "; ".join(str(row).strip() for row in source_errors[:2]) + ".")
+        sanitized = [_sanitize_data_gap_message(row) for row in source_errors[:3]]
+        sanitized = [row for row in sanitized if row]
+        if sanitized:
+            lines.append("- Data gaps affecting certainty: " + "; ".join(sanitized[:2]) + ".")
     lines.append(
         "- Validation plan (next run): verify top 3 hypotheses against refreshed campaign timeline, brand-demand baseline, "
         "and segment-level GSC deltas before escalating technical actions."
     )
 
-    return lines
+    return _compact_manager_section(lines, max_lines=28)
 
 
 def _focus_terms_from_query_scope(query_scope: AnalysisResult | None) -> list[str]:
@@ -3926,6 +4293,38 @@ def _build_reasoning_hypotheses(
             }
         )
 
+    default_protocol = {
+        "falsifier": "If next run shows opposite direction and no supporting source signals, reject this hypothesis.",
+        "validation_metric": "GSC clicks/CTR/position by affected segment",
+        "validation_date": (date.today() + timedelta(days=7)).isoformat(),
+    }
+    for row in hypotheses:
+        if not isinstance(row, dict):
+            continue
+        category = str(row.get("category", "")).strip().lower()
+        if "seasonality" in category:
+            row.setdefault("falsifier", "If seasonal-cluster deltas explain <30% of total click delta for 2 runs, seasonality is not primary.")
+            row.setdefault("validation_metric", "Share of total click delta explained by seasonal clusters + weather shift")
+        elif "campaign" in category:
+            row.setdefault("falsifier", "If campaign windows overlap <2 days with affected intents or deltas move opposite, campaign effect is unlikely.")
+            row.setdefault("validation_metric", "Window-overlap days + aligned direction in trade-plan and query clusters")
+        elif "algorithm" in category:
+            row.setdefault("falsifier", "If impacted segments are not at least 10% worse than control segments post-update, algorithm effect is unlikely.")
+            row.setdefault("validation_metric", "Post-update delta on impacted segments vs control segments")
+        elif "technical" in category:
+            row.setdefault("falsifier", "If technical metrics improve by >=10% with no traffic recovery, technical root-cause is weak.")
+            row.setdefault("validation_metric", "CWV/device/template change vs segment traffic response")
+        elif "continuity" in category:
+            row.setdefault("falsifier", "If repeated themes are absent for 2 consecutive runs, continuity signal is not explanatory.")
+            row.setdefault("validation_metric", "Share of repeated winner/loser terms vs prior reports")
+        elif "non-brand" in category or "demand mix" in category:
+            row.setdefault("falsifier", "If non-brand recovers >=5% while external demand proxies remain weak, this hypothesis is unlikely.")
+            row.setdefault("validation_metric", "Non-brand clicks/CTR/position vs external demand proxies")
+        else:
+            row.setdefault("falsifier", default_protocol["falsifier"])
+            row.setdefault("validation_metric", default_protocol["validation_metric"])
+        row.setdefault("validation_date", default_protocol["validation_date"])
+
     hypotheses.sort(key=lambda row: int(row.get("confidence", 0)), reverse=True)
     return hypotheses
 
@@ -4124,6 +4523,63 @@ def build_markdown_report(
             additional_context=additional_context,
         )
     )
+    evidence_ledger = _build_evidence_ledger(
+        windows=windows,
+        external_signals=external_signals,
+        additional_context=additional_context,
+        limit=8,
+    )
+    if evidence_ledger:
+        anchor_ids = ", ".join(f"[{row.get('id', '')}]" for row in evidence_ledger if row.get("id"))
+        if anchor_ids:
+            lines.append("")
+            lines.append(f"- Evidence anchors used in this report: {anchor_ids}.")
+            lines.append("- Key claim mapping: KPI movement [E1]; external context and timeline claims use subsequent evidence IDs from the ledger.")
+
+    lines.append("")
+    lines.append("## Hypothesis protocol")
+    lines.append("| Hypothesis | Confidence | What would disprove it | Validation metric | Check date |")
+    lines.append("|---|---|---|---|---|")
+    emitted = 0
+    for row in hypotheses:
+        if not isinstance(row, dict):
+            continue
+        category = str(row.get("category", "")).strip() or "Unknown"
+        thesis = str(row.get("thesis", "")).strip()
+        confidence = int(row.get("confidence", 0) or 0)
+        falsifier = str(row.get("falsifier", "")).strip() or "-"
+        validation_metric = str(row.get("validation_metric", "")).strip() or "-"
+        validation_date = str(row.get("validation_date", "")).strip() or "-"
+        if not thesis:
+            continue
+        lines.append(
+            f"| {category}: {thesis} | {_confidence_bucket(confidence)} ({confidence}/100) | "
+            f"{falsifier} | {validation_metric} | {validation_date} |"
+        )
+        emitted += 1
+        if emitted >= 3:
+            break
+    if emitted == 0:
+        lines.append("| (no tracked hypotheses) | - | - | - | - |")
+
+    lines.append("")
+    lines.extend(
+        _governance_lines(
+            run_date=run_date,
+            report_country_code=country_label,
+            windows=windows,
+            additional_context=additional_context,
+        )
+    )
+    if evidence_ledger:
+        lines.append("")
+        lines.append("## Evidence ledger")
+        lines.append("| ID | Source | Date | Note |")
+        lines.append("|---|---|---|---|")
+        for row in evidence_ledger:
+            lines.append(
+                f"| {row.get('id','')} | {row.get('source','')} | {row.get('date','')} | {row.get('note','')} |"
+            )
 
     # Decision-layer report only (Executive summary + narrative).
     if not INCLUDE_APPENDIX_IN_REPORT:

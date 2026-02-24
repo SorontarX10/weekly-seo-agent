@@ -3,14 +3,17 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
+import json
 import shutil
 from datetime import date
 from pathlib import Path
+import time
 
 from dotenv import find_dotenv, load_dotenv
 
 from weekly_seo_agent.weekly_reporting_agent.clients.google_drive_client import GoogleDriveClient
 from weekly_seo_agent.weekly_reporting_agent.config import AgentConfig
+from weekly_seo_agent.weekly_reporting_agent.evaluation import evaluate_report_text
 from weekly_seo_agent.weekly_reporting_agent.reporting import write_docx
 from weekly_seo_agent.weekly_reporting_agent.workflow import run_weekly_workflow
 
@@ -132,6 +135,7 @@ def _run_country_report(
     country_code: str,
     output_dir_str: str,
 ) -> dict[str, str]:
+    started = time.time()
     country_config, senuto_country_id, gsc_country_filter = _build_country_config(
         config, country_code
     )
@@ -140,6 +144,7 @@ def _run_country_report(
 
     state = run_weekly_workflow(run_date, country_config)
     final_report = state.get("final_report") or state["markdown_report"]
+    quality = evaluate_report_text(final_report)
     report_stem = f"{run_date.strftime('%Y_%m_%d')}_{country_code.lower()}_seo_weekly_report"
     docx_path = output_dir / f"{report_stem}.docx"
     write_docx(
@@ -152,6 +157,11 @@ def _run_country_report(
         "docx_path": str(docx_path),
         "gsc_country_filter": gsc_country_filter,
         "senuto_country_id": str(senuto_country_id),
+        "quality_score": str(int(quality.get("score", 0) or 0)),
+        "quality_passed": "true" if bool(quality.get("passed", False)) else "false",
+        "quality_issues": json.dumps(quality.get("issues", []), ensure_ascii=False),
+        "quality_metrics": json.dumps(quality.get("metrics", {}), ensure_ascii=False),
+        "runtime_sec": f"{(time.time() - started):.2f}",
     }
 
 
@@ -190,6 +200,7 @@ def main() -> None:
 
     failed_countries: list[tuple[str, str]] = []
     successful_runs: list[dict[str, str]] = []
+    telemetry_rows: list[dict[str, str]] = []
     max_workers = max(1, min(len(country_codes), 4))
     force_serial = len(country_codes) == 1
     mode_label = "serial" if force_serial else "parallel"
@@ -207,10 +218,12 @@ def main() -> None:
                 output_dir_str=str(output_dir),
             )
             successful_runs.append(result)
+            telemetry_rows.append(result)
             print(
                 "Report generated: "
                 f"{result['docx_path']} | country={result['country_code']} | "
-                f"GSC={result['gsc_country_filter']} | Senuto country_id={result['senuto_country_id']}"
+                f"GSC={result['gsc_country_filter']} | Senuto country_id={result['senuto_country_id']} | "
+                f"quality={result.get('quality_score', '0')}/100"
             )
         except Exception as exc:
             failed_countries.append((country_code, str(exc)))
@@ -232,16 +245,35 @@ def main() -> None:
                 try:
                     result = future.result()
                     successful_runs.append(result)
+                    telemetry_rows.append(result)
                     print(
                         "Report generated: "
                         f"{result['docx_path']} | country={result['country_code']} | "
-                        f"GSC={result['gsc_country_filter']} | Senuto country_id={result['senuto_country_id']}"
+                        f"GSC={result['gsc_country_filter']} | Senuto country_id={result['senuto_country_id']} | "
+                        f"quality={result.get('quality_score', '0')}/100"
                     )
                 except Exception as exc:
                     failed_countries.append((country_code, str(exc)))
                     print(f"Country run failed: {country_code} | {exc}")
 
-    if drive_client is not None:
+    gated_runs: list[dict[str, str]] = []
+    for result in successful_runs:
+        score = int(float(result.get("quality_score", "0") or 0.0))
+        passed = str(result.get("quality_passed", "")).lower() == "true"
+        if config.eval_gate_enabled and (score < int(config.eval_gate_min_score) or not passed):
+            failed_countries.append(
+                (
+                    str(result.get("country_code", "unknown")),
+                    "Evaluation gate failed: "
+                    f"score={score}/100 (min {int(config.eval_gate_min_score)}), "
+                    f"passed={passed}, issues={result.get('quality_issues', '[]')}",
+                )
+            )
+            continue
+        gated_runs.append(result)
+    successful_runs = gated_runs
+
+    if drive_client is not None and (not config.eval_gate_enabled or not config.eval_gate_block_drive_upload or successful_runs):
         drive_upload_errors: list[str] = []
         for result in successful_runs:
             docx_path = Path(result["docx_path"])
@@ -262,6 +294,30 @@ def main() -> None:
             for err in drive_upload_errors:
                 print(f"- {err}")
 
+    if config.telemetry_enabled and telemetry_rows:
+        telemetry_dir = output_dir / "_telemetry"
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+        telemetry_path = telemetry_dir / f"{run_date.strftime('%Y_%m_%d')}_weekly_reporting_observability.jsonl"
+        with telemetry_path.open("w", encoding="utf-8") as handle:
+            for row in telemetry_rows:
+                handle.write(
+                    json.dumps(
+                        {
+                            "country_code": row.get("country_code", ""),
+                            "docx_path": row.get("docx_path", ""),
+                            "quality_score": int(float(row.get("quality_score", "0") or 0.0)),
+                            "quality_passed": str(row.get("quality_passed", "")).lower() == "true",
+                            "runtime_sec": float(row.get("runtime_sec", "0.0") or 0.0),
+                            "quality_issues": json.loads(str(row.get("quality_issues", "[]") or "[]")),
+                            "quality_metrics": json.loads(str(row.get("quality_metrics", "{}") or "{}")),
+                            "timestamp": time.time(),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        print(f"Observability log written: {telemetry_path}")
+
     if not successful_runs:
         raise SystemExit(
             "Run failed: no country report was generated. "
@@ -272,6 +328,8 @@ def main() -> None:
         print("Run finished with country-level failures:")
         for code, message in failed_countries:
             print(f"- {code}: {message}")
+        if config.eval_gate_enabled:
+            raise SystemExit("Run failed quality/evaluation gate for at least one country.")
 
 
 if __name__ == "__main__":

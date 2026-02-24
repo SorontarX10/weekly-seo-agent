@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from datetime import date
+from datetime import date, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -23,7 +23,7 @@ from weekly_seo_agent.weekly_reporting_agent.clients.senuto_client import Senuto
 from weekly_seo_agent.weekly_reporting_agent.config import AgentConfig
 from weekly_seo_agent.weekly_reporting_agent.ferie import build_ferie_context, build_upcoming_ferie_trends
 from weekly_seo_agent.weekly_reporting_agent.llm import build_gaia_llm
-from weekly_seo_agent.weekly_reporting_agent.models import AnalysisResult, ExternalSignal, KeyDelta, MetricSummary
+from weekly_seo_agent.weekly_reporting_agent.models import AnalysisResult, DateWindow, ExternalSignal, KeyDelta, MetricRow, MetricSummary
 from weekly_seo_agent.weekly_reporting_agent.query_filter import filter_irrelevant_query_rows
 from weekly_seo_agent.weekly_reporting_agent.reporting import _build_reasoning_hypotheses, build_markdown_report
 from weekly_seo_agent.weekly_reporting_agent.segmentation import build_segment_diagnostics
@@ -174,6 +174,61 @@ def _cache_saved_at(payload: dict[str, object]) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _host_from_url(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else f"https://{text}")
+    host = (parsed.netloc or parsed.path).strip().lower()
+    return host
+
+
+def _source_url_allowed(url: str | None, allowlist: tuple[str, ...]) -> bool:
+    if not url:
+        return True
+    host = _host_from_url(url)
+    if not host:
+        return False
+    normalized = tuple(item.strip().lower() for item in allowlist if item.strip())
+    if not normalized:
+        return True
+    for domain in normalized:
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
+
+
+def _sanitize_signal_text(value: str, max_len: int = 400) -> str:
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        text = text[: max_len - 3].rstrip() + "..."
+    return text
+
+
+def _sanitize_external_signals(
+    signals: list[ExternalSignal],
+    allowlist: tuple[str, ...],
+) -> list[ExternalSignal]:
+    out: list[ExternalSignal] = []
+    for row in signals:
+        if not isinstance(row, ExternalSignal):
+            continue
+        if not _source_url_allowed(row.url, allowlist):
+            continue
+        out.append(
+            ExternalSignal(
+                source=_sanitize_signal_text(row.source, max_len=120),
+                day=row.day,
+                title=_sanitize_signal_text(row.title, max_len=180),
+                details=_sanitize_signal_text(row.details, max_len=420),
+                severity=str(row.severity or "info").strip().lower() or "info",
+                url=row.url if _source_url_allowed(row.url, allowlist) else None,
+            )
+        )
+    return out
 
 
 def _latest_signal_day(signals: list[ExternalSignal], source_predicate) -> date | None:
@@ -1038,55 +1093,15 @@ def _extract_key_data_packets(
         }
 
     def _market_pack() -> dict[str, str]:
-        senuto_raw = additional_context.get("senuto_intelligence", {}) if isinstance(additional_context, dict) else {}
-        senuto_compact: dict[str, object] = {}
-        if isinstance(senuto_raw, dict):
-            senuto_compact = {
-                "enabled": bool(senuto_raw.get("enabled")),
-                "errors": senuto_raw.get("errors", []),
-                "competitors_overview": (
-                    senuto_raw.get("competitors_overview", [])[:6]
-                    if isinstance(senuto_raw.get("competitors_overview"), list)
-                    else []
-                ),
-                "keyword_trending": (
-                    senuto_raw.get("keyword_trending", [])[:8]
-                    if isinstance(senuto_raw.get("keyword_trending"), list)
-                    else []
-                ),
-            }
-
         data: dict[str, object] = {
-            "senuto": senuto_compact,
+            "policy_note": (
+                "Detailed trend/status/history/senuto blocks are used for hypothesis generation only "
+                "and intentionally excluded from direct narrative packets."
+            ),
             "allegro_trends": _compact_ctx_rows(
                 additional_context.get("allegro_trends", {}) if isinstance(additional_context, dict) else {},
                 top_n=8,
             ),
-            "product_trends": {
-                "enabled": bool(
-                    (additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {}).get("enabled")
-                )
-                if isinstance(additional_context, dict)
-                else False,
-                "top_yoy_non_brand": (
-                    (additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {}).get("top_yoy_non_brand", [])[:8]
-                    if isinstance((additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {}).get("top_yoy_non_brand"), list)
-                    else []
-                ),
-                "current_non_brand": (
-                    (additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {}).get("current_non_brand", [])[:8]
-                    if isinstance((additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {}).get("current_non_brand"), list)
-                    else []
-                ),
-                "upcoming_31d": (
-                    (additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {}).get("upcoming_31d", [])[:8]
-                    if isinstance((additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {}).get("upcoming_31d"), list)
-                    else []
-                ),
-                "errors": (
-                    (additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {}).get("errors", [])
-                ),
-            },
             "market_event_calendar": _compact_ctx_rows(
                 additional_context.get("market_event_calendar", {}) if isinstance(additional_context, dict) else {},
                 top_n=8,
@@ -1134,14 +1149,6 @@ def _extract_key_data_packets(
             "free_public_source_hub": _compact_ctx_rows(
                 additional_context.get("free_public_source_hub", {}) if isinstance(additional_context, dict) else {},
                 top_n=10,
-            ),
-            "status_log": _compact_ctx_rows(
-                additional_context.get("status_log", {}) if isinstance(additional_context, dict) else {},
-                top_n=6,
-            ),
-            "historical_reports": _compact_ctx_rows(
-                additional_context.get("historical_reports", {}) if isinstance(additional_context, dict) else {},
-                top_n=4,
             ),
             "weekly_news_digest": _compact_ctx_rows(
                 additional_context.get("weekly_news_digest", {}) if isinstance(additional_context, dict) else {},
@@ -1225,42 +1232,103 @@ def _parse_json_object(raw: str) -> dict[str, object]:
     return {}
 
 
+def _is_valid_map_summary_schema(payload: dict[str, object]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    for key in ("facts", "signals", "unknowns", "quality_notes"):
+        if key not in payload:
+            return False
+    if not isinstance(payload.get("facts"), list):
+        return False
+    if not isinstance(payload.get("signals"), list):
+        return False
+    if not isinstance(payload.get("unknowns"), list):
+        return False
+    if not isinstance(payload.get("quality_notes"), list):
+        return False
+    for row in payload.get("facts", [])[:12]:
+        if not isinstance(row, dict):
+            return False
+        if "claim" not in row or "evidence" not in row or "confidence_0_100" not in row:
+            return False
+    for row in payload.get("signals", [])[:12]:
+        if not isinstance(row, dict):
+            return False
+        if "type" not in row or "statement" not in row or "evidence" not in row:
+            return False
+    return True
+
+
+def _is_valid_validator_schema(payload: dict[str, object]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    required = ("approved", "issues", "unsupported_claims", "feedback_for_rewrite")
+    if any(key not in payload for key in required):
+        return False
+    if not isinstance(payload.get("approved"), bool):
+        return False
+    if not isinstance(payload.get("issues"), list):
+        return False
+    if not isinstance(payload.get("unsupported_claims"), list):
+        return False
+    if not isinstance(payload.get("feedback_for_rewrite"), list):
+        return False
+    return True
+
+
 def _compose_final_report(markdown_report: str, commentary: str) -> str:
     leadership_snapshot = _extract_markdown_section(markdown_report, "Leadership snapshot")
     executive_summary = _extract_markdown_section(markdown_report, "Executive summary")
-    baseline_narrative = _extract_markdown_section(markdown_report, "What is happening and why")
-    leadership_snapshot_block = ""
-    if leadership_snapshot:
-        leadership_snapshot_block = (
-            "## Leadership Snapshot\n"
-            f"{leadership_snapshot}\n\n"
-        )
-    executive_summary_block = ""
-    if executive_summary:
-        executive_summary_block = (
-            "## Executive Summary\n"
-            f"{executive_summary}\n\n"
-        )
-
+    governance = _extract_markdown_section(markdown_report, "Governance and provenance")
+    evidence_ledger = _extract_markdown_section(markdown_report, "Evidence ledger")
     report_title_line = next(
         (line for line in markdown_report.splitlines() if line.startswith("# ")),
         "# Weekly SEO Intelligence Report",
     )
-    return (
-        f"{report_title_line}\n\n"
-        f"{leadership_snapshot_block}"
-        f"{executive_summary_block}"
-        "## Narrative Analysis\n"
-        f"{commentary.strip()}\n\n"
-        "### Source Baseline Narrative (for traceability)\n"
-        f"{baseline_narrative.strip() or '- Baseline narrative section not available.'}\n"
-    )
+    output_lines: list[str] = [report_title_line, ""]
+    if leadership_snapshot:
+        output_lines.append("## Leadership Snapshot")
+        output_lines.append(leadership_snapshot.strip())
+        output_lines.append("")
+    if executive_summary:
+        output_lines.append("## Executive Summary")
+        output_lines.append(executive_summary.strip())
+        output_lines.append("")
+
+    output_lines.append("## Narrative Analysis")
+    output_lines.append(commentary.strip())
+    output_lines.append("")
+
+    governance_lines = [
+        row.strip()
+        for row in (governance or "").splitlines()
+        if row.strip().startswith("- ")
+    ]
+    output_lines.append("## Governance and Provenance")
+    if governance_lines:
+        output_lines.extend(governance_lines[:3])
+    else:
+        output_lines.append("- Governance metadata unavailable.")
+    output_lines.append("")
+
+    anchor_ids = re.findall(r"\|\s*(E\d+)\s*\|", evidence_ledger or "")
+    output_lines.append("## Evidence Anchors")
+    if anchor_ids:
+        joined = ", ".join(f"[{anchor}]" for anchor in anchor_ids[:6])
+        output_lines.append(f"- Primary anchors: {joined}.")
+    else:
+        output_lines.append("- Evidence ledger unavailable.")
+
+    return "\n".join(output_lines).strip() + "\n"
 
 
 def _compose_validation_report(markdown_report: str, commentary: str, max_appendix_chars: int) -> str:
     leadership_snapshot = _extract_markdown_section(markdown_report, "Leadership snapshot")
     executive_summary = _extract_markdown_section(markdown_report, "Executive summary")
     baseline_narrative = _extract_markdown_section(markdown_report, "What is happening and why")
+    hypothesis_protocol = _extract_markdown_section(markdown_report, "Hypothesis protocol")
+    governance = _extract_markdown_section(markdown_report, "Governance and provenance")
+    evidence_ledger = _extract_markdown_section(markdown_report, "Evidence ledger")
     report_title_line = next(
         (line for line in markdown_report.splitlines() if line.startswith("# ")),
         "# Weekly SEO Intelligence Report",
@@ -1274,7 +1342,13 @@ def _compose_validation_report(markdown_report: str, commentary: str, max_append
         "## Narrative Analysis\n"
         f"{commentary.strip()}\n\n"
         "## Source Baseline Narrative\n"
-        f"{(baseline_narrative or '- Missing baseline narrative').strip()}\n"
+        f"{(baseline_narrative or '- Missing baseline narrative').strip()}\n\n"
+        "## Hypothesis protocol\n"
+        f"{(hypothesis_protocol or '- Missing hypothesis protocol').strip()}\n\n"
+        "## Governance and provenance\n"
+        f"{(governance or '- Missing governance metadata').strip()}\n\n"
+        "## Evidence ledger\n"
+        f"{(evidence_ledger or '- Missing evidence ledger').strip()}\n"
     )
 
 
@@ -1377,6 +1451,8 @@ Validator feedback to address (if any):
                 {"summary_raw": summary_raw},
             )
         parsed = _parse_json_object(summary_raw)
+        if not _is_valid_map_summary_schema(parsed):
+            parsed = {"facts": [], "signals": [], "unknowns": ["Schema validation failed for map-step output."], "quality_notes": []}
         facts = parsed.get("facts", []) if isinstance(parsed, dict) else []
         signals = parsed.get("signals", []) if isinstance(parsed, dict) else []
         unknowns = parsed.get("unknowns", []) if isinstance(parsed, dict) else []
@@ -1551,6 +1627,13 @@ Decision rule:
         _cache_save_json("llm_validator_v2", (cache_key_payload,), {"validator_raw": raw})
 
     parsed = _parse_json_object(raw)
+    if not _is_valid_validator_schema(parsed):
+        return {
+            "approved": False,
+            "issues": ["[high] Validator returned payload incompatible with strict schema."],
+            "feedback": ["Rebuild validator output with strict JSON schema."],
+            "unsupported_claims_count": 1,
+        }
     issues_out: list[str] = []
     unsupported_claims_count = 0
 
@@ -1614,6 +1697,9 @@ def _run_rule_based_report_checks(report_text: str) -> list[str]:
         "## Leadership Snapshot",
         "## Executive Summary",
         "## Narrative Analysis",
+        "## Hypothesis protocol",
+        "## Governance and provenance",
+        "## Evidence ledger",
     )
     for section in required_sections:
         if section not in report_text:
@@ -1649,6 +1735,38 @@ def _pct_change(current: float, baseline: float) -> float:
     if baseline == 0:
         return 0.0
     return ((current - baseline) / baseline) * 100
+
+
+def _daily_metric_map(
+    gsc: GSCClient,
+    window,
+) -> dict[date, MetricRow]:
+    out: dict[date, MetricRow] = {}
+    try:
+        rows = gsc.fetch_rows(window, dimensions=("date",))
+    except Exception:
+        return out
+    for row in rows:
+        try:
+            day = date.fromisoformat(str(row.key).strip()[:10])
+        except Exception:
+            continue
+        out[day] = row
+    return out
+
+
+def _summary_for_days(
+    day_map: dict[date, MetricRow],
+    selected_days: set[date] | None = None,
+) -> MetricSummary:
+    rows = []
+    for day, row in day_map.items():
+        if selected_days is not None and day not in selected_days:
+            continue
+        rows.append(row)
+    if not rows:
+        return MetricSummary()
+    return MetricSummary.from_rows(rows)
 
 
 def _weekly_news_impact_tag(text: str) -> tuple[str, str]:
@@ -1697,8 +1815,28 @@ def _collect_weekly_news_digest(
             geo_keywords=config.weekly_news_keywords_geo,
             max_items=max(1, int(config.weekly_news_max_items)),
         )
+        yoy_window = DateWindow(
+            name="YoY aligned (52 weeks ago)",
+            start=current_window.start - timedelta(weeks=52),
+            end=current_window.end - timedelta(weeks=52),
+        )
+        seo_items_yoy, geo_items_yoy = collect_weekly_news(
+            window=yoy_window,
+            seo_urls=config.weekly_news_rss_urls_seo,
+            geo_urls=config.weekly_news_rss_urls_geo,
+            seo_allowlist=config.weekly_news_domains_seo,
+            geo_allowlist=config.weekly_news_domains_geo,
+            seo_keywords=config.weekly_news_keywords_seo,
+            geo_keywords=config.weekly_news_keywords_geo,
+            max_items=max(1, int(config.weekly_news_max_items)),
+        )
         summary = build_weekly_news_summary(config, seo_items, geo_items)
         merged = list(seo_items) + list(geo_items)
+        merged_yoy = list(seo_items_yoy) + list(geo_items_yoy)
+        total_current = len(merged)
+        total_yoy = len(merged_yoy)
+        delta_vs_yoy = total_current - total_yoy
+        delta_pct_vs_yoy = ((delta_vs_yoy / total_yoy) * 100.0) if total_yoy else 0.0
         context = {
             "enabled": bool(merged),
             "source": "Weekly SEO/GEO RSS digest",
@@ -1706,6 +1844,14 @@ def _collect_weekly_news_digest(
             "window_end": current_window.end.isoformat(),
             "seo_count": len(seo_items),
             "geo_count": len(geo_items),
+            "window_start_yoy": yoy_window.start.isoformat(),
+            "window_end_yoy": yoy_window.end.isoformat(),
+            "seo_count_yoy": len(seo_items_yoy),
+            "geo_count_yoy": len(geo_items_yoy),
+            "total_count": total_current,
+            "total_count_yoy": total_yoy,
+            "delta_count_vs_yoy": delta_vs_yoy,
+            "delta_count_pct_vs_yoy": delta_pct_vs_yoy,
             "rows": _serialize_news_items(merged, limit=max(1, int(config.weekly_news_max_items))),
             "summary": summary.strip(),
             "errors": [],
@@ -1796,6 +1942,7 @@ def _allegro_trends_candidate_queries(
 
 
 def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
+    node_started = time.time()
     run_date = state["run_date"]
     config = state["config"]
 
@@ -1817,13 +1964,57 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         row_limit=config.gsc_row_limit,
     )
 
+    current_daily_map = _daily_metric_map(gsc, current_window)
+    yoy_daily_map = _daily_metric_map(gsc, yoy_window)
+    current_days_with_data = {
+        day
+        for day, row in current_daily_map.items()
+        if float(row.impressions or 0.0) > 0.0 or float(row.clicks or 0.0) > 0.0
+    }
+    # Fallback: if day-level endpoint returns no rows, keep full-window baseline.
+    if not current_days_with_data:
+        current_days_with_data = {
+            current_window.start + timedelta(days=offset)
+            for offset in range(max(0, current_window.days))
+        }
+    yoy_days_aligned = {
+        yoy_window.start + timedelta(days=(day - current_window.start).days)
+        for day in current_days_with_data
+    }
+    yoy_days_with_data = {
+        day
+        for day in yoy_days_aligned
+        if day in yoy_daily_map
+        and (
+            float(yoy_daily_map[day].impressions or 0.0) > 0.0
+            or float(yoy_daily_map[day].clicks or 0.0) > 0.0
+        )
+    }
+
+    yoy_total_masked = _summary_for_days(yoy_daily_map, yoy_days_with_data)
+    if float(yoy_total_masked.impressions) <= 0.0:
+        yoy_total_masked = gsc.fetch_totals(yoy_window)
+
+    current_week_total = gsc.fetch_totals(current_window)
+
     totals = {
-        "current_28d": gsc.fetch_totals(current_window),
+        "current_28d": current_week_total,
         "previous_28d": gsc.fetch_totals(previous_window),
-        "yoy_52w": gsc.fetch_totals(yoy_window),
+        "yoy_52w": yoy_total_masked,
         "current_28d_context": gsc.fetch_totals(context_28d_current),
         "previous_28d_context": gsc.fetch_totals(context_28d_previous),
         "yoy_28d_context_52w": gsc.fetch_totals(context_28d_yoy),
+    }
+    gsc_data_coverage = {
+        "window": "current_week",
+        "start": current_window.start.isoformat(),
+        "end": current_window.end.isoformat(),
+        "days_with_data": len(current_days_with_data),
+        "days_total": int(current_window.days),
+        "days_with_data_list": sorted(day.isoformat() for day in current_days_with_data),
+        "p52w_mode": "masked_to_days_with_data",
+        "p52w_days_used": len(yoy_days_with_data),
+        "p52w_days_used_list": sorted(day.isoformat() for day in yoy_days_with_data),
     }
 
     scope_results: list[tuple[str, AnalysisResult]] = []
@@ -2072,11 +2263,13 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
             )
     else:
         # Parallel I/O for independent context fetches with bounded worker pool.
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
             future_external = executor.submit(
                 external_client.collect,
                 current_window=current_window,
                 previous_window=previous_window,
+                yoy_window=yoy_window,
             )
             future_context = executor.submit(
                 collect_additional_context,
@@ -2108,7 +2301,9 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 product_trends_horizon_days=config.product_trends_horizon_days,
                 trade_plan_enabled=config.trade_plan_enabled,
                 trade_plan_sheet_reference=config.trade_plan_sheet_reference,
+                trade_plan_yoy_sheet_reference=config.trade_plan_yoy_sheet_reference,
                 trade_plan_tab_map=config.trade_plan_tab_map,
+                trade_plan_yoy_tab_map=config.trade_plan_yoy_tab_map,
                 trade_plan_top_rows=config.trade_plan_top_rows,
                 platform_pulse_enabled=config.platform_pulse_enabled,
                 platform_pulse_rss_urls=config.platform_pulse_rss_urls,
@@ -2224,6 +2419,9 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                         severity="medium",
                     )
                 )
+        finally:
+            # Do not block shutdown on stuck network I/O in worker threads.
+            executor.shutdown(wait=False, cancel_futures=True)
         if not external_signals and stale_external:
             external_signals, weather_summary = _deserialize_external_cache(stale_external)
             external_cache_mode = "stale_fallback"
@@ -2271,6 +2469,22 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
             },
         )
     external_signals.extend(extra_signals)
+    raw_signal_count = len(external_signals)
+    external_signals = _sanitize_external_signals(
+        external_signals,
+        allowlist=config.security_source_allowlist_domains,
+    )
+    dropped_signals = max(0, raw_signal_count - len(external_signals))
+    additional_context.setdefault("security", {})
+    if isinstance(additional_context.get("security"), dict):
+        additional_context["security"].update(
+            {
+                "signal_filter_allowlist_domains": list(config.security_source_allowlist_domains),
+                "signals_raw_count": raw_signal_count,
+                "signals_kept_count": len(external_signals),
+                "signals_dropped_count": dropped_signals,
+            }
+        )
     external_signals.sort(key=lambda item: (item.day, item.source), reverse=True)
     source_freshness = _build_source_freshness_rows(
         run_date=run_date,
@@ -2285,6 +2499,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         source_ttl_market_events_sec=max(60, int(config.source_ttl_market_events_sec)),
     )
     additional_context["source_freshness"] = source_freshness
+    additional_context["gsc_data_coverage"] = gsc_data_coverage
     additional_context.setdefault("source_stability", {})
     if isinstance(additional_context.get("source_stability"), dict):
         additional_context["source_stability"].update(
@@ -2597,6 +2812,13 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         except Exception as exc:
             senuto_error = str(exc)
     additional_context["senuto_intelligence"] = senuto_intelligence
+    additional_context["gaia_model"] = config.gaia_model
+    additional_context["governance_human_reviewer"] = config.governance_human_reviewer
+    additional_context["observability"] = {
+        "collect_and_analyze_runtime_sec": round(time.time() - node_started, 3),
+        "external_signal_count": len(external_signals),
+        "hypothesis_count": 0,
+    }
 
     precomputed_hypotheses = _build_reasoning_hypotheses(
         totals=totals,
@@ -2610,6 +2832,8 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         senuto_error=senuto_error,
     )
     additional_context["precomputed_hypotheses"] = precomputed_hypotheses
+    if isinstance(additional_context.get("observability"), dict):
+        additional_context["observability"]["hypothesis_count"] = len(precomputed_hypotheses)
     additional_context["hypothesis_tracker"] = _update_hypothesis_tracker(
         country_code=config.report_country_code,
         run_date=run_date,

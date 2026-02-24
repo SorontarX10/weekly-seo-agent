@@ -1391,7 +1391,9 @@ def collect_additional_context(
     product_trends_horizon_days: int = 31,
     trade_plan_enabled: bool = True,
     trade_plan_sheet_reference: str = "",
+    trade_plan_yoy_sheet_reference: str = "",
     trade_plan_tab_map: dict[str, str] | None = None,
+    trade_plan_yoy_tab_map: dict[str, str] | None = None,
     trade_plan_top_rows: int = 12,
     platform_pulse_enabled: bool = True,
     platform_pulse_rss_urls: tuple[str, ...] = (),
@@ -1409,11 +1411,15 @@ def collect_additional_context(
     eia_api_key: str = "",
 ) -> tuple[dict[str, Any], list[ExternalSignal]]:
     country_code = report_country_code.strip().upper() or "PL"
+    yoy_window = DateWindow(
+        name="YoY aligned (52 weeks ago)",
+        start=current_window.start - timedelta(weeks=52),
+        end=current_window.end - timedelta(weeks=52),
+    )
     context: dict[str, Any] = {
         "country_code": country_code,
         "pagespeed": {},
         "pagespeed_source": "",
-        "google_trends": [],
         "google_trends_brand": {},
         "duckduckgo_context": {},
         "campaign_events": [],
@@ -1474,7 +1480,7 @@ def collect_additional_context(
                     title="Core Web Vitals risk on origin",
                     details=(
                         f"Mobile field data: LCP {lcp:.0f}ms, INP {inp:.0f}ms, CLS {cls:.2f}. "
-                        "Wolniejsze CWV moga obciazac wyniki SEO i konwersje."
+                        "Slower CWV can reduce SEO performance and conversion."
                     ),
                     severity="medium",
                     url="https://pagespeed.web.dev/",
@@ -1489,29 +1495,6 @@ def collect_additional_context(
             )
         else:
             context["errors"].append(f"CrUX/PageSpeed fetch failed: {exc}")
-
-    try:
-        trends = _fetch_google_trends(rss_url=google_trends_rss_url, since=previous_window.start)
-        context["google_trends"] = trends
-        for row in trends[:8]:
-            topic = str(row.get("topic", "Trend"))
-            traffic = int(row.get("approx_traffic", 0))
-            day = row.get("day")
-            if not isinstance(day, date):
-                continue
-            severity = "medium" if traffic >= 100000 else "info"
-            signals.append(
-                ExternalSignal(
-                    source=f"Google Trends {country_code}",
-                    day=day,
-                    title=f"Trending topic: {topic}",
-                    details=f"Approx traffic: {traffic}.",
-                    severity=severity,
-                    url=str(row.get("url", "")).strip() or None,
-                )
-            )
-    except Exception as exc:
-        context["errors"].append(f"Google Trends fetch failed: {exc}")
 
     try:
         brand_context = _fetch_google_trends_brand_context(
@@ -1709,7 +1692,16 @@ def collect_additional_context(
             "source": "GDELT DOC API",
             "country_code": country_code,
             "events": [],
+            "events_yoy": [],
             "top_rows": max(1, market_events_top_rows),
+            "window_current": {
+                "start": previous_window.start.isoformat(),
+                "end": (current_window.end + timedelta(days=31)).isoformat(),
+            },
+            "window_yoy": {
+                "start": (yoy_window.start - timedelta(days=28)).isoformat(),
+                "end": (yoy_window.end + timedelta(days=31)).isoformat(),
+            },
             "errors": [],
         }
         try:
@@ -1720,7 +1712,25 @@ def collect_additional_context(
                 top_rows=max(1, market_events_top_rows),
                 api_base_url=market_events_api_base_url,
             )
+            market_rows_yoy = _fetch_market_event_calendar(
+                country_code=country_code,
+                since=yoy_window.start - timedelta(days=28),
+                until=yoy_window.end + timedelta(days=31),
+                top_rows=max(1, market_events_top_rows),
+                api_base_url=market_events_api_base_url,
+            )
             market_context["events"] = market_rows
+            market_context["events_yoy"] = market_rows_yoy
+            market_context["counts"] = {
+                "current": len(market_rows),
+                "yoy": len(market_rows_yoy),
+                "delta_vs_yoy": len(market_rows) - len(market_rows_yoy),
+                "delta_pct_vs_yoy": (
+                    ((len(market_rows) - len(market_rows_yoy)) / len(market_rows_yoy)) * 100.0
+                    if len(market_rows_yoy)
+                    else 0.0
+                ),
+            }
             for row in market_rows[: max(1, market_events_top_rows)]:
                 if not isinstance(row, dict):
                     continue
@@ -1872,36 +1882,6 @@ def collect_additional_context(
             )
             seo_context = presentations_client.collect_context(run_date=run_date)
             context["seo_presentations"] = seo_context
-
-            for row in seo_context.get("highlights", [])[:12]:
-                if not isinstance(row, dict):
-                    continue
-                day = _parse_date(row.get("date")) or run_date
-                signals.append(
-                    ExternalSignal(
-                        source="SEO Team Presentations",
-                        day=day,
-                        title=f"Presentation insight: {row.get('file', '')}",
-                        details=str(row.get("note", "")).strip()[:280],
-                        severity="info",
-                        url=str(row.get("url", "")).strip() or None,
-                    )
-                )
-
-            for year_row in seo_context.get("years", []):
-                if not isinstance(year_row, dict):
-                    continue
-                year = str(year_row.get("year", ""))
-                count = int(year_row.get("file_count", 0))
-                signals.append(
-                    ExternalSignal(
-                        source="SEO Team Presentations",
-                        day=run_date,
-                        title=f"Presentation archive coverage {year}",
-                        details=f"Detected {count} presentation files in year folder {year}.",
-                        severity="info",
-                    )
-                )
         except Exception as exc:
             context["errors"].append(f"SEO presentations fetch failed: {exc}")
 
@@ -1939,47 +1919,6 @@ def collect_additional_context(
             try:
                 historical_context = continuity_client.collect_historical_reports(run_date=run_date)
                 context["historical_reports"] = historical_context
-                for row in historical_context.get("recent_reports", [])[:4]:
-                    if not isinstance(row, dict):
-                        continue
-                    report_day = _parse_date(row.get("date")) or run_date
-                    report_name = str(row.get("name", "")).strip() or "Historical report"
-                    highlights = row.get("highlights", [])
-                    details = ""
-                    if isinstance(highlights, list) and highlights:
-                        details = str(highlights[0]).strip()
-                    if not details:
-                        details = (
-                            str(row.get("excerpt", "")).strip()[:220]
-                            or "Historical report context captured for continuity check."
-                        )
-                    signals.append(
-                        ExternalSignal(
-                            source="Historical SEO Reports",
-                            day=report_day,
-                            title=f"Historical context: {report_name}",
-                            details=details,
-                            severity="info",
-                            url=str(row.get("url", "")).strip() or None,
-                        )
-                    )
-
-                yoy_report = historical_context.get("yoy_report", {})
-                if isinstance(yoy_report, dict) and yoy_report.get("id"):
-                    report_day = _parse_date(yoy_report.get("date")) or run_date
-                    signals.append(
-                        ExternalSignal(
-                            source="Historical SEO Reports",
-                            day=report_day,
-                            title="YoY reference report loaded",
-                            details=(
-                                str(yoy_report.get("name", "")).strip()
-                                or "YoY report from previous year loaded for continuity checks."
-                            ),
-                            severity="info",
-                            url=str(yoy_report.get("url", "")).strip() or None,
-                        )
-                    )
             except Exception as exc:
                 context["errors"].append(f"Historical report fetch failed: {exc}")
 
@@ -1987,23 +1926,6 @@ def collect_additional_context(
             try:
                 status_context = continuity_client.collect_status_updates(run_date=run_date)
                 context["status_log"] = status_context
-                for row in status_context.get("entries", [])[:8]:
-                    if not isinstance(row, dict):
-                        continue
-                    entry_day = _parse_date(row.get("date")) or run_date
-                    topic = str(row.get("topic", "")).strip() or "Status update"
-                    summary = str(row.get("summary", "")).strip()
-                    details = summary or f"Entry from sheet '{row.get('sheet', '')}'."
-                    signals.append(
-                        ExternalSignal(
-                            source="SEO Status Log",
-                            day=entry_day,
-                            title=topic[:140],
-                            details=details[:240],
-                            severity="info",
-                            url=str(status_context.get("url", "")).strip() or None,
-                        )
-                    )
             except Exception as exc:
                 context["errors"].append(f"Status log fetch failed: {exc}")
 
@@ -2019,40 +1941,6 @@ def collect_additional_context(
                     horizon_days=product_trends_horizon_days,
                 )
                 context["product_trends"] = trend_context
-
-                for row in trend_context.get("upcoming_31d", [])[:8]:
-                    if not isinstance(row, dict):
-                        continue
-                    day = _parse_date(row.get("date")) or run_date
-                    trend = str(row.get("trend", "")).strip() or "Upcoming product trend"
-                    value = float(row.get("value", 0.0))
-                    signals.append(
-                        ExternalSignal(
-                            source="Product Trends (upcoming 31d)",
-                            day=day,
-                            title=trend[:140],
-                            details=f"Non-brand trend score/value: {value:.2f}.",
-                            severity="medium" if value >= 1000 else "info",
-                            url=str(trend_context.get("upcoming_sheet", {}).get("url", "")).strip() or None,
-                        )
-                    )
-
-                for row in trend_context.get("current_non_brand", [])[:8]:
-                    if not isinstance(row, dict):
-                        continue
-                    day = _parse_date(row.get("date")) or run_date
-                    trend = str(row.get("trend", "")).strip() or "Current product trend"
-                    value = float(row.get("value", 0.0))
-                    signals.append(
-                        ExternalSignal(
-                            source="Product Trends (current)",
-                            day=day,
-                            title=trend[:140],
-                            details=f"Non-brand trend score/value: {value:.2f}.",
-                            severity="info",
-                            url=str(trend_context.get("current_sheet", {}).get("url", "")).strip() or None,
-                        )
-                    )
             except Exception as exc:
                 context["errors"].append(f"Product trends fetch failed: {exc}")
 
@@ -2062,6 +1950,10 @@ def collect_additional_context(
                 tab_name = str(tab_map.get(country_code, "")).strip()
                 if not tab_name:
                     tab_name = f"TP_{run_date.year}_{country_code}"
+                yoy_tab_map = trade_plan_yoy_tab_map or {}
+                yoy_tab_name = str(yoy_tab_map.get(country_code, "")).strip()
+                if not yoy_tab_name and str(run_date.year) in tab_name:
+                    yoy_tab_name = tab_name.replace(str(run_date.year), str(run_date.year - 1))
                 trade_plan_context = continuity_client.collect_trade_plan_context(
                     run_date=run_date,
                     sheet_reference=trade_plan_sheet_reference,
@@ -2070,6 +1962,10 @@ def collect_additional_context(
                     current_window_end=current_window.end,
                     previous_window_start=previous_window.start,
                     previous_window_end=previous_window.end,
+                    yoy_window_start=yoy_window.start,
+                    yoy_window_end=yoy_window.end,
+                    yoy_sheet_reference=trade_plan_yoy_sheet_reference,
+                    yoy_tab_name=yoy_tab_name,
                     top_rows=max(1, int(trade_plan_top_rows)),
                 )
                 context["trade_plan"] = trade_plan_context

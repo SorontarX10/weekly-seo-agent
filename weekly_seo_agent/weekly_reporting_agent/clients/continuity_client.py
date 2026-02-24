@@ -673,6 +673,86 @@ class ContinuityClient:
                     return idx
         return None
 
+    @staticmethod
+    def _trade_plan_yoy_hypothesis(
+        *,
+        current_spend: float,
+        yoy_spend: float,
+        current_clicks: float,
+        yoy_clicks: float,
+        current_impressions: float,
+        yoy_impressions: float,
+    ) -> dict[str, object]:
+        if yoy_spend <= 0.0 and yoy_clicks <= 0.0 and yoy_impressions <= 0.0:
+            return {
+                "impact": "neutral",
+                "confidence": 35,
+                "reason": "YoY baseline is missing, so impact cannot be inferred reliably.",
+            }
+
+        spend_delta_pct = ((current_spend - yoy_spend) / yoy_spend * 100.0) if yoy_spend else 0.0
+        clicks_delta_pct = ((current_clicks - yoy_clicks) / yoy_clicks * 100.0) if yoy_clicks else 0.0
+        impressions_delta_pct = (
+            ((current_impressions - yoy_impressions) / yoy_impressions * 100.0) if yoy_impressions else 0.0
+        )
+
+        if yoy_spend > 0.0 and current_spend > 0.0 and abs(spend_delta_pct) < 8.0:
+            return {
+                "impact": "neutral",
+                "confidence": 62,
+                "reason": (
+                    "Planned spend is close to last year, which points to a neutral YoY demand-allocation effect "
+                    "unless external demand changed materially."
+                ),
+            }
+
+        if spend_delta_pct >= 12.0:
+            if clicks_delta_pct >= -5.0 and impressions_delta_pct >= -5.0:
+                return {
+                    "impact": "positive",
+                    "confidence": 74,
+                    "reason": (
+                        "Planned support is materially higher YoY and visibility signals are not weaker, "
+                        "so this likely increased demand capture potential."
+                    ),
+                }
+            return {
+                "impact": "negative",
+                "confidence": 68,
+                "reason": (
+                    "Planned support is higher YoY but clicks/impressions are weaker vs last year, "
+                    "which suggests lower expected efficiency or less favorable demand mix."
+                ),
+            }
+
+        if spend_delta_pct <= -12.0:
+            if clicks_delta_pct >= 5.0 or impressions_delta_pct >= 5.0:
+                return {
+                    "impact": "positive",
+                    "confidence": 66,
+                    "reason": (
+                        "Support is lower YoY while visibility signals remain stronger, "
+                        "which implies more efficient demand capture vs last year."
+                    ),
+                }
+            return {
+                "impact": "negative",
+                "confidence": 72,
+                "reason": (
+                    "Planned support is materially lower YoY and no stronger visibility offset is visible, "
+                    "so the expected effect on demand allocation is negative."
+                ),
+            }
+
+        return {
+            "impact": "neutral",
+            "confidence": 58,
+            "reason": (
+                "YoY differences are mixed across support and visibility indicators, "
+                "so the net effect is likely neutral in this window."
+            ),
+        }
+
     @classmethod
     def _pick_text_column(cls, headers: list[str], tokens: tuple[str, ...]) -> int | None:
         normalized = [cls._normalize_text(header) for header in headers]
@@ -1614,6 +1694,11 @@ class ContinuityClient:
         current_window_end: date,
         previous_window_start: date,
         previous_window_end: date,
+        yoy_window_start: date | None = None,
+        yoy_window_end: date | None = None,
+        yoy_sheet_reference: str = "",
+        yoy_tab_name: str = "",
+        include_yoy_enrichment: bool = True,
         top_rows: int = 12,
     ) -> dict[str, Any]:
         if not self.client_secret_path:
@@ -1670,6 +1755,9 @@ class ContinuityClient:
             }
 
         header_candidates: list[tuple[int, list[str], int | None, int | None, int | None, int]] = []
+        date_header_tokens = ("campaign start", "week start", "start date", "date", "data")
+        campaign_header_tokens = ("campaign name", "initiative name", "nazwa kampanii", "nazwa")
+        campaign_fallback_tokens = ("campaign", "akcja", "event", "initiative")
         max_header_scan = min(8, len(values))
         for idx in range(max_header_scan):
             row = values[idx]
@@ -1680,12 +1768,17 @@ class ContinuityClient:
                 continue
             date_idx_probe = self._pick_text_column(
                 headers,
-                ("date", "data", "start", "from", "week", "tydzien", "day", "campaign start", "week start"),
+                date_header_tokens,
             )
             campaign_idx_probe = self._pick_text_column(
                 headers,
-                ("campaign", "akcja", "event", "initiative", "name", "nazwa"),
+                campaign_header_tokens,
             )
+            if campaign_idx_probe is None:
+                campaign_idx_probe = self._pick_text_column(
+                    headers,
+                    campaign_fallback_tokens,
+                )
             channel_idx_probe = self._pick_text_column(
                 headers,
                 ("channel", "kanal", "source", "medium", "publisher", "platform"),
@@ -1746,7 +1839,7 @@ class ContinuityClient:
 
         date_idx = self._pick_text_column(
             headers,
-            ("date", "data", "start", "from", "week", "tydzien", "day", "campaign start", "week start"),
+            date_header_tokens,
         )
         campaign_start_idx = self._pick_text_column(
             headers,
@@ -1758,11 +1851,24 @@ class ContinuityClient:
         )
         campaign_idx = self._pick_text_column(
             headers,
-            ("campaign", "akcja", "event", "initiative", "name", "nazwa"),
+            campaign_header_tokens,
         )
+        if campaign_idx is None:
+            campaign_idx = self._pick_text_column(
+                headers,
+                campaign_fallback_tokens,
+            )
         channel_idx = self._pick_text_column(
             headers,
             ("channel", "kanal", "source", "medium", "publisher", "platform"),
+        )
+        team_idx = self._pick_text_column(
+            headers,
+            ("executing team", "team", "owner"),
+        )
+        type_idx = self._pick_text_column(
+            headers,
+            ("type", "campaign/content"),
         )
         category_idx = self._pick_text_column(
             headers,
@@ -1770,7 +1876,15 @@ class ContinuityClient:
         )
         spend_idx = self._pick_text_column(
             headers,
-            ("spend", "budget", "cost", "koszt", "wydatki"),
+            ("spend", "cost", "koszt", "wydatki"),
+        )
+        duration_idx = self._pick_text_column(
+            headers,
+            ("duration", "total duration", "duration [days]"),
+        )
+        core_phase_idx = self._pick_text_column(
+            headers,
+            ("core phase", "core phase [days]"),
         )
         impressions_idx = self._pick_text_column(
             headers,
@@ -1804,16 +1918,17 @@ class ContinuityClient:
                     return date(year, month, day)
                 except ValueError:
                     return None
-            # Infer year nearest to run_date.
+            # Infer year nearest to analyzed window (not today's run date).
+            anchor_day = current_window_end
             candidates: list[date] = []
-            for year in (run_date.year - 1, run_date.year, run_date.year + 1):
+            for year in (anchor_day.year - 1, anchor_day.year, anchor_day.year + 1):
                 try:
                     candidates.append(date(year, month, day))
                 except ValueError:
                     continue
             if not candidates:
                 return None
-            return min(candidates, key=lambda item: abs((item - run_date).days))
+            return min(candidates, key=lambda item: abs((item - anchor_day).days))
 
         def _derive_row_day(row: list[object]) -> date | None:
             if date_idx is not None and date_idx < len(row):
@@ -1843,6 +1958,12 @@ class ContinuityClient:
                 return "current"
             if previous_window_start <= row_day <= previous_window_end:
                 return "previous"
+            if (
+                isinstance(yoy_window_start, date)
+                and isinstance(yoy_window_end, date)
+                and yoy_window_start <= row_day <= yoy_window_end
+            ):
+                return "yoy"
             if current_window_end < row_day <= current_window_end + timedelta(days=31):
                 return "forward_31d"
             return ""
@@ -1868,7 +1989,12 @@ class ContinuityClient:
                 str(row[channel_idx]).strip()
                 if channel_idx is not None and channel_idx < len(row)
                 else ""
-            ) or "Unknown channel"
+            )
+            if not channel and team_idx is not None and team_idx < len(row):
+                channel = str(row[team_idx]).strip()
+            if not channel and type_idx is not None and type_idx < len(row):
+                channel = str(row[type_idx]).strip()
+            channel = channel or "Unknown channel"
             category = (
                 str(row[category_idx]).strip()
                 if category_idx is not None and category_idx < len(row)
@@ -1889,6 +2015,25 @@ class ContinuityClient:
                 if clicks_idx is not None and clicks_idx < len(row)
                 else None
             )
+            duration_days = (
+                self._parse_numeric_cell(row[duration_idx])
+                if duration_idx is not None and duration_idx < len(row)
+                else None
+            )
+            core_phase_days = (
+                self._parse_numeric_cell(row[core_phase_idx])
+                if core_phase_idx is not None and core_phase_idx < len(row)
+                else None
+            )
+            # Trade-plan tabs often have no spend/clicks/impressions.
+            # Use planning intensity proxy from duration/core-phase to keep YoY comparability.
+            if spend is None:
+                if core_phase_days is not None:
+                    spend = float(core_phase_days)
+                elif duration_days is not None:
+                    spend = float(duration_days)
+                else:
+                    spend = 0.0
 
             parsed_rows.append(
                 {
@@ -1898,6 +2043,8 @@ class ContinuityClient:
                     "channel": channel,
                     "category": category,
                     "spend": float(spend or 0.0),
+                    "duration_days": float(duration_days or 0.0),
+                    "core_phase_days": float(core_phase_days or 0.0),
                     "impressions": float(impressions or 0.0),
                     "clicks": float(clicks or 0.0),
                 }
@@ -1910,10 +2057,13 @@ class ContinuityClient:
                     "channel": channel,
                     "current_spend": 0.0,
                     "previous_spend": 0.0,
+                    "yoy_spend": 0.0,
                     "current_impressions": 0.0,
                     "previous_impressions": 0.0,
+                    "yoy_impressions": 0.0,
                     "current_clicks": 0.0,
                     "previous_clicks": 0.0,
+                    "yoy_clicks": 0.0,
                 },
             )
             if bucket == "current":
@@ -1924,6 +2074,10 @@ class ContinuityClient:
                 channel_row["previous_spend"] += float(spend or 0.0)
                 channel_row["previous_impressions"] += float(impressions or 0.0)
                 channel_row["previous_clicks"] += float(clicks or 0.0)
+            elif bucket == "yoy":
+                channel_row["yoy_spend"] += float(spend or 0.0)
+                channel_row["yoy_impressions"] += float(impressions or 0.0)
+                channel_row["yoy_clicks"] += float(clicks or 0.0)
 
             campaign_key = f"{campaign.strip().lower()}::{category.strip().lower()}"
             campaign_row = campaign_summary.setdefault(
@@ -1934,8 +2088,14 @@ class ContinuityClient:
                     "first_date": row_day.isoformat(),
                     "last_date": row_day.isoformat(),
                     "current_spend": 0.0,
+                    "previous_spend": 0.0,
+                    "yoy_spend": 0.0,
                     "current_impressions": 0.0,
+                    "previous_impressions": 0.0,
+                    "yoy_impressions": 0.0,
                     "current_clicks": 0.0,
+                    "previous_clicks": 0.0,
+                    "yoy_clicks": 0.0,
                     "forward_spend": 0.0,
                 },
             )
@@ -1947,6 +2107,14 @@ class ContinuityClient:
                 campaign_row["current_spend"] = float(campaign_row.get("current_spend", 0.0)) + float(spend or 0.0)
                 campaign_row["current_impressions"] = float(campaign_row.get("current_impressions", 0.0)) + float(impressions or 0.0)
                 campaign_row["current_clicks"] = float(campaign_row.get("current_clicks", 0.0)) + float(clicks or 0.0)
+            elif bucket == "previous":
+                campaign_row["previous_spend"] = float(campaign_row.get("previous_spend", 0.0)) + float(spend or 0.0)
+                campaign_row["previous_impressions"] = float(campaign_row.get("previous_impressions", 0.0)) + float(impressions or 0.0)
+                campaign_row["previous_clicks"] = float(campaign_row.get("previous_clicks", 0.0)) + float(clicks or 0.0)
+            elif bucket == "yoy":
+                campaign_row["yoy_spend"] = float(campaign_row.get("yoy_spend", 0.0)) + float(spend or 0.0)
+                campaign_row["yoy_impressions"] = float(campaign_row.get("yoy_impressions", 0.0)) + float(impressions or 0.0)
+                campaign_row["yoy_clicks"] = float(campaign_row.get("yoy_clicks", 0.0)) + float(clicks or 0.0)
             elif bucket == "forward_31d":
                 campaign_row["forward_spend"] = float(campaign_row.get("forward_spend", 0.0)) + float(spend or 0.0)
 
@@ -1954,37 +2122,267 @@ class ContinuityClient:
         for row in channel_summary.values():
             prev_spend = float(row.get("previous_spend", 0.0))
             current_spend = float(row.get("current_spend", 0.0))
+            yoy_spend = float(row.get("yoy_spend", 0.0))
             prev_impr = float(row.get("previous_impressions", 0.0))
             current_impr = float(row.get("current_impressions", 0.0))
+            yoy_impr = float(row.get("yoy_impressions", 0.0))
             prev_clicks = float(row.get("previous_clicks", 0.0))
             current_clicks = float(row.get("current_clicks", 0.0))
+            yoy_clicks = float(row.get("yoy_clicks", 0.0))
+            yoy_hypothesis = self._trade_plan_yoy_hypothesis(
+                current_spend=current_spend,
+                yoy_spend=yoy_spend,
+                current_clicks=current_clicks,
+                yoy_clicks=yoy_clicks,
+                current_impressions=current_impr,
+                yoy_impressions=yoy_impr,
+            )
             channel_rows.append(
                 {
                     "channel": str(row.get("channel", "")),
                     "current_spend": current_spend,
                     "previous_spend": prev_spend,
+                    "yoy_spend": yoy_spend,
                     "delta_spend": current_spend - prev_spend,
                     "delta_spend_pct": ((current_spend - prev_spend) / prev_spend * 100.0) if prev_spend else None,
+                    "delta_spend_vs_yoy": current_spend - yoy_spend,
+                    "delta_spend_pct_vs_yoy": ((current_spend - yoy_spend) / yoy_spend * 100.0) if yoy_spend else None,
                     "current_impressions": current_impr,
                     "previous_impressions": prev_impr,
+                    "yoy_impressions": yoy_impr,
                     "delta_impressions": current_impr - prev_impr,
                     "delta_impressions_pct": ((current_impr - prev_impr) / prev_impr * 100.0) if prev_impr else None,
+                    "delta_impressions_vs_yoy": current_impr - yoy_impr,
+                    "delta_impressions_pct_vs_yoy": ((current_impr - yoy_impr) / yoy_impr * 100.0) if yoy_impr else None,
                     "current_clicks": current_clicks,
                     "previous_clicks": prev_clicks,
+                    "yoy_clicks": yoy_clicks,
                     "delta_clicks": current_clicks - prev_clicks,
                     "delta_clicks_pct": ((current_clicks - prev_clicks) / prev_clicks * 100.0) if prev_clicks else None,
+                    "delta_clicks_vs_yoy": current_clicks - yoy_clicks,
+                    "delta_clicks_pct_vs_yoy": ((current_clicks - yoy_clicks) / yoy_clicks * 100.0) if yoy_clicks else None,
+                    "yoy_hypothesis_impact": str(yoy_hypothesis.get("impact", "neutral")),
+                    "yoy_hypothesis_confidence": int(yoy_hypothesis.get("confidence", 50) or 50),
+                    "yoy_hypothesis_reason": str(yoy_hypothesis.get("reason", "")).strip(),
                 }
             )
         channel_rows.sort(key=lambda item: abs(float(item.get("delta_spend", 0.0))), reverse=True)
 
+        campaign_rows_full: list[dict[str, Any]] = []
+        for item in campaign_summary.values():
+            current_spend = float(item.get("current_spend", 0.0))
+            previous_spend = float(item.get("previous_spend", 0.0))
+            yoy_spend = float(item.get("yoy_spend", 0.0))
+            current_impressions = float(item.get("current_impressions", 0.0))
+            previous_impressions = float(item.get("previous_impressions", 0.0))
+            yoy_impressions = float(item.get("yoy_impressions", 0.0))
+            current_clicks = float(item.get("current_clicks", 0.0))
+            previous_clicks = float(item.get("previous_clicks", 0.0))
+            yoy_clicks = float(item.get("yoy_clicks", 0.0))
+            yoy_hypothesis = self._trade_plan_yoy_hypothesis(
+                current_spend=current_spend,
+                yoy_spend=yoy_spend,
+                current_clicks=current_clicks,
+                yoy_clicks=yoy_clicks,
+                current_impressions=current_impressions,
+                yoy_impressions=yoy_impressions,
+            )
+            campaign_rows_full.append(
+                {
+                    **item,
+                    "delta_spend": current_spend - previous_spend,
+                    "delta_spend_pct": ((current_spend - previous_spend) / previous_spend * 100.0) if previous_spend else None,
+                    "delta_spend_vs_yoy": current_spend - yoy_spend,
+                    "delta_spend_pct_vs_yoy": ((current_spend - yoy_spend) / yoy_spend * 100.0) if yoy_spend else None,
+                    "delta_impressions": current_impressions - previous_impressions,
+                    "delta_impressions_pct": ((current_impressions - previous_impressions) / previous_impressions * 100.0) if previous_impressions else None,
+                    "delta_impressions_vs_yoy": current_impressions - yoy_impressions,
+                    "delta_impressions_pct_vs_yoy": ((current_impressions - yoy_impressions) / yoy_impressions * 100.0) if yoy_impressions else None,
+                    "delta_clicks": current_clicks - previous_clicks,
+                    "delta_clicks_pct": ((current_clicks - previous_clicks) / previous_clicks * 100.0) if previous_clicks else None,
+                    "delta_clicks_vs_yoy": current_clicks - yoy_clicks,
+                    "delta_clicks_pct_vs_yoy": ((current_clicks - yoy_clicks) / yoy_clicks * 100.0) if yoy_clicks else None,
+                    "yoy_hypothesis_impact": str(yoy_hypothesis.get("impact", "neutral")),
+                    "yoy_hypothesis_confidence": int(yoy_hypothesis.get("confidence", 50) or 50),
+                    "yoy_hypothesis_reason": str(yoy_hypothesis.get("reason", "")).strip(),
+                }
+            )
+
         campaign_rows = sorted(
-            campaign_summary.values(),
+            campaign_rows_full,
             key=lambda item: (
                 float(item.get("current_spend", 0.0)),
                 float(item.get("current_impressions", 0.0)),
             ),
             reverse=True,
         )[: max(1, int(top_rows))]
+
+        yoy_sheet_meta: dict[str, str] = {}
+        if (
+            include_yoy_enrichment
+            and isinstance(yoy_window_start, date)
+            and isinstance(yoy_window_end, date)
+            and (yoy_sheet_reference.strip() or yoy_tab_name.strip())
+        ):
+            yoy_reference = yoy_sheet_reference.strip() or sheet_reference
+            candidate_tab = yoy_tab_name.strip()
+            if not candidate_tab and str(run_date.year) in tab_name:
+                candidate_tab = tab_name.replace(str(run_date.year), str(run_date.year - 1))
+            if not candidate_tab:
+                candidate_tab = tab_name
+            try:
+                yoy_ctx = self.collect_trade_plan_context(
+                    run_date=run_date,
+                    sheet_reference=yoy_reference,
+                    tab_name=candidate_tab,
+                    current_window_start=yoy_window_start,
+                    current_window_end=yoy_window_end,
+                    previous_window_start=yoy_window_start - timedelta(days=7),
+                    previous_window_end=yoy_window_start - timedelta(days=1),
+                    yoy_window_start=None,
+                    yoy_window_end=None,
+                    yoy_sheet_reference="",
+                    yoy_tab_name="",
+                    include_yoy_enrichment=False,
+                    top_rows=max(50, int(top_rows) * 8),
+                )
+                yoy_channel_rows_probe = yoy_ctx.get("channel_split", []) if isinstance(yoy_ctx, dict) else []
+                has_direct_yoy = False
+                if isinstance(yoy_channel_rows_probe, list):
+                    has_direct_yoy = any(
+                        isinstance(row, dict) and abs(float(row.get("current_spend", 0.0) or 0.0)) > 0.0
+                        for row in yoy_channel_rows_probe
+                    )
+                if not has_direct_yoy:
+                    yoy_ctx = self.collect_trade_plan_context(
+                        run_date=run_date,
+                        sheet_reference=yoy_reference,
+                        tab_name=candidate_tab,
+                        current_window_start=yoy_window_start - timedelta(days=14),
+                        current_window_end=yoy_window_end + timedelta(days=14),
+                        previous_window_start=yoy_window_start - timedelta(days=28),
+                        previous_window_end=yoy_window_start - timedelta(days=15),
+                        yoy_window_start=None,
+                        yoy_window_end=None,
+                        yoy_sheet_reference="",
+                        yoy_tab_name="",
+                        include_yoy_enrichment=False,
+                        top_rows=max(50, int(top_rows) * 8),
+                    )
+                yoy_sheet = yoy_ctx.get("sheet", {}) if isinstance(yoy_ctx, dict) else {}
+                if isinstance(yoy_sheet, dict):
+                    yoy_sheet_meta = {
+                        "id": str(yoy_sheet.get("id", "")).strip(),
+                        "name": str(yoy_sheet.get("name", "")).strip(),
+                        "url": str(yoy_sheet.get("url", "")).strip(),
+                        "tab": str(yoy_sheet.get("tab", "")).strip(),
+                    }
+                yoy_channel_rows = yoy_ctx.get("channel_split", []) if isinstance(yoy_ctx, dict) else []
+                channel_yoy_map: dict[str, dict[str, Any]] = {}
+                if isinstance(yoy_channel_rows, list):
+                    for row in yoy_channel_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        key = str(row.get("channel", "")).strip().lower()
+                        if key:
+                            channel_yoy_map[key] = row
+                if channel_yoy_map:
+                    for row in channel_rows:
+                        key = str(row.get("channel", "")).strip().lower()
+                        yoy_row = channel_yoy_map.get(key)
+                        if not yoy_row:
+                            continue
+                        row["yoy_spend"] = float(yoy_row.get("current_spend", 0.0) or 0.0)
+                        row["yoy_impressions"] = float(yoy_row.get("current_impressions", 0.0) or 0.0)
+                        row["yoy_clicks"] = float(yoy_row.get("current_clicks", 0.0) or 0.0)
+                        yoy_spend = float(row.get("yoy_spend", 0.0) or 0.0)
+                        yoy_impr = float(row.get("yoy_impressions", 0.0) or 0.0)
+                        yoy_clicks = float(row.get("yoy_clicks", 0.0) or 0.0)
+                        current_spend = float(row.get("current_spend", 0.0) or 0.0)
+                        current_impr = float(row.get("current_impressions", 0.0) or 0.0)
+                        current_clicks = float(row.get("current_clicks", 0.0) or 0.0)
+                        row["delta_spend_vs_yoy"] = current_spend - yoy_spend
+                        row["delta_spend_pct_vs_yoy"] = (
+                            ((current_spend - yoy_spend) / yoy_spend * 100.0) if yoy_spend else None
+                        )
+                        row["delta_impressions_vs_yoy"] = current_impr - yoy_impr
+                        row["delta_impressions_pct_vs_yoy"] = (
+                            ((current_impr - yoy_impr) / yoy_impr * 100.0) if yoy_impr else None
+                        )
+                        row["delta_clicks_vs_yoy"] = current_clicks - yoy_clicks
+                        row["delta_clicks_pct_vs_yoy"] = (
+                            ((current_clicks - yoy_clicks) / yoy_clicks * 100.0) if yoy_clicks else None
+                        )
+                        hypothesis = self._trade_plan_yoy_hypothesis(
+                            current_spend=current_spend,
+                            yoy_spend=yoy_spend,
+                            current_clicks=current_clicks,
+                            yoy_clicks=yoy_clicks,
+                            current_impressions=current_impr,
+                            yoy_impressions=yoy_impr,
+                        )
+                        row["yoy_hypothesis_impact"] = str(hypothesis.get("impact", "neutral"))
+                        row["yoy_hypothesis_confidence"] = int(hypothesis.get("confidence", 50) or 50)
+                        row["yoy_hypothesis_reason"] = str(hypothesis.get("reason", "")).strip()
+
+                yoy_campaign_rows = yoy_ctx.get("campaign_rows", []) if isinstance(yoy_ctx, dict) else []
+                campaign_yoy_map: dict[str, dict[str, Any]] = {}
+                if isinstance(yoy_campaign_rows, list):
+                    for row in yoy_campaign_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        key = (
+                            str(row.get("campaign", "")).strip().lower()
+                            + "::"
+                            + str(row.get("category", "")).strip().lower()
+                        )
+                        if key != "::":
+                            campaign_yoy_map[key] = row
+                if campaign_yoy_map:
+                    for row in campaign_rows:
+                        key = (
+                            str(row.get("campaign", "")).strip().lower()
+                            + "::"
+                            + str(row.get("category", "")).strip().lower()
+                        )
+                        yoy_row = campaign_yoy_map.get(key)
+                        if not yoy_row:
+                            continue
+                        row["yoy_spend"] = float(yoy_row.get("current_spend", 0.0) or 0.0)
+                        row["yoy_impressions"] = float(yoy_row.get("current_impressions", 0.0) or 0.0)
+                        row["yoy_clicks"] = float(yoy_row.get("current_clicks", 0.0) or 0.0)
+                        yoy_spend = float(row.get("yoy_spend", 0.0) or 0.0)
+                        yoy_impr = float(row.get("yoy_impressions", 0.0) or 0.0)
+                        yoy_clicks = float(row.get("yoy_clicks", 0.0) or 0.0)
+                        current_spend = float(row.get("current_spend", 0.0) or 0.0)
+                        current_impr = float(row.get("current_impressions", 0.0) or 0.0)
+                        current_clicks = float(row.get("current_clicks", 0.0) or 0.0)
+                        row["delta_spend_vs_yoy"] = current_spend - yoy_spend
+                        row["delta_spend_pct_vs_yoy"] = (
+                            ((current_spend - yoy_spend) / yoy_spend * 100.0) if yoy_spend else None
+                        )
+                        row["delta_impressions_vs_yoy"] = current_impr - yoy_impr
+                        row["delta_impressions_pct_vs_yoy"] = (
+                            ((current_impr - yoy_impr) / yoy_impr * 100.0) if yoy_impr else None
+                        )
+                        row["delta_clicks_vs_yoy"] = current_clicks - yoy_clicks
+                        row["delta_clicks_pct_vs_yoy"] = (
+                            ((current_clicks - yoy_clicks) / yoy_clicks * 100.0) if yoy_clicks else None
+                        )
+                        hypothesis = self._trade_plan_yoy_hypothesis(
+                            current_spend=current_spend,
+                            yoy_spend=yoy_spend,
+                            current_clicks=current_clicks,
+                            yoy_clicks=yoy_clicks,
+                            current_impressions=current_impr,
+                            yoy_impressions=yoy_impr,
+                        )
+                        row["yoy_hypothesis_impact"] = str(hypothesis.get("impact", "neutral"))
+                        row["yoy_hypothesis_confidence"] = int(hypothesis.get("confidence", 50) or 50)
+                        row["yoy_hypothesis_reason"] = str(hypothesis.get("reason", "")).strip()
+            except Exception:
+                # Keep base trade-plan output if YoY enrichment fails.
+                pass
 
         return {
             "enabled": bool(parsed_rows),
@@ -2004,7 +2402,12 @@ class ContinuityClient:
                     "start": previous_window_start.isoformat(),
                     "end": previous_window_end.isoformat(),
                 },
+                "yoy": {
+                    "start": yoy_window_start.isoformat() if isinstance(yoy_window_start, date) else "",
+                    "end": yoy_window_end.isoformat() if isinstance(yoy_window_end, date) else "",
+                },
             },
+            "yoy_sheet": yoy_sheet_meta,
             "top_rows": max(1, int(top_rows)),
             "channel_split": channel_rows[: max(1, int(top_rows))],
             "campaign_rows": campaign_rows,

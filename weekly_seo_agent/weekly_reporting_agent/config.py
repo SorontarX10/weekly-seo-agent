@@ -160,11 +160,20 @@ class AgentConfig:
     product_trends_horizon_days: int
     trade_plan_enabled: bool
     trade_plan_sheet_reference: str
+    trade_plan_yoy_sheet_reference: str
     trade_plan_tab_map: dict[str, str]
+    trade_plan_yoy_tab_map: dict[str, str]
     trade_plan_top_rows: int
     platform_pulse_enabled: bool
     platform_pulse_rss_urls: tuple[str, ...]
     platform_pulse_top_rows: int
+    governance_enabled: bool
+    governance_human_reviewer: str
+    eval_gate_enabled: bool
+    eval_gate_min_score: int
+    eval_gate_block_drive_upload: bool
+    telemetry_enabled: bool
+    security_source_allowlist_domains: tuple[str, ...]
 
     target_site_url: str
     target_domain: str
@@ -350,6 +359,13 @@ class AgentConfig:
             "https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=oj:JOL_2026_001_RSS,"
             "https://www.gov.pl/rss"
         )
+        default_source_allowlist = (
+            "google.com,googleapis.com,developers.google.com,searchengineland.com,searchenginejournal.com,"
+            "seroundtable.com,reuters.com,ec.europa.eu,eur-lex.europa.eu,worldbank.org,"
+            "trends.google.com,open-meteo.com,api.open-meteo.com,archive-api.open-meteo.com,"
+            "gdeltproject.org,openholidaysapi.org,nager.at,api.nbp.pl,danepubliczne.imgw.pl,"
+            "docs.google.com,drive.google.com,sheets.googleapis.com"
+        )
 
         default_query_excludes = (
             "allegro ma non troppo,allegro non troppo,allegro con brio,allegro moderato,"
@@ -436,13 +452,24 @@ class AgentConfig:
             product_trends_horizon_days=_env_int("PRODUCT_TRENDS_HORIZON_DAYS", 31),
             trade_plan_enabled=_env_bool("TRADE_PLAN_ENABLED", True),
             trade_plan_sheet_reference=_env("TRADE_PLAN_SHEET_REFERENCE"),
+            trade_plan_yoy_sheet_reference=_env("TRADE_PLAN_YOY_SHEET_REFERENCE"),
             trade_plan_tab_map=_env_map_str("TRADE_PLAN_TAB_MAP", default_trade_plan_tab_map),
+            trade_plan_yoy_tab_map=_env_map_str("TRADE_PLAN_YOY_TAB_MAP"),
             trade_plan_top_rows=_env_int("TRADE_PLAN_TOP_ROWS", 12),
             platform_pulse_enabled=_env_bool("PLATFORM_PULSE_ENABLED", True),
             platform_pulse_rss_urls=_env_csv(
                 "PLATFORM_PULSE_RSS_URLS", default_platform_pulse_rss
             ),
             platform_pulse_top_rows=_env_int("PLATFORM_PULSE_TOP_ROWS", 12),
+            governance_enabled=_env_bool("GOVERNANCE_ENABLED", True),
+            governance_human_reviewer=_env("GOVERNANCE_HUMAN_REVIEWER"),
+            eval_gate_enabled=_env_bool("EVAL_GATE_ENABLED", True),
+            eval_gate_min_score=_env_int("EVAL_GATE_MIN_SCORE", 75),
+            eval_gate_block_drive_upload=_env_bool("EVAL_GATE_BLOCK_DRIVE_UPLOAD", True),
+            telemetry_enabled=_env_bool("TELEMETRY_ENABLED", True),
+            security_source_allowlist_domains=_env_csv(
+                "SECURITY_SOURCE_ALLOWLIST_DOMAINS", default_source_allowlist
+            ),
             target_site_url=target_site_url,
             target_domain=target_domain,
             gsc_site_url=_env("GSC_SITE_URL", gsc_site_default),

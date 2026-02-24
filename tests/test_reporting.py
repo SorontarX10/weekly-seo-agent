@@ -302,7 +302,7 @@ def test_report_contains_reasoning_and_upcoming_trends(tmp_path):
     assert "`Data policy`: GA4 deltas are temporarily excluded from decision narrative" not in report
     assert "## What is happening and why" in report
     assert "Marketplace timeline (market events + promo calendar)" in report
-    assert "Unified marketplace timeline (market events + promo calendar)" in report
+    assert "Weekly market storyline on one timeline:" in report
     assert "Reasoning ledger (facts -> hypotheses -> validation)" in report
     assert "## Appendix" not in report
     assert "## Date windows" not in report
