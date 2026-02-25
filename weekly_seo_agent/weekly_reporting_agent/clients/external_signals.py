@@ -531,6 +531,25 @@ class ExternalSignalsClient:
             total_precip = sum(item[1] for item in window_days)
             return avg_temp, total_precip
 
+        def window_rows(window: DateWindow | None) -> list[dict[str, float | str]]:
+            if not isinstance(window, DateWindow):
+                return []
+            out: list[dict[str, float | str]] = []
+            for offset in range(window.days):
+                day = window.start + timedelta(days=offset)
+                values = stats.get(day)
+                if values is None:
+                    continue
+                temp_c, precip_mm = values
+                out.append(
+                    {
+                        "date": day.isoformat(),
+                        "temp_c": float(temp_c),
+                        "precip_mm": float(precip_mm),
+                    }
+                )
+            return out
+
         current_avg_temp, current_precip = summarize(current_window)
         previous_avg_temp, previous_precip = summarize(previous_window)
         yoy_avg_temp, yoy_precip = summarize(yoy_window) if isinstance(yoy_window, DateWindow) else (0.0, 0.0)
@@ -554,6 +573,9 @@ class ExternalSignalsClient:
             "precip_change_pct": precip_change_pct,
             "precip_yoy_mm": yoy_precip,
             "precip_change_pct_yoy": precip_change_pct_yoy,
+            "daily_current": window_rows(current_window),
+            "daily_previous": window_rows(previous_window),
+            "daily_yoy": window_rows(yoy_window) if isinstance(yoy_window, DateWindow) else [],
         }
 
     def _weather_forecast_summary(self, reference_day: date, days: int = 7) -> dict[str, float | str]:

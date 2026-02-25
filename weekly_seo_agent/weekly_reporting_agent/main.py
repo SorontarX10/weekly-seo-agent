@@ -14,7 +14,10 @@ from dotenv import find_dotenv, load_dotenv
 from weekly_seo_agent.weekly_reporting_agent.clients.google_drive_client import GoogleDriveClient
 from weekly_seo_agent.weekly_reporting_agent.config import AgentConfig
 from weekly_seo_agent.weekly_reporting_agent.evaluation import evaluate_report_text
-from weekly_seo_agent.weekly_reporting_agent.reporting import write_docx
+from weekly_seo_agent.weekly_reporting_agent.reporting import (
+    enforce_manager_quality_guardrail,
+    write_docx,
+)
 from weekly_seo_agent.weekly_reporting_agent.workflow import run_weekly_workflow
 
 
@@ -144,6 +147,7 @@ def _run_country_report(
 
     state = run_weekly_workflow(run_date, country_config)
     final_report = state.get("final_report") or state["markdown_report"]
+    final_report = enforce_manager_quality_guardrail(final_report, max_words=1380)
     quality = evaluate_report_text(final_report)
     report_stem = f"{run_date.strftime('%Y_%m_%d')}_{country_code.lower()}_seo_weekly_report"
     docx_path = output_dir / f"{report_stem}.docx"

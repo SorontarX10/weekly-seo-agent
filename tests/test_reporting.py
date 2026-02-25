@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from datetime import date
+import re
 
 from docx import Document
 
 from weekly_seo_agent.models import AnalysisResult, DateWindow, ExternalSignal, KeyDelta, MetricSummary
-from weekly_seo_agent.reporting import build_markdown_report, write_docx
+from weekly_seo_agent.reporting import (
+    build_markdown_report,
+    enforce_manager_quality_guardrail,
+    write_docx,
+)
 
 
 def _delta_row(key: str, current: float, previous: float, yoy: float) -> KeyDelta:
@@ -450,3 +455,147 @@ def test_report_hides_missing_ga4_metrics_and_shows_channel_split():
     assert "| Channel | Sessions current | Sessions YoY | Delta vs YoY | Delta % vs YoY |" not in report
     assert "Top channel growth YoY:" not in report
     assert "Paid Search (+150)" not in report
+
+
+def test_report_includes_daily_gsc_storyline_with_context_links():
+    run_date = date(2026, 2, 24)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=1_420_000, impressions=30_000_000, ctr=0.047, position=6.3),
+        "previous_28d": MetricSummary(clicks=1_390_000, impressions=29_500_000, ctr=0.047, position=6.2),
+        "yoy_52w": MetricSummary(clicks=1_590_000, impressions=31_500_000, ctr=0.050, position=4.9),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    external_signals = [
+        ExternalSignal(
+            source="Campaign tracker Allegro (news.google.com)",
+            day=date(2026, 2, 22),
+            title="Planned campaign: MegaRaty February",
+            details="Campaign timing can influence demand allocation.",
+            severity="medium",
+        ),
+        ExternalSignal(
+            source="Weekly SEO digest (seo)",
+            day=date(2026, 2, 21),
+            title="Google Search Ranking Volatility Beginning To Cool?",
+            details="Volatility context for this week.",
+            severity="info",
+        ),
+    ]
+    additional_context = {
+        "country_code": "PL",
+        "gsc_daily_rows": {
+            "enabled": True,
+            "days_total": 7,
+            "days_with_data": 7,
+            "days_with_previous_weekday_data": 7,
+            "weekly_clicks_sum": 1_420_000.0,
+            "rows": [
+                {
+                    "date": "2026-02-20",
+                    "clicks": 220000.0,
+                    "impressions": 4100000.0,
+                    "ctr": 0.0537,
+                    "position": 6.1,
+                    "previous_weekday_has_data": True,
+                    "delta_clicks_vs_previous_weekday": -26000.0,
+                    "delta_pct_vs_previous_weekday": -10.6,
+                    "yoy_day_has_data": True,
+                    "delta_pct_vs_yoy_day": -15.1,
+                },
+                {
+                    "date": "2026-02-22",
+                    "clicks": 245000.0,
+                    "impressions": 4350000.0,
+                    "ctr": 0.0563,
+                    "position": 6.0,
+                    "previous_weekday_has_data": True,
+                    "delta_clicks_vs_previous_weekday": 31000.0,
+                    "delta_pct_vs_previous_weekday": 14.5,
+                    "yoy_day_has_data": True,
+                    "delta_pct_vs_yoy_day": -9.2,
+                },
+            ],
+        },
+        "trade_plan": {
+            "enabled": True,
+            "campaign_rows": [
+                {
+                    "campaign": "MegaRaty February",
+                    "first_date": "2026-02-20",
+                    "last_date": "2026-02-24",
+                }
+            ],
+        },
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=external_signals,
+        weather_summary={
+            "daily_current": [
+                {"date": "2026-02-20", "temp_c": -1.0, "precip_mm": 4.5},
+                {"date": "2026-02-22", "temp_c": 2.0, "precip_mm": 1.0},
+            ],
+            "daily_previous": [
+                {"date": "2026-02-13", "temp_c": 2.5, "precip_mm": 0.5},
+                {"date": "2026-02-15", "temp_c": -1.5, "precip_mm": 7.0},
+            ],
+        },
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "Daily GSC pulse (day-by-day)" in report
+    assert "Daily trend view (GSC by day)" in report
+    assert "trade-plan campaign active: MegaRaty February" in report
+
+
+def test_quality_guardrail_enforces_markers_and_compacts_optional_lines():
+    long_optional = "\n".join(
+        [
+            "- Macro context: extended optional explanation line for manager readability control."
+            for _ in range(60)
+        ]
+    )
+    raw = (
+        "# Weekly SEO Intelligence Report (2026-02-25 | PL)\n\n"
+        "## Executive summary\n"
+        "- **What changed**: sample text.\n\n"
+        "## What is happening and why\n"
+        "- **WoW diagnosis**: sample.\n"
+        f"{long_optional}\n\n"
+        "## Hypothesis protocol\n"
+        "| Hypothesis | Confidence | What would disprove it | Validation metric | Check date |\n"
+        "|---|---|---|---|---|\n"
+        "| Sample | Medium | - | - | - |\n\n"
+        "## Governance and provenance\n"
+        "- Sample.\n\n"
+        "## Evidence ledger\n"
+        "| ID | Source | Date | Note |\n"
+        "|---|---|---|---|\n"
+        "| E1 | Test | 2026-02-25 | note |\n"
+    )
+
+    guarded = enforce_manager_quality_guardrail(raw, max_words=160)
+    lowered = guarded.lower()
+    assert "falsifier" in lowered
+    assert "validation metric" in lowered
+    assert "validation date" in lowered
+    assert len(re.findall(r"\b\w+\b", guarded, flags=re.UNICODE)) <= 160

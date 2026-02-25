@@ -143,6 +143,9 @@ def _deserialize_external_cache(payload: dict[str, object]) -> tuple[list[Extern
         for key, value in weather_payload.items():
             if isinstance(value, (int, float)):
                 weather_summary[str(key)] = float(value)
+            elif isinstance(value, (str, list, dict)):
+                # Keep richer weather payload fields (for example day-level rows) when present in cache.
+                weather_summary[str(key)] = value  # type: ignore[assignment]
     signals_payload = payload.get("signals", [])
     if isinstance(signals_payload, list):
         for row in signals_payload:
@@ -1134,6 +1137,10 @@ def _extract_key_data_packets(
                 additional_context.get("gsc_feature_split", {}) if isinstance(additional_context, dict) else {},
                 top_n=10,
             ),
+            "gsc_daily_rows": _compact_ctx_rows(
+                additional_context.get("gsc_daily_rows", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
+            ),
             "macro_backdrop": _compact_ctx_rows(
                 additional_context.get("macro_backdrop", {}) if isinstance(additional_context, dict) else {},
                 top_n=4,
@@ -1769,6 +1776,112 @@ def _summary_for_days(
     return MetricSummary.from_rows(rows)
 
 
+def _build_gsc_daily_rows_context(
+    *,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    yoy_window: DateWindow,
+    current_daily_map: dict[date, MetricRow],
+    previous_daily_map: dict[date, MetricRow],
+    yoy_daily_map: dict[date, MetricRow],
+) -> dict[str, object]:
+    rows: list[dict[str, object]] = []
+    total_days = max(0, int(current_window.days))
+    days_missing = 0
+
+    for offset in range(total_days):
+        day = current_window.start + timedelta(days=offset)
+        current_row = current_daily_map.get(day)
+        if current_row is None:
+            days_missing += 1
+            continue
+
+        clicks = float(current_row.clicks or 0.0)
+        impressions = float(current_row.impressions or 0.0)
+        if clicks <= 0.0 and impressions <= 0.0:
+            days_missing += 1
+            continue
+
+        previous_day = day - timedelta(days=7)
+        previous_row = previous_daily_map.get(previous_day)
+        previous_clicks = float(previous_row.clicks or 0.0) if previous_row else 0.0
+        previous_impressions = float(previous_row.impressions or 0.0) if previous_row else 0.0
+        previous_has_data = bool(
+            previous_row is not None
+            and (previous_clicks > 0.0 or previous_impressions > 0.0)
+        )
+
+        yoy_day = yoy_window.start + timedelta(days=offset)
+        yoy_row = yoy_daily_map.get(yoy_day)
+        yoy_clicks = float(yoy_row.clicks or 0.0) if yoy_row else 0.0
+        yoy_impressions = float(yoy_row.impressions or 0.0) if yoy_row else 0.0
+        yoy_has_data = bool(
+            yoy_row is not None
+            and (yoy_clicks > 0.0 or yoy_impressions > 0.0)
+        )
+
+        delta_prev = clicks - previous_clicks if previous_has_data else 0.0
+        delta_prev_pct = (
+            _pct_change(clicks, previous_clicks)
+            if previous_has_data and previous_clicks > 0.0
+            else 0.0
+        )
+        delta_yoy = clicks - yoy_clicks if yoy_has_data else 0.0
+        delta_yoy_pct = (
+            _pct_change(clicks, yoy_clicks)
+            if yoy_has_data and yoy_clicks > 0.0
+            else 0.0
+        )
+
+        rows.append(
+            {
+                "date": day.isoformat(),
+                "clicks": clicks,
+                "impressions": impressions,
+                "ctr": float(current_row.ctr or 0.0),
+                "position": float(current_row.position or 0.0),
+                "previous_weekday_date": previous_day.isoformat(),
+                "previous_weekday_has_data": previous_has_data,
+                "previous_weekday_clicks": previous_clicks if previous_has_data else 0.0,
+                "delta_clicks_vs_previous_weekday": delta_prev,
+                "delta_pct_vs_previous_weekday": delta_prev_pct,
+                "yoy_date": yoy_day.isoformat(),
+                "yoy_day_has_data": yoy_has_data,
+                "yoy_clicks": yoy_clicks if yoy_has_data else 0.0,
+                "delta_clicks_vs_yoy_day": delta_yoy,
+                "delta_pct_vs_yoy_day": delta_yoy_pct,
+            }
+        )
+
+    days_with_prev = sum(1 for row in rows if bool(row.get("previous_weekday_has_data")))
+    days_with_yoy = sum(1 for row in rows if bool(row.get("yoy_day_has_data")))
+    weekly_clicks = sum(float(row.get("clicks", 0.0) or 0.0) for row in rows)
+
+    return {
+        "enabled": bool(rows),
+        "source": "GSC API (date dimension; day-level diagnostics)",
+        "window_current": {
+            "start": current_window.start.isoformat(),
+            "end": current_window.end.isoformat(),
+        },
+        "window_previous": {
+            "start": previous_window.start.isoformat(),
+            "end": previous_window.end.isoformat(),
+        },
+        "window_yoy": {
+            "start": yoy_window.start.isoformat(),
+            "end": yoy_window.end.isoformat(),
+        },
+        "days_total": total_days,
+        "days_with_data": len(rows),
+        "days_missing": days_missing,
+        "days_with_previous_weekday_data": days_with_prev,
+        "days_with_yoy_day_data": days_with_yoy,
+        "weekly_clicks_sum": weekly_clicks,
+        "rows": rows,
+    }
+
+
 def _weekly_news_impact_tag(text: str) -> tuple[str, str]:
     blob = text.lower()
     if any(token in blob for token in ("core update", "algorithm", "ranking", "indexing", "discover", "search console")):
@@ -1965,6 +2078,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     )
 
     current_daily_map = _daily_metric_map(gsc, current_window)
+    previous_daily_map = _daily_metric_map(gsc, previous_window)
     yoy_daily_map = _daily_metric_map(gsc, yoy_window)
     current_days_with_data = {
         day
@@ -2500,6 +2614,14 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     )
     additional_context["source_freshness"] = source_freshness
     additional_context["gsc_data_coverage"] = gsc_data_coverage
+    additional_context["gsc_daily_rows"] = _build_gsc_daily_rows_context(
+        current_window=current_window,
+        previous_window=previous_window,
+        yoy_window=yoy_window,
+        current_daily_map=current_daily_map,
+        previous_daily_map=previous_daily_map,
+        yoy_daily_map=yoy_daily_map,
+    )
     additional_context.setdefault("source_stability", {})
     if isinstance(additional_context.get("source_stability"), dict):
         additional_context["source_stability"].update(

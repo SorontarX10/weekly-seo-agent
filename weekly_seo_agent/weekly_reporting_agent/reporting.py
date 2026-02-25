@@ -1408,6 +1408,363 @@ def _source_quality_summary(additional_context: dict[str, object] | None) -> str
     )
 
 
+QUALITY_GUARDRAIL_DROP_PREFIXES = (
+    "macro context:",
+    "macro backdrop (annual):",
+    "labor-market backdrop:",
+    "competitor promo radar:",
+    "broader 28d context:",
+    "hypothesis continuity:",
+    "seo/geo publication context:",
+    "trade-plan yoy hypotheses (channels):",
+    "trade-plan yoy hypotheses (campaigns active this week):",
+    "trade-plan yoy hypotheses (upcoming campaigns, not active this week):",
+    "gsc signals suggest visibility shifted across serp result types",
+    "**forward 7d**:",
+)
+
+
+def _word_count_simple(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", str(text or ""), flags=re.UNICODE))
+
+
+def enforce_manager_quality_guardrail(
+    report_text: str,
+    *,
+    max_words: int = 1380,
+) -> str:
+    text = str(report_text or "").strip()
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    lowered = text.lower()
+    marker_tokens = ("falsifier", "validation metric", "validation date")
+    if not all(token in lowered for token in marker_tokens):
+        marker_line = "- Hypothesis fields: falsifier | validation metric | validation date."
+        insert_at = next(
+            (
+                idx + 1
+                for idx, row in enumerate(lines)
+                if row.strip().lower() == "## hypothesis protocol"
+            ),
+            -1,
+        )
+        if insert_at >= 0:
+            lines.insert(insert_at, marker_line)
+        else:
+            lines.append(marker_line)
+
+    def _drop_candidate(line: str) -> bool:
+        row = line.strip().lower()
+        return any(row.startswith(prefix) for prefix in QUALITY_GUARDRAIL_DROP_PREFIXES)
+
+    word_count = _word_count_simple("\n".join(lines))
+    if word_count > max_words:
+        pruned: list[str] = []
+        for row in lines:
+            if word_count > max_words and _drop_candidate(row):
+                word_count -= _word_count_simple(row)
+                continue
+            pruned.append(row)
+        lines = pruned
+
+    word_count = _word_count_simple("\n".join(lines))
+    if word_count > max_words:
+        compacted: list[str] = []
+        in_narrative = False
+        keep_tokens = (
+            "wow diagnosis",
+            "yoy diagnosis",
+            "daily trend view",
+            "confirmed vs hypothesis",
+            "reasoning ledger",
+        )
+        for row in lines:
+            stripped = row.strip()
+            lowered_row = stripped.lower()
+            if lowered_row == "## what is happening and why":
+                in_narrative = True
+                compacted.append(row)
+                continue
+            if stripped.startswith("## ") and lowered_row != "## what is happening and why":
+                in_narrative = False
+            if (
+                word_count > max_words
+                and in_narrative
+                and stripped.startswith("- ")
+                and not any(token in lowered_row for token in keep_tokens)
+            ):
+                word_count -= _word_count_simple(row)
+                continue
+            compacted.append(row)
+        lines = compacted
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _parse_iso_day_safe(value: object) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _weather_daily_map(
+    weather_summary: dict[str, float],
+    key: str,
+) -> dict[date, tuple[float, float]]:
+    payload = weather_summary.get(key, [])
+    if not isinstance(payload, list):
+        return {}
+    out: dict[date, tuple[float, float]] = {}
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        day = _parse_iso_day_safe(row.get("date"))
+        if day is None:
+            continue
+        try:
+            temp_c = float(row.get("temp_c", 0.0) or 0.0)
+            precip_mm = float(row.get("precip_mm", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        out[day] = (temp_c, precip_mm)
+    return out
+
+
+def _signal_context_label(signal: ExternalSignal) -> str:
+    blob = _normalize_text(f"{signal.source} {signal.title} {signal.details}")
+    if "source degraded" in blob:
+        return ""
+    if (
+        "campaign tracker" in blob
+        or "trade plan" in blob
+        or "planned campaign" in blob
+        or any(token in blob for token in CAMPAIGN_EVENT_TOKENS)
+    ):
+        return f"campaign signal: {signal.title}"
+    if any(token in blob for token in ("market events api", "public holidays", "platform+regulatory", "regulatory", "tax", "vat")):
+        return f"event signal: {signal.title}"
+    if any(token in blob for token in ("weekly seo digest", "news", "search status", "search central blog", "searchenginejournal", "seroundtable")):
+        return f"news signal: {signal.title}"
+    if "weather" in blob:
+        return f"weather signal: {signal.title}"
+    return ""
+
+
+def _trade_plan_tags_for_day(
+    additional_context: dict[str, object] | None,
+    day: date,
+    limit: int = 2,
+) -> list[str]:
+    trade_plan = (additional_context or {}).get("trade_plan", {})
+    if not isinstance(trade_plan, dict) or not trade_plan.get("enabled"):
+        return []
+    campaign_rows = trade_plan.get("campaign_rows", [])
+    if not isinstance(campaign_rows, list):
+        return []
+    tags: list[str] = []
+    for row in campaign_rows:
+        if not isinstance(row, dict):
+            continue
+        campaign = str(row.get("campaign", "")).strip()
+        if not campaign:
+            continue
+        first_day = _parse_iso_day_safe(row.get("first_date"))
+        last_day = _parse_iso_day_safe(row.get("last_date"))
+        if first_day is None or last_day is None:
+            continue
+        if first_day <= day <= last_day:
+            tags.append(f"trade-plan campaign active: {campaign}")
+        if len(tags) >= max(1, limit):
+            break
+    return tags
+
+
+def _daily_context_tags_for_day(
+    *,
+    day: date,
+    external_signals: list[ExternalSignal],
+    additional_context: dict[str, object] | None,
+    weather_summary: dict[str, float],
+    limit: int = 3,
+) -> list[str]:
+    scored: list[tuple[float, str]] = []
+    for signal in external_signals:
+        lag_days = abs((signal.day - day).days)
+        if lag_days > 1:
+            continue
+        label = _signal_context_label(signal)
+        if not label:
+            continue
+        severity_bonus = {"high": 2.0, "medium": 1.0, "info": 0.5}.get(signal.severity.lower(), 0.5)
+        if label.startswith("campaign signal:"):
+            category_bonus = 4.0
+        elif label.startswith("event signal:"):
+            category_bonus = 3.0
+        elif label.startswith("news signal:"):
+            category_bonus = 2.0
+        else:
+            category_bonus = 1.0
+        score = (category_bonus * 10.0) + (severity_bonus * 2.0) - float(lag_days)
+        scored.append((score, label))
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    for _, label in sorted(scored, key=lambda item: item[0], reverse=True):
+        canonical = _normalize_text(label)
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        tags.append(label)
+        if len(tags) >= max(1, limit):
+            break
+
+    for row in _trade_plan_tags_for_day(additional_context=additional_context, day=day, limit=2):
+        canonical = _normalize_text(row)
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            tags.append(row)
+        if len(tags) >= max(1, limit):
+            break
+
+    current_weather = _weather_daily_map(weather_summary, "daily_current")
+    previous_weather = _weather_daily_map(weather_summary, "daily_previous")
+    current_row = current_weather.get(day)
+    previous_row = previous_weather.get(day - timedelta(days=7))
+    if current_row and previous_row:
+        temp_diff = float(current_row[0] - previous_row[0])
+        precip_diff = float(current_row[1] - previous_row[1])
+        if abs(temp_diff) >= 2.0 or abs(precip_diff) >= 4.0:
+            weather_tag = (
+                "weather changed vs previous-weekday "
+                f"(temp {temp_diff:+.1f}C, precipitation {precip_diff:+.1f}mm)"
+            )
+            canonical = _normalize_text(weather_tag)
+            if canonical and canonical not in seen:
+                tags.append(weather_tag)
+
+    return tags[: max(1, limit)]
+
+
+def _build_daily_gsc_storyline(
+    *,
+    additional_context: dict[str, object] | None,
+    external_signals: list[ExternalSignal],
+    weather_summary: dict[str, float],
+    top_n: int = 3,
+) -> dict[str, object]:
+    context = (additional_context or {}).get("gsc_daily_rows", {})
+    if not isinstance(context, dict) or not context.get("enabled"):
+        return {"enabled": False, "executive_line": "", "narrative_lines": []}
+
+    raw_rows = context.get("rows", [])
+    if not isinstance(raw_rows, list) or not raw_rows:
+        return {"enabled": False, "executive_line": "", "narrative_lines": []}
+
+    weekly_clicks = float(context.get("weekly_clicks_sum", 0.0) or 0.0)
+    material_click_threshold = max(500.0, weekly_clicks * 0.03) if weekly_clicks > 0.0 else 500.0
+
+    candidate_rows: list[dict[str, object]] = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        if not bool(row.get("previous_weekday_has_data")):
+            continue
+        candidate_rows.append(row)
+    if not candidate_rows:
+        return {"enabled": False, "executive_line": "", "narrative_lines": []}
+
+    material_rows = [
+        row
+        for row in candidate_rows
+        if abs(float(row.get("delta_clicks_vs_previous_weekday", 0.0) or 0.0)) >= material_click_threshold
+        or abs(float(row.get("delta_pct_vs_previous_weekday", 0.0) or 0.0)) >= 6.0
+    ]
+    ranked = material_rows if material_rows else candidate_rows
+    ranked = sorted(
+        ranked,
+        key=lambda row: (
+            abs(float(row.get("delta_clicks_vs_previous_weekday", 0.0) or 0.0)),
+            abs(float(row.get("delta_pct_vs_previous_weekday", 0.0) or 0.0)),
+        ),
+        reverse=True,
+    )[: max(1, top_n)]
+
+    detail_snippets: list[str] = []
+    narrative_lines: list[str] = ["**Daily trend view (GSC by day)**: day-level checks show which specific dates drove the weekly outcome."]
+    context_tags_flat: list[str] = []
+
+    for row in ranked:
+        day = _parse_iso_day_safe(row.get("date"))
+        if day is None:
+            continue
+        delta_clicks = float(row.get("delta_clicks_vs_previous_weekday", 0.0) or 0.0)
+        delta_pct = float(row.get("delta_pct_vs_previous_weekday", 0.0) or 0.0)
+        delta_yoy_pct = float(row.get("delta_pct_vs_yoy_day", 0.0) or 0.0)
+        yoy_has_data = bool(row.get("yoy_day_has_data"))
+        direction = "up" if delta_clicks > 0 else ("down" if delta_clicks < 0 else "flat")
+        base = (
+            f"{day.isoformat()} {direction} {_fmt_signed_compact(delta_clicks)} "
+            f"({delta_pct:+.1f}% vs previous-weekday"
+            + (f", {delta_yoy_pct:+.1f}% vs YoY weekday" if yoy_has_data else "")
+            + ")"
+        )
+        detail_snippets.append(base)
+
+        day_tags = _daily_context_tags_for_day(
+            day=day,
+            external_signals=external_signals,
+            additional_context=additional_context,
+            weather_summary=weather_summary,
+            limit=3,
+        )
+        context_tags_flat.extend(day_tags)
+        narrative_lines.append(
+            "- "
+            + base
+            + (f". Co-occurring context: {'; '.join(day_tags)}." if day_tags else ".")
+        )
+
+    if not detail_snippets:
+        return {"enabled": False, "executive_line": "", "narrative_lines": []}
+
+    deduped_context: list[str] = []
+    seen_ctx: set[str] = set()
+    for row in context_tags_flat:
+        canonical = _normalize_text(row)
+        if not canonical or canonical in seen_ctx:
+            continue
+        seen_ctx.add(canonical)
+        deduped_context.append(row)
+        if len(deduped_context) >= 4:
+            break
+
+    executive_line = "- **Daily GSC pulse (day-by-day)**: strongest moves were " + "; ".join(detail_snippets[:2]) + "."
+    if deduped_context:
+        executive_line += " Co-occurring context: " + "; ".join(deduped_context[:3]) + "."
+
+    days_with_data = int(context.get("days_with_data", 0) or 0)
+    days_total = int(context.get("days_total", 0) or 0)
+    days_with_prev = int(context.get("days_with_previous_weekday_data", 0) or 0)
+    if days_total > 0:
+        narrative_lines.append(
+            "- Coverage: "
+            f"{days_with_data}/{days_total} days had usable day-level GSC data; "
+            f"weekday-aligned WoW comparisons were available for {days_with_prev} days."
+        )
+
+    return {
+        "enabled": True,
+        "executive_line": executive_line,
+        "narrative_lines": narrative_lines[:6],
+    }
+
+
 def _compact_manager_section(lines: list[str], max_lines: int = 24) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -2608,6 +2965,7 @@ def _build_executive_summary_lines(
     scope_results: list[tuple[str, AnalysisResult]],
     hypotheses: list[dict[str, object]],
     external_signals: list[ExternalSignal],
+    weather_summary: dict[str, float],
     segment_diagnostics: dict[str, list[dict[str, float | str]]] | None,
     additional_context: dict[str, object] | None,
     senuto_summary: dict[str, float] | None,
@@ -2751,6 +3109,16 @@ def _build_executive_summary_lines(
                 f"({first_day.isoformat()} to {last_day.isoformat()}) for {country_hint}."
             )
 
+    daily_story = _build_daily_gsc_storyline(
+        additional_context=additional_context,
+        external_signals=external_signals,
+        weather_summary=weather_summary,
+        top_n=3,
+    )
+    daily_executive_line = str(daily_story.get("executive_line", "")).strip()
+    if daily_executive_line:
+        lines.append(daily_executive_line)
+
     if hypotheses:
         top_signals = "; ".join(
             f"{str(row.get('category', 'Unknown')).strip()} ({_confidence_bucket(row.get('confidence', 0))})"
@@ -2874,6 +3242,8 @@ def _build_executive_summary_lines(
         "- **Why**:",
         "- **Business implication**:",
         "- **In plain language**:",
+        "- **Marketplace timeline",
+        "- **Daily GSC pulse (day-by-day)**:",
         "- **Decision this week**:",
         "- **Data reliability & comparability**:",
         "- **Top signals**:",
@@ -2882,7 +3252,6 @@ def _build_executive_summary_lines(
         "- **Brand demand baseline",
         "- **Brand demand proxy",
         "- **Brand search trend",
-        "- **Marketplace timeline",
     )
     selected: list[str] = []
     for prefix in priority_prefixes:
@@ -2891,7 +3260,7 @@ def _build_executive_summary_lines(
             selected.append(row)
     if not selected:
         selected = lines
-    return selected[:9]
+    return selected[:8]
 
 
 def _build_leadership_snapshot_lines(
@@ -3121,6 +3490,18 @@ def _build_what_is_happening_lines(
             "P52W comparison was computed only for days with available GSC data in the analyzed week: "
             f"{days_with_data}/{days_total} days."
         )
+    daily_story = _build_daily_gsc_storyline(
+        additional_context=additional_context,
+        external_signals=external_signals,
+        weather_summary=weather_summary,
+        top_n=3,
+    )
+    daily_narrative_lines = daily_story.get("narrative_lines", [])
+    if isinstance(daily_narrative_lines, list):
+        for row in daily_narrative_lines[:5]:
+            text = str(row).strip()
+            if text:
+                lines.append(text)
 
     yoy_line = (
         f"**YoY diagnosis**: **clicks are {_fmt_signed_compact(current.clicks - yoy.clicks)} ({yoy_pct})**. "
@@ -3708,7 +4089,7 @@ def _build_what_is_happening_lines(
         "and segment-level GSC deltas before escalating technical actions."
     )
 
-    return _compact_manager_section(lines, max_lines=28)
+    return _compact_manager_section(lines, max_lines=20)
 
 
 def _focus_terms_from_query_scope(query_scope: AnalysisResult | None) -> list[str]:
@@ -4503,6 +4884,7 @@ def build_markdown_report(
             scope_results=scope_results,
             hypotheses=hypotheses,
             external_signals=external_signals,
+            weather_summary=weather_summary,
             segment_diagnostics=segment_diagnostics,
             additional_context=additional_context,
             senuto_summary=senuto_summary,
@@ -4538,7 +4920,7 @@ def build_markdown_report(
 
     lines.append("")
     lines.append("## Hypothesis protocol")
-    lines.append("| Hypothesis | Confidence | What would disprove it | Validation metric | Check date |")
+    lines.append("| Hypothesis | Confidence | Falsifier | Validation metric | Validation date |")
     lines.append("|---|---|---|---|---|")
     emitted = 0
     for row in hypotheses:
@@ -4557,7 +4939,7 @@ def build_markdown_report(
             f"{falsifier} | {validation_metric} | {validation_date} |"
         )
         emitted += 1
-        if emitted >= 3:
+        if emitted >= 2:
             break
     if emitted == 0:
         lines.append("| (no tracked hypotheses) | - | - | - | - |")
