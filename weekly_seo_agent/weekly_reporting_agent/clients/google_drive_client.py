@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 import webbrowser
 
 from google.auth.transport.requests import Request
@@ -180,36 +181,53 @@ class GoogleDriveClient:
             "parents": [folder_id],
         }
 
-        try:
-            created = (
-                service.files()
-                .create(
-                    body=body,
-                    media_body=media,
-                    fields="id,name,webViewLink,mimeType,parents",
-                )
-                .execute()
-            )
-        except HttpError as exc:
-            payload = str(exc)
-            if getattr(exc, "content", None):
-                try:
-                    payload = f"{payload} {exc.content.decode('utf-8', errors='ignore')}"
-                except Exception:
-                    pass
-            if exc.resp.status == 403 and "storageQuotaExceeded" in payload:
-                hint = (
-                    "Google Drive quota exceeded for the authenticated account. "
-                )
-                if self._auth_mode == "service_account":
-                    hint += (
-                        "Current credentials are service-account based. "
-                        "Use OAuth client credentials for a user Drive or point "
-                        "GOOGLE_DRIVE_FOLDER_ID to a Shared Drive folder where this "
-                        "service account has write access."
+        created: dict | None = None
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                created = (
+                    service.files()
+                    .create(
+                        body=body,
+                        media_body=media,
+                        fields="id,name,webViewLink,mimeType,parents",
                     )
-                raise RuntimeError(hint) from exc
-            raise
+                    .execute()
+                )
+                break
+            except HttpError as exc:
+                payload = str(exc)
+                if getattr(exc, "content", None):
+                    try:
+                        payload = f"{payload} {exc.content.decode('utf-8', errors='ignore')}"
+                    except Exception:
+                        pass
+                if exc.resp.status == 403 and "storageQuotaExceeded" in payload:
+                    hint = (
+                        "Google Drive quota exceeded for the authenticated account. "
+                    )
+                    if self._auth_mode == "service_account":
+                        hint += (
+                            "Current credentials are service-account based. "
+                            "Use OAuth client credentials for a user Drive or point "
+                            "GOOGLE_DRIVE_FOLDER_ID to a Shared Drive folder where this "
+                            "service account has write access."
+                        )
+                    raise RuntimeError(hint) from exc
+                retryable = exc.resp.status in {429, 500, 502, 503, 504}
+                if retryable and attempt < 3:
+                    time.sleep(float(attempt) * 1.5)
+                    continue
+                last_error = exc
+                break
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                last_error = exc
+                break
+
+        if created is None:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Failed to upload/convert DOCX to Google Docs.")
 
         if not created.get("id"):
             raise RuntimeError("Failed to upload/convert DOCX to Google Docs.")

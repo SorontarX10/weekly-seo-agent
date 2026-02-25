@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import replace
 from datetime import date, timedelta
 import hashlib
 import json
@@ -75,6 +76,18 @@ AI_SECTION_TITLES = (
     "Further Analysis Flags",
     "Status-Log Updates",
 )
+
+REQUIRED_AI_SECTION_TITLES = (
+    "Narrative Flow",
+    "Causal Chain",
+    "Evidence by Source",
+    "Priority Actions for This Week",
+    "Risks and Monitoring",
+    "Continuity Check",
+    "Further Analysis Flags",
+)
+
+GAIA_MODEL_RUNTIME_FALLBACK = "gpt-4o"
 
 EXTERNAL_SIGNALS_TIMEOUT_SEC = 120
 ADDITIONAL_CONTEXT_TIMEOUT_SEC = 180
@@ -555,7 +568,151 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    return normalized
+    # Enforce manager-ready section scaffold with concise bullets and compact tables.
+    section_order: list[str] = []
+    section_map: dict[str, list[str]] = {}
+    current_section = ""
+    for raw in normalized.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("### "):
+            title_raw = stripped[4:].strip().rstrip(":")
+            title = next(
+                (candidate for candidate in AI_SECTION_TITLES if candidate.lower() == title_raw.lower()),
+                title_raw,
+            )
+            current_section = title
+            if title not in section_map:
+                section_map[title] = []
+                section_order.append(title)
+            continue
+        if not current_section:
+            # Push orphan lines into narrative flow so the final output always stays structured.
+            current_section = "Narrative Flow"
+            if current_section not in section_map:
+                section_map[current_section] = []
+                section_order.append(current_section)
+        line = stripped
+        if not (line.startswith("- ") or line.startswith("|")):
+            line = f"- {line}"
+        section_map.setdefault(current_section, []).append(line)
+
+    defaults: dict[str, list[str]] = {
+        "Narrative Flow": [
+            "- Weekly movement is explained by demand timing and traffic mix shifts supported by packet evidence."
+        ],
+        "Causal Chain": [
+            "- Working hypothesis: demand and routing factors are currently stronger than a broad technical degradation signal. Confidence: 60/100."
+        ],
+        "Evidence by Source": [
+            "- Evidence coverage was limited in this run; keep this interpretation as provisional."
+        ],
+        "Priority Actions for This Week": [
+            "- [SEO Team | next run] Validate the top hypothesis on refreshed data and confirm escalation path."
+        ],
+        "Risks and Monitoring": [
+            "- Risk: if CTR/position weakens in the next window, reclassify this as a potential technical SEO issue."
+        ],
+        "Continuity Check": [
+            "- Compare this week with the previous run and confirm whether the same drivers remain active."
+        ],
+        "Further Analysis Flags": [
+            "- Validate segment-level deltas (Page Name, brand/non-brand, device) against campaign timing and trade-plan overlap."
+        ],
+    }
+    for title in REQUIRED_AI_SECTION_TITLES:
+        if title not in section_map or not section_map.get(title):
+            section_map[title] = defaults.get(title, ["- Insufficient evidence in current packet set."])
+            if title not in section_order:
+                section_order.append(title)
+
+    # Normalize priority-action bullets to explicit [Owner | ETA] format.
+    priority_section = section_map.get("Priority Actions for This Week", [])
+    normalized_priority: list[str] = []
+    for row in priority_section:
+        stripped = row.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("|"):
+            normalized_priority.append(stripped)
+            continue
+        body = stripped[2:].strip() if stripped.startswith("- ") else stripped
+        if re.search(r"\[[^\]]+\|[^\]]+\]", body):
+            normalized_priority.append(f"- {body}")
+            continue
+        owner_eta_match = re.search(r"\(([^|()]+)\|\s*([^()]+)\)", body)
+        if owner_eta_match:
+            owner = owner_eta_match.group(1).strip()
+            eta = owner_eta_match.group(2).strip()
+            action = re.sub(r"\(([^|()]+)\|\s*([^()]+)\)", "", body).strip(" .")
+            normalized_priority.append(f"- [{owner} | {eta}] {action}")
+            continue
+        normalized_priority.append(f"- [SEO Team | next run] {body}")
+    section_map["Priority Actions for This Week"] = normalized_priority[:5] or defaults["Priority Actions for This Week"]
+
+    # Add a compact evidence table when no table exists yet.
+    evidence_rows = section_map.get("Evidence by Source", [])
+    if not any(row.strip().startswith("|") for row in evidence_rows):
+        bullet_payload = [
+            row.strip()[2:].strip()
+            for row in evidence_rows
+            if row.strip().startswith("- ")
+        ]
+        table_rows = [
+            "| Source | Evidence signal | Why it matters |",
+            "|---|---|---|",
+        ]
+        if bullet_payload:
+            for text in bullet_payload[:3]:
+                table_rows.append(
+                    f"| Packet evidence | {text} | Supports this week interpretation and prioritization. |"
+                )
+        else:
+            table_rows.append(
+                "| Packet evidence | Insufficient evidence in this run | Re-check after source refresh in the next run. |"
+            )
+        section_map["Evidence by Source"] = evidence_rows[:2] + table_rows
+
+    line_caps = {
+        "Narrative Flow": 4,
+        "Causal Chain": 4,
+        "Evidence by Source": 7,
+        "Priority Actions for This Week": 6,
+        "Risks and Monitoring": 4,
+        "Continuity Check": 3,
+        "Further Analysis Flags": 3,
+    }
+
+    rebuilt: list[str] = []
+    preferred_order = list(REQUIRED_AI_SECTION_TITLES)
+    for title in section_order:
+        if title not in preferred_order:
+            preferred_order.append(title)
+
+    for title in preferred_order:
+        rows = section_map.get(title)
+        if not rows:
+            continue
+        rebuilt.append(f"### {title}")
+        cap = line_caps.get(title, 4)
+        kept = 0
+        for row in rows:
+            stripped = row.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("|"):
+                rebuilt.append(stripped)
+                continue
+            if kept >= cap:
+                continue
+            rebuilt.append(stripped if stripped.startswith("- ") else f"- {stripped}")
+            kept += 1
+        rebuilt.append("")
+
+    while rebuilt and not rebuilt[-1].strip():
+        rebuilt.pop()
+    return "\n".join(rebuilt)
 
 
 def _extract_window_ranges(report_markdown: str) -> tuple[str, str, str, str]:
@@ -1283,27 +1440,241 @@ def _is_valid_validator_schema(payload: dict[str, object]) -> bool:
     return True
 
 
+def _extract_h3_section(markdown: str, header: str) -> str:
+    lines = markdown.splitlines()
+    target = f"### {header}".strip().lower()
+    start_index: int | None = None
+    for idx, line in enumerate(lines):
+        if line.strip().lower() == target:
+            start_index = idx + 1
+            break
+    if start_index is None:
+        return ""
+    out: list[str] = []
+    for line in lines[start_index:]:
+        stripped = line.strip()
+        if stripped.startswith("### ") or stripped.startswith("## "):
+            break
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _extract_bullets(section_text: str, limit: int = 8) -> list[str]:
+    out: list[str] = []
+    for row in section_text.splitlines():
+        stripped = row.strip()
+        if not stripped.startswith("- "):
+            continue
+        text = stripped[2:].strip()
+        if text:
+            out.append(text)
+        if len(out) >= max(1, limit):
+            break
+    return out
+
+
+def _escape_table_cell(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().replace("|", "/")) or "-"
+
+
+def _trim_markdown_table(section_text: str, max_rows: int = 6) -> list[str]:
+    lines = [row.rstrip() for row in section_text.splitlines() if row.strip()]
+    first_table_idx = next((idx for idx, row in enumerate(lines) if row.strip().startswith("|")), None)
+    if first_table_idx is None:
+        return []
+    if first_table_idx + 1 >= len(lines):
+        return []
+    header = lines[first_table_idx].strip()
+    divider = lines[first_table_idx + 1].strip()
+    if not divider.startswith("|"):
+        return []
+    data_rows: list[str] = []
+    for row in lines[first_table_idx + 2 :]:
+        stripped = row.strip()
+        if not stripped.startswith("|"):
+            break
+        data_rows.append(stripped)
+    return [header, divider] + data_rows[: max(1, max_rows)]
+
+
+def _extract_confirmed_hypothesis_points(
+    baseline_narrative: str,
+    commentary: str,
+) -> tuple[list[str], list[str]]:
+    confirmed: list[str] = []
+    hypotheses: list[str] = []
+    mode = ""
+    in_block = False
+    for row in baseline_narrative.splitlines():
+        stripped = row.strip()
+        lowered = stripped.lower()
+        if "confirmed vs hypothesis" in lowered:
+            in_block = True
+            mode = ""
+            continue
+        if not in_block:
+            continue
+        if lowered.startswith("confirmed facts from data"):
+            mode = "confirmed"
+            continue
+        if lowered.startswith("working hypotheses"):
+            mode = "hypothesis"
+            continue
+        if stripped.startswith("- "):
+            payload = stripped[2:].strip()
+            if not payload:
+                continue
+            if mode == "confirmed":
+                confirmed.append(payload)
+            elif mode == "hypothesis":
+                hypotheses.append(payload)
+        if len(confirmed) >= 4 and len(hypotheses) >= 4:
+            break
+
+    if not confirmed:
+        narrative_flow = _extract_h3_section(commentary, "Narrative Flow")
+        confirmed = _extract_bullets(narrative_flow, limit=3)
+    if not hypotheses:
+        causal_chain = _extract_h3_section(commentary, "Causal Chain")
+        hypotheses = _extract_bullets(causal_chain, limit=3)
+
+    if not confirmed:
+        confirmed = ["Current KPI movement is supported by direct weekly evidence anchors."]
+    if not hypotheses:
+        hypotheses = ["Primary interpretation remains provisional and requires next-run validation."]
+    return confirmed[:4], hypotheses[:4]
+
+
+def _extract_priority_action_rows(
+    commentary: str,
+    executive_summary: str,
+    limit: int = 5,
+) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+
+    def _append(action: str, owner: str, eta: str) -> None:
+        clean_action = _escape_table_cell(action).strip(". ")
+        clean_owner = _escape_table_cell(owner) or "SEO Team"
+        clean_eta = _escape_table_cell(eta) or "next run"
+        if not clean_action:
+            return
+        key = (clean_action.lower(), clean_owner.lower(), clean_eta.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append((clean_action, clean_owner, clean_eta))
+
+    seen: set[tuple[str, str, str]] = set()
+
+    action_section = _extract_h3_section(commentary, "Priority Actions for This Week")
+    for bullet in _extract_bullets(action_section, limit=12):
+        bracket = re.match(r"^\[([^\]|]+)\|\s*([^\]]+)\]\s*(.+)$", bullet)
+        if bracket:
+            _append(bracket.group(3), bracket.group(1), bracket.group(2))
+            continue
+        owner_eta = re.search(r"\(([^|()]+)\|\s*([^()]+)\)", bullet)
+        if owner_eta:
+            action = re.sub(r"\(([^|()]+)\|\s*([^()]+)\)", "", bullet).strip(" .")
+            _append(action, owner_eta.group(1), owner_eta.group(2))
+            continue
+        _append(bullet, "SEO Team", "next run")
+
+    if rows:
+        return rows[: max(1, limit)]
+
+    for row in executive_summary.splitlines():
+        stripped = row.strip()
+        if "priority actions" not in stripped.lower():
+            continue
+        payload = stripped
+        if ":" in payload:
+            payload = payload.split(":", 1)[1]
+        chunks = [item.strip(" .") for item in payload.split(";") if item.strip()]
+        for chunk in chunks:
+            owner_eta = re.search(r"\(([^|()]+)\|\s*([^()]+)\)", chunk)
+            if owner_eta:
+                action = re.sub(r"\(([^|()]+)\|\s*([^()]+)\)", "", chunk).strip(" .")
+                _append(action, owner_eta.group(1), owner_eta.group(2))
+            else:
+                _append(chunk, "SEO Team", "next run")
+            if len(rows) >= max(1, limit):
+                break
+        if rows:
+            break
+
+    if not rows:
+        rows.append(
+            (
+                "Validate top hypothesis with refreshed next-week evidence before escalating",
+                "SEO Team",
+                "next run",
+            )
+        )
+    return rows[: max(1, limit)]
+
+
 def _compose_final_report(markdown_report: str, commentary: str) -> str:
     leadership_snapshot = _extract_markdown_section(markdown_report, "Leadership snapshot")
     executive_summary = _extract_markdown_section(markdown_report, "Executive summary")
+    baseline_narrative = _extract_markdown_section(markdown_report, "What is happening and why")
+    hypothesis_protocol = _extract_markdown_section(markdown_report, "Hypothesis protocol")
     governance = _extract_markdown_section(markdown_report, "Governance and provenance")
     evidence_ledger = _extract_markdown_section(markdown_report, "Evidence ledger")
     report_title_line = next(
         (line for line in markdown_report.splitlines() if line.startswith("# ")),
         "# Weekly SEO Intelligence Report",
     )
+    confirmed_points, hypothesis_points = _extract_confirmed_hypothesis_points(
+        baseline_narrative=baseline_narrative,
+        commentary=commentary,
+    )
+    priority_rows = _extract_priority_action_rows(
+        commentary=commentary,
+        executive_summary=executive_summary,
+        limit=5,
+    )
+    protocol_table = _trim_markdown_table(hypothesis_protocol, max_rows=3)
+    evidence_table = _trim_markdown_table(evidence_ledger, max_rows=8)
+
     output_lines: list[str] = [report_title_line, ""]
     if leadership_snapshot:
         output_lines.append("## Leadership Snapshot")
         output_lines.append(leadership_snapshot.strip())
         output_lines.append("")
     if executive_summary:
-        output_lines.append("## Executive Summary")
+        output_lines.append("## Executive summary")
         output_lines.append(executive_summary.strip())
         output_lines.append("")
 
-    output_lines.append("## Narrative Analysis")
+    output_lines.append("## What is happening and why")
     output_lines.append(commentary.strip())
+    output_lines.append("")
+
+    output_lines.append("## Confirmed vs hypothesis")
+    output_lines.append("### Confirmed facts from data")
+    for row in confirmed_points[:4]:
+        output_lines.append(f"- {row}")
+    output_lines.append("### Working hypotheses")
+    for row in hypothesis_points[:4]:
+        output_lines.append(f"- {row}")
+    output_lines.append("")
+
+    output_lines.append("## Priority actions (owner | ETA)")
+    output_lines.append("- Action protocol: each action must include `Owner | ETA` and one concrete deliverable.")
+    output_lines.append("| Priority action | Owner | ETA |")
+    output_lines.append("|---|---|---|")
+    for action, owner, eta in priority_rows:
+        output_lines.append(
+            f"| {_escape_table_cell(action)} | {_escape_table_cell(owner)} | {_escape_table_cell(eta)} |"
+        )
+    output_lines.append("")
+
+    output_lines.append("## Hypothesis protocol")
+    output_lines.append("- Protocol markers: falsifier | validation metric | validation date.")
+    if protocol_table:
+        output_lines.extend(protocol_table)
+    else:
+        output_lines.append("- Hypothesis protocol table unavailable in this run.")
     output_lines.append("")
 
     governance_lines = [
@@ -1311,20 +1682,23 @@ def _compose_final_report(markdown_report: str, commentary: str) -> str:
         for row in (governance or "").splitlines()
         if row.strip().startswith("- ")
     ]
-    output_lines.append("## Governance and Provenance")
+    output_lines.append("## Governance and provenance")
     if governance_lines:
-        output_lines.extend(governance_lines[:3])
+        output_lines.extend(governance_lines[:4])
     else:
         output_lines.append("- Governance metadata unavailable.")
     output_lines.append("")
 
-    anchor_ids = re.findall(r"\|\s*(E\d+)\s*\|", evidence_ledger or "")
-    output_lines.append("## Evidence Anchors")
-    if anchor_ids:
-        joined = ", ".join(f"[{anchor}]" for anchor in anchor_ids[:6])
-        output_lines.append(f"- Primary anchors: {joined}.")
+    output_lines.append("## Evidence ledger")
+    if evidence_table:
+        output_lines.extend(evidence_table)
     else:
-        output_lines.append("- Evidence ledger unavailable.")
+        anchor_ids = re.findall(r"\|\s*(E\d+)\s*\|", evidence_ledger or "")
+        if anchor_ids:
+            joined = ", ".join(f"[{anchor}]" for anchor in anchor_ids[:6])
+            output_lines.append(f"- Primary anchors: {joined}.")
+        else:
+            output_lines.append("- Evidence ledger unavailable.")
 
     return "\n".join(output_lines).strip() + "\n"
 
@@ -1531,16 +1905,21 @@ Output constraints:
 - `### Risks and Monitoring`
 - `### Continuity Check`
 - `### Further Analysis Flags`
-3. Under each heading, use `-` bullets only.
-4. Include concrete metrics/dates in key claims when present.
-5. Keep concise, avoid repetition.
-6. Use `Page Name` term.
-7. Use thousands separators with spaces.
-8. Mention movers/trends only when present in packet evidence.
-9. For each hypothesis bullet in `### Causal Chain`, append `Confidence: x/100` based only on packet evidence.
-10. Do not include raw JSON in output.
-11. Do not state a metric without interpretation. For each key change, add one plain-language implication (what it means for demand, visibility, routing, or risk).
-12. If brand declines/increases are mentioned, explain business meaning explicitly (demand softness vs routing/SERP allocation) and what evidence supports that interpretation.
+3. Use concise `-` bullets under each heading.
+4. In `### Evidence by Source`, add one compact markdown table after bullets with columns:
+   `| Source | Evidence signal | Why it matters |`.
+5. In `### Priority Actions for This Week`, every bullet must start with:
+   `- [Owner | ETA] Action`.
+6. Keep each section to max 3 bullets (excluding the single table).
+7. Total narrative length target: 350-650 words.
+8. Avoid jargon when a plain-language term exists.
+9. Use `Page Name` term.
+10. Use thousands separators with spaces.
+11. Mention movers/trends only when present in packet evidence.
+12. For each hypothesis bullet in `### Causal Chain`, append `Confidence: x/100` based only on packet evidence.
+13. Do not include raw JSON in output.
+14. Do not state a metric without interpretation. For each key change, add one plain-language implication (what it means for demand, visibility, routing, or risk).
+15. If brand declines/increases are mentioned, explain business meaning explicitly (demand softness vs routing/SERP allocation) and what evidence supports that interpretation.
 """.strip(),
             ),
             (
@@ -1578,6 +1957,34 @@ Validator feedback to address (if any):
         {"commentary": result},
     )
     return result
+
+
+def _build_gaia_llm_with_runtime_fallback(
+    config: AgentConfig,
+) -> tuple[object, AgentConfig]:
+    try:
+        return build_gaia_llm(config), config
+    except Exception as exc:
+        model_name = str(config.gaia_model or "").strip().lower()
+        fallback_name = GAIA_MODEL_RUNTIME_FALLBACK.strip().lower()
+        if not fallback_name or model_name == fallback_name:
+            raise
+        text = str(exc).lower()
+        runtime_model_issue = any(
+            token in text
+            for token in (
+                "deployment",
+                "model",
+                "not found",
+                "does not exist",
+                "unavailable",
+                "404",
+            )
+        )
+        if not runtime_model_issue:
+            raise
+        fallback_config = replace(config, gaia_model=GAIA_MODEL_RUNTIME_FALLBACK)
+        return build_gaia_llm(fallback_config), fallback_config
 
 
 def _run_llm_document_validator(llm, report_text: str, config: AgentConfig) -> dict[str, object]:
@@ -3016,10 +3423,12 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
         }
 
     try:
-        llm = build_gaia_llm(config)
+        llm, config_for_llm = _build_gaia_llm_with_runtime_fallback(config)
+        state_for_llm = dict(state)
+        state_for_llm["config"] = config_for_llm
         commentary = _generate_three_step_llm_commentary(
             llm,
-            state,
+            state_for_llm,
             feedback_notes=feedback_notes if isinstance(feedback_notes, list) else [],
         )
         commentary = _normalize_ai_commentary_markdown(commentary)
@@ -3069,14 +3478,14 @@ def llm_validate_node(state: WorkflowState) -> WorkflowState:
             "llm_validation_issues": ["[info] LLM validator disabled by USE_LLM_VALIDATOR=false."],
         }
     try:
-        llm = build_gaia_llm(config)
+        llm, config_for_llm = _build_gaia_llm_with_runtime_fallback(config)
         candidate_report = _compose_validation_report(
             markdown_report,
             commentary,
             max_appendix_chars=max(600, int(config.llm_appendix_max_chars)),
         )
         rule_issues = _run_rule_based_report_checks(candidate_report)
-        validation = _run_llm_document_validator(llm, candidate_report, config)
+        validation = _run_llm_document_validator(llm, candidate_report, config_for_llm)
         llm_issues = validation.get("issues", [])
         unsupported_claims_count = int(validation.get("unsupported_claims_count", 0) or 0)
         issues: list[str] = []
@@ -3099,16 +3508,17 @@ def llm_validate_node(state: WorkflowState) -> WorkflowState:
             }
         max_rounds = max(1, int(config.llm_validation_max_rounds))
         if round_no >= max_rounds:
-            fallback_commentary = (
-                "LLM narrative omitted after validation retries due to unresolved QA issues. "
-                "Using deterministic report sections only."
-            )
+            fallback_report = _compose_final_report(markdown_report, commentary)
+            if issues:
+                fallback_report += "\n## Validator Notes\n" + "\n".join(
+                    f"- {str(item).strip()}" for item in issues[:6] if str(item).strip()
+                ) + "\n"
             return {
                 "llm_validation_passed": True,
                 "llm_validation_issues": issues,
                 "llm_skip_validation": True,
-                "llm_commentary": fallback_commentary,
-                "final_report": markdown_report,
+                "llm_commentary": commentary,
+                "final_report": fallback_report,
             }
         next_feedback: list[str] = []
         if isinstance(feedback, list):

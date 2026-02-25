@@ -15,8 +15,8 @@ Action two
     assert "### Detailed Supporting Analysis" in normalized
     assert "### Priority Actions for This Week" in normalized
     assert "- Seasonality has impact." in normalized
-    assert "- Action one" in normalized
-    assert "- Action two" in normalized
+    assert "Action one" in normalized
+    assert "Action two" in normalized
 
 
 def test_normalize_ai_commentary_uses_page_name_and_tones_down_language() -> None:

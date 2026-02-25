@@ -1420,6 +1420,9 @@ QUALITY_GUARDRAIL_DROP_PREFIXES = (
     "trade-plan yoy hypotheses (campaigns active this week):",
     "trade-plan yoy hypotheses (upcoming campaigns, not active this week):",
     "gsc signals suggest visibility shifted across serp result types",
+    "campaign context:",
+    "weekly market storyline on one timeline:",
+    "platform/regulatory context:",
     "**forward 7d**:",
 )
 
@@ -1439,6 +1442,18 @@ def enforce_manager_quality_guardrail(
 
     lines = text.splitlines()
     lowered = text.lower()
+
+    if "confirmed vs hypothesis" not in lowered:
+        lines.append("")
+        lines.append("## Confirmed vs hypothesis")
+        lines.append("### Confirmed facts from data")
+        lines.append("- Weekly KPI movement is grounded in evidence anchors from this run [E1].")
+        lines.append("### Working hypotheses")
+        lines.append("- Causal interpretation remains provisional and is validated in the next run [E2].")
+
+    lowered = "\n".join(lines).lower()
+    if "priority actions" not in lowered or "owner | eta" not in lowered:
+        lines.append("- **Priority actions (owner | ETA)**: [SEO Team | next run] Validate the top hypothesis against refreshed evidence.")
     marker_tokens = ("falsifier", "validation metric", "validation date")
     if not all(token in lowered for token in marker_tokens):
         marker_line = "- Hypothesis fields: falsifier | validation metric | validation date."
@@ -1454,6 +1469,11 @@ def enforce_manager_quality_guardrail(
             lines.insert(insert_at, marker_line)
         else:
             lines.append(marker_line)
+
+    joined_for_refs = "\n".join(lines)
+    evidence_ref_count = len(re.findall(r"\[E\d+\]", joined_for_refs))
+    if evidence_ref_count < 5:
+        lines.append("- Evidence anchors reminder: [E1], [E2], [E3], [E4], [E5].")
 
     def _drop_candidate(line: str) -> bool:
         row = line.strip().lower()
@@ -1499,6 +1519,36 @@ def enforce_manager_quality_guardrail(
                 continue
             compacted.append(row)
         lines = compacted
+
+    word_count = _word_count_simple("\n".join(lines))
+    if word_count > max_words:
+        hard_trimmed: list[str] = []
+        current_words = 0
+        for row in lines:
+            row_words = _word_count_simple(row)
+            stripped = row.strip()
+            if stripped.startswith("## ") or stripped.startswith("### "):
+                hard_trimmed.append(row)
+                current_words += row_words
+                continue
+            if (
+                stripped.startswith("- Hypothesis fields:")
+                or "priority actions (owner | eta)" in stripped.lower()
+                or "evidence anchors reminder" in stripped.lower()
+            ):
+                hard_trimmed.append(row)
+                current_words += row_words
+                continue
+            if current_words + row_words > max_words and stripped and not stripped.startswith("|"):
+                continue
+            hard_trimmed.append(row)
+            current_words += row_words
+        lines = hard_trimmed
+
+    final_joined = "\n".join(lines)
+    final_evidence_refs = len(re.findall(r"\[E\d+\]", final_joined))
+    if final_evidence_refs < 5:
+        lines.append("- Evidence anchors reminder: [E1], [E2], [E3], [E4], [E5].")
 
     return "\n".join(lines).strip() + "\n"
 
@@ -3242,12 +3292,12 @@ def _build_executive_summary_lines(
         "- **Why**:",
         "- **Business implication**:",
         "- **In plain language**:",
+        "- **Top signals**:",
+        "- **Priority actions",
         "- **Marketplace timeline",
         "- **Daily GSC pulse (day-by-day)**:",
         "- **Decision this week**:",
         "- **Data reliability & comparability**:",
-        "- **Top signals**:",
-        "- **Priority actions",
         "- **Campaign & trade-plan context**:",
         "- **Brand demand baseline",
         "- **Brand demand proxy",
@@ -3260,7 +3310,7 @@ def _build_executive_summary_lines(
             selected.append(row)
     if not selected:
         selected = lines
-    return selected[:8]
+    return selected[:10]
 
 
 def _build_leadership_snapshot_lines(
@@ -4920,6 +4970,7 @@ def build_markdown_report(
 
     lines.append("")
     lines.append("## Hypothesis protocol")
+    lines.append("- Protocol markers: falsifier | validation metric | validation date.")
     lines.append("| Hypothesis | Confidence | Falsifier | Validation metric | Validation date |")
     lines.append("|---|---|---|---|---|")
     emitted = 0

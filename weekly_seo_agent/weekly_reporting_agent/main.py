@@ -21,6 +21,39 @@ from weekly_seo_agent.weekly_reporting_agent.reporting import (
 from weekly_seo_agent.weekly_reporting_agent.workflow import run_weekly_workflow
 
 
+QUALITY_MAX_GAIA_MODEL = "gpt-5.2"
+QUALITY_MAX_MIN_EVAL_SCORE = 88
+
+
+def _apply_weekly_quality_max_profile(config: AgentConfig) -> AgentConfig:
+    """Force high-quality LLM settings for weekly reporter only.
+
+    This profile is applied in weekly reporter runtime code and intentionally
+    does not require any .env changes.
+    """
+
+    return replace(
+        config,
+        eval_gate_enabled=True,
+        eval_gate_min_score=max(QUALITY_MAX_MIN_EVAL_SCORE, int(config.eval_gate_min_score)),
+        eval_gate_block_drive_upload=True,
+        use_llm_analysis=True,
+        use_llm_validator=True,
+        gaia_model=QUALITY_MAX_GAIA_MODEL,
+        gaia_temperature=0.0,
+        gaia_timeout_sec=max(180, int(config.gaia_timeout_sec)),
+        gaia_max_retries=max(2, int(config.gaia_max_retries)),
+        gaia_max_output_tokens=max(2200, int(config.gaia_max_output_tokens)),
+        llm_map_max_tokens=max(900, int(config.llm_map_max_tokens)),
+        llm_reduce_max_tokens=max(2200, int(config.llm_reduce_max_tokens)),
+        llm_validator_max_tokens=max(1200, int(config.llm_validator_max_tokens)),
+        llm_packet_max_chars=max(5200, int(config.llm_packet_max_chars)),
+        llm_appendix_max_chars=max(2600, int(config.llm_appendix_max_chars)),
+        llm_map_max_packets=max(6, int(config.llm_map_max_packets)),
+        llm_validation_max_rounds=max(3, int(config.llm_validation_max_rounds)),
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Weekly SEO Intelligence Agent")
     parser.add_argument(
@@ -147,7 +180,7 @@ def _run_country_report(
 
     state = run_weekly_workflow(run_date, country_config)
     final_report = state.get("final_report") or state["markdown_report"]
-    final_report = enforce_manager_quality_guardrail(final_report, max_words=1380)
+    final_report = enforce_manager_quality_guardrail(final_report, max_words=1260)
     quality = evaluate_report_text(final_report)
     report_stem = f"{run_date.strftime('%Y_%m_%d')}_{country_code.lower()}_seo_weekly_report"
     docx_path = output_dir / f"{report_stem}.docx"
@@ -177,7 +210,7 @@ def main() -> None:
 
     args = _parse_args()
     run_date = _parse_run_date(args.run_date)
-    config = AgentConfig.from_env()
+    config = _apply_weekly_quality_max_profile(AgentConfig.from_env())
 
     if not config.gsc_enabled:
         raise SystemExit(

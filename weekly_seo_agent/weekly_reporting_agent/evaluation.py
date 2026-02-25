@@ -7,6 +7,7 @@ from typing import Any
 REQUIRED_SECTIONS = (
     "Executive summary",
     "What is happening and why",
+    "Confirmed vs hypothesis",
 )
 
 HYPOTHESIS_MARKERS = (
@@ -32,6 +33,11 @@ MANAGER_MARKERS = (
     "business implication",
     "decision this week",
     "data reliability",
+)
+
+ACTION_MARKERS = (
+    "priority actions",
+    "owner | eta",
 )
 
 
@@ -94,9 +100,9 @@ def evaluate_report_text(report_text: str) -> dict[str, Any]:
         issues.append(f"Missing required section: {section}")
 
     evidence_refs = re.findall(r"\[E\d+\]", text)
-    if len(evidence_refs) < 3:
-        score -= 15
-        issues.append("Too few evidence references ([E#]) in narrative.")
+    if len(evidence_refs) < 5:
+        score -= 20
+        issues.append("Too few evidence references ([E#]) in narrative (minimum: 5).")
 
     has_ledger = (
         "## evidence ledger" in text_lower
@@ -118,8 +124,8 @@ def evaluate_report_text(report_text: str) -> dict[str, Any]:
         issues.append("Missing `## Governance and provenance` section.")
 
     marker_hits = sum(1 for marker in HYPOTHESIS_MARKERS if marker in text.lower())
-    if marker_hits < 2:
-        score -= 10
+    if marker_hits < 3:
+        score -= 14
         issues.append("Hypothesis discipline markers are incomplete (falsifier/validation metric/date).")
 
     if not re.search(r"\b20\d{2}-\d{2}-\d{2}\b", text):
@@ -127,40 +133,55 @@ def evaluate_report_text(report_text: str) -> dict[str, Any]:
         issues.append("No explicit ISO dates found.")
 
     word_count = len(re.findall(r"\b\w+\b", text, flags=re.UNICODE))
-    if word_count > 1800:
+    if word_count > 1600:
         score -= 16
         issues.append(f"Report is too long for decision brief readability ({word_count} words).")
-    elif word_count > 1400:
-        score -= 8
+    elif word_count > 1300:
+        score -= 10
         issues.append(f"Report is longer than target manager format ({word_count} words).")
-    elif word_count < 300:
+    elif word_count < 320:
         score -= 6
         issues.append(f"Report may be too short to support decisions ({word_count} words).")
 
     duplicate_ratio = _duplicate_line_ratio(text)
-    if duplicate_ratio > 0.20:
+    if duplicate_ratio > 0.16:
         score -= 12
         issues.append(f"High line duplication ratio detected ({duplicate_ratio:.2f}).")
-    elif duplicate_ratio > 0.14:
+    elif duplicate_ratio > 0.10:
         score -= 6
         issues.append(f"Moderate line duplication ratio detected ({duplicate_ratio:.2f}).")
 
     jargon_hits = sum(text_lower.count(token) for token in JARGON_TOKENS)
-    if jargon_hits > 18:
-        score -= 8
+    if jargon_hits > 14:
+        score -= 10
         issues.append("Too many technical terms for non-SEO audience readability.")
 
     confidence_mentions = len(re.findall(r"\b\d{1,3}/100\b", text))
-    if confidence_mentions > 10:
+    if confidence_mentions > 8:
         score -= 8
         issues.append(
             f"Too many confidence-score mentions ({confidence_mentions}); prefer fewer confidence callouts."
         )
+    elif confidence_mentions > 5:
+        score -= 4
+        issues.append(
+            f"Confidence-score mentions should be reduced further ({confidence_mentions})."
+        )
 
     manager_marker_hits = sum(1 for marker in MANAGER_MARKERS if marker in text_lower)
-    if manager_marker_hits < 3:
-        score -= 6
+    if manager_marker_hits < 4:
+        score -= 8
         issues.append("Manager-oriented framing is incomplete (plain language / decision / reliability markers).")
+
+    action_marker_hits = sum(1 for marker in ACTION_MARKERS if marker in text_lower)
+    if action_marker_hits < 2:
+        score -= 10
+        issues.append("Action framing is incomplete (priority actions with owner/ETA).")
+
+    yoy_mentions = len(re.findall(r"\byoy\b", text_lower))
+    if yoy_mentions < 6:
+        score -= 10
+        issues.append(f"YoY coverage is too limited ({yoy_mentions} mentions).")
 
     direction_conflicts = _directional_conflicts(text)
     if direction_conflicts:
@@ -173,7 +194,7 @@ def evaluate_report_text(report_text: str) -> dict[str, Any]:
     score = max(0, min(100, score))
     return {
         "score": score,
-        "passed": score >= 75 and not any("Missing required section" in item for item in issues),
+        "passed": score >= 85 and not any("Missing required section" in item for item in issues),
         "issues": issues,
         "metrics": {
             "evidence_reference_count": len(evidence_refs),
@@ -185,6 +206,8 @@ def evaluate_report_text(report_text: str) -> dict[str, Any]:
             "jargon_hits": jargon_hits,
             "confidence_mentions": confidence_mentions,
             "manager_marker_hits": manager_marker_hits,
+            "action_marker_hits": action_marker_hits,
+            "yoy_mentions": yoy_mentions,
             "directional_conflicts": len(direction_conflicts),
         },
     }

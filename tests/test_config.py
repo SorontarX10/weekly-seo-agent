@@ -1,4 +1,8 @@
 from weekly_seo_agent.config import AgentConfig
+from weekly_seo_agent.weekly_reporting_agent.main import (
+    QUALITY_MAX_GAIA_MODEL,
+    _apply_weekly_quality_max_profile,
+)
 
 
 def test_gsc_country_filter_maps_pl_to_pol(monkeypatch):
@@ -76,3 +80,36 @@ def test_allegro_trends_config(monkeypatch):
     assert config.allegro_trends_api_enabled is True
     assert config.allegro_trends_measures == ("VISIT", "PV", "GMV")
     assert config.allegro_trends_top_rows == 12
+
+
+def test_weekly_quality_max_profile_forces_llm_settings(monkeypatch):
+    monkeypatch.setenv("GAIA_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("LLM_MAP_MAX_TOKENS", "300")
+    monkeypatch.setenv("LLM_REDUCE_MAX_TOKENS", "900")
+    monkeypatch.setenv("LLM_VALIDATOR_MAX_TOKENS", "600")
+    monkeypatch.setenv("LLM_PACKET_MAX_CHARS", "2000")
+    monkeypatch.setenv("LLM_APPENDIX_MAX_CHARS", "1200")
+    monkeypatch.setenv("LLM_MAP_MAX_PACKETS", "2")
+    monkeypatch.setenv("LLM_VALIDATION_MAX_ROUNDS", "1")
+    monkeypatch.setenv("USE_LLM_ANALYSIS", "false")
+    monkeypatch.setenv("USE_LLM_VALIDATOR", "false")
+    monkeypatch.setenv("EVAL_GATE_ENABLED", "false")
+    monkeypatch.setenv("EVAL_GATE_MIN_SCORE", "75")
+    monkeypatch.setenv("EVAL_GATE_BLOCK_DRIVE_UPLOAD", "false")
+
+    base = AgentConfig.from_env()
+    profiled = _apply_weekly_quality_max_profile(base)
+
+    assert profiled.gaia_model == QUALITY_MAX_GAIA_MODEL
+    assert profiled.use_llm_analysis is True
+    assert profiled.use_llm_validator is True
+    assert profiled.eval_gate_enabled is True
+    assert profiled.eval_gate_min_score >= 88
+    assert profiled.eval_gate_block_drive_upload is True
+    assert profiled.llm_map_max_tokens >= 900
+    assert profiled.llm_reduce_max_tokens >= 2200
+    assert profiled.llm_validator_max_tokens >= 1200
+    assert profiled.llm_packet_max_chars >= 5200
+    assert profiled.llm_appendix_max_chars >= 2600
+    assert profiled.llm_map_max_packets >= 6
+    assert profiled.llm_validation_max_rounds >= 3
