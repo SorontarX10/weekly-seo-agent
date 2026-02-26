@@ -2302,13 +2302,18 @@ class ContinuityClient:
             reverse=True,
         )[: max(1, int(top_rows))]
 
-        yoy_sheet_meta: dict[str, str] = {}
-        if (
+        yoy_requested = bool(
             include_yoy_enrichment
             and isinstance(yoy_window_start, date)
             and isinstance(yoy_window_end, date)
             and (yoy_sheet_reference.strip() or yoy_tab_name.strip())
-        ):
+        )
+        yoy_sheet_meta: dict[str, str] = {}
+        yoy_fallback_used = False
+        yoy_matches_channels = 0
+        yoy_matches_campaigns = 0
+        yoy_message = ""
+        if yoy_requested:
             yoy_reference = yoy_sheet_reference.strip() or sheet_reference
             candidate_tab = yoy_tab_name.strip()
             if not candidate_tab and str(run_date.year) in tab_name:
@@ -2339,6 +2344,7 @@ class ContinuityClient:
                         for row in yoy_channel_rows_probe
                     )
                 if not has_direct_yoy:
+                    yoy_fallback_used = True
                     yoy_ctx = self.collect_trade_plan_context(
                         run_date=run_date,
                         sheet_reference=yoy_reference,
@@ -2409,6 +2415,7 @@ class ContinuityClient:
                         row["yoy_hypothesis_impact"] = str(hypothesis.get("impact", "neutral"))
                         row["yoy_hypothesis_confidence"] = int(hypothesis.get("confidence", 50) or 50)
                         row["yoy_hypothesis_reason"] = str(hypothesis.get("reason", "")).strip()
+                        yoy_matches_channels += 1
 
                 yoy_campaign_rows = yoy_ctx.get("campaign_rows", []) if isinstance(yoy_ctx, dict) else []
                 campaign_yoy_map: dict[str, dict[str, Any]] = {}
@@ -2465,9 +2472,32 @@ class ContinuityClient:
                         row["yoy_hypothesis_impact"] = str(hypothesis.get("impact", "neutral"))
                         row["yoy_hypothesis_confidence"] = int(hypothesis.get("confidence", 50) or 50)
                         row["yoy_hypothesis_reason"] = str(hypothesis.get("reason", "")).strip()
+                        yoy_matches_campaigns += 1
             except Exception:
                 # Keep base trade-plan output if YoY enrichment fails.
-                pass
+                yoy_message = (
+                    "YoY comparator requested, but prior-year trade-plan sheet/tab could not be read; "
+                    "using in-sheet YoY columns only (if present)."
+                )
+
+            if not yoy_message:
+                if yoy_matches_channels > 0 or yoy_matches_campaigns > 0:
+                    yoy_message = (
+                        "YoY comparator applied using prior-year sheet data"
+                        + (" (extended-window fallback)." if yoy_fallback_used else ".")
+                    )
+                elif yoy_sheet_meta:
+                    yoy_message = (
+                        "YoY sheet was loaded, but no matching channel/campaign rows were found for this window; "
+                        "using in-sheet YoY columns only (if present)."
+                    )
+                else:
+                    yoy_message = (
+                        "YoY comparator requested, but prior-year sheet metadata is unavailable; "
+                        "using in-sheet YoY columns only (if present)."
+                    )
+        elif include_yoy_enrichment and isinstance(yoy_window_start, date) and isinstance(yoy_window_end, date):
+            yoy_message = "YoY comparator skipped: no prior-year trade-plan sheet/tab configured."
 
         return {
             "enabled": bool(parsed_rows),
@@ -2493,6 +2523,14 @@ class ContinuityClient:
                 },
             },
             "yoy_sheet": yoy_sheet_meta,
+            "yoy_availability": {
+                "requested": yoy_requested,
+                "applied": bool(yoy_matches_channels or yoy_matches_campaigns),
+                "matches_channels": yoy_matches_channels,
+                "matches_campaigns": yoy_matches_campaigns,
+                "fallback_used": yoy_fallback_used,
+                "message": yoy_message,
+            },
             "top_rows": max(1, int(top_rows)),
             "channel_split": channel_rows[: max(1, int(top_rows))],
             "campaign_rows": campaign_rows,

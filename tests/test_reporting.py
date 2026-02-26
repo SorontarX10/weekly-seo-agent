@@ -903,3 +903,77 @@ def test_external_source_hypotheses_are_supporting_only():
     for row in external_rows:
         assert bool(row.get("supporting_context_only"))
         assert int(row.get("confidence", 0)) <= 63
+
+
+def test_report_includes_trade_plan_overlap_intensity_and_yoy_fallback_message():
+    run_date = date(2026, 2, 25)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=120000, impressions=2100000, ctr=0.057, position=5.8),
+        "previous_28d": MetricSummary(clicks=115000, impressions=2050000, ctr=0.056, position=5.9),
+        "yoy_52w": MetricSummary(clicks=130000, impressions=2200000, ctr=0.059, position=5.5),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    additional_context = {
+        "country_code": "PL",
+        "trade_plan": {
+            "enabled": True,
+            "windows": {
+                "current": {"start": "2026-02-16", "end": "2026-02-22"},
+                "previous": {"start": "2026-02-09", "end": "2026-02-15"},
+            },
+            "channel_split": [
+                {"channel": "Paid Search", "current_spend": 120.0, "previous_spend": 90.0, "delta_spend": 30.0},
+            ],
+            "campaign_rows": [
+                {
+                    "campaign": "MegaRaty February",
+                    "category": "Promo",
+                    "first_date": "2026-02-19",
+                    "last_date": "2026-02-23",
+                    "current_spend": 80.0,
+                },
+                {
+                    "campaign": "Warehouse Cleaning Sellout",
+                    "category": "Promo",
+                    "first_date": "2026-02-17",
+                    "last_date": "2026-02-20",
+                    "current_spend": 40.0,
+                },
+            ],
+            "yoy_availability": {
+                "requested": True,
+                "applied": False,
+                "fallback_used": False,
+                "message": "YoY comparator skipped: no prior-year trade-plan sheet/tab configured.",
+            },
+        },
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=[],
+        weather_summary={},
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "Overlap intensity:" in report or "Trade-plan overlap intensity:" in report
+    assert "Trade-plan YoY availability" in report
+    assert "YoY comparator skipped" in report

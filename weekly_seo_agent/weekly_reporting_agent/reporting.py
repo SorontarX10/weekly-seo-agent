@@ -2396,6 +2396,97 @@ def _trade_plan_paid_pressure(
     return ("flat", 0.0)
 
 
+def _trade_plan_overlap_intensity(
+    trade_plan: dict[str, object],
+) -> dict[str, object]:
+    campaign_rows = trade_plan.get("campaign_rows", [])
+    windows = trade_plan.get("windows", {})
+    current_window = windows.get("current", {}) if isinstance(windows, dict) else {}
+    current_start = _parse_iso_day_safe((current_window or {}).get("start"))
+    current_end = _parse_iso_day_safe((current_window or {}).get("end"))
+    if not isinstance(campaign_rows, list) or current_start is None or current_end is None:
+        return {
+            "score": 0,
+            "campaigns": 0,
+            "overlap_days": 0,
+            "recency_days": None,
+            "label": "Low",
+        }
+
+    overlap_campaigns = 0
+    overlap_day_set: set[date] = set()
+    latest_overlap_day: date | None = None
+    for row in campaign_rows:
+        if not isinstance(row, dict):
+            continue
+        first_day = _parse_iso_day_safe(row.get("first_date"))
+        last_day = _parse_iso_day_safe(row.get("last_date"))
+        if first_day is None and last_day is None:
+            if (
+                float(row.get("current_spend", 0.0) or 0.0) > 0.0
+                or float(row.get("current_impressions", 0.0) or 0.0) > 0.0
+                or float(row.get("current_clicks", 0.0) or 0.0) > 0.0
+            ):
+                overlap_campaigns += 1
+            continue
+        if first_day is None:
+            first_day = last_day
+        if last_day is None:
+            last_day = first_day
+        if first_day is None or last_day is None:
+            continue
+        if last_day < current_start or first_day > current_end:
+            continue
+        overlap_campaigns += 1
+        overlap_start = max(first_day, current_start)
+        overlap_end = min(last_day, current_end)
+        if overlap_start <= overlap_end:
+            for offset in range((overlap_end - overlap_start).days + 1):
+                overlap_day_set.add(overlap_start + timedelta(days=offset))
+            latest_overlap_day = overlap_end if latest_overlap_day is None else max(latest_overlap_day, overlap_end)
+
+    overlap_days = len(overlap_day_set)
+    recency_days: int | None = None
+    if latest_overlap_day is not None:
+        recency_days = max(0, (current_end - latest_overlap_day).days)
+
+    if overlap_campaigns <= 0:
+        return {
+            "score": 0,
+            "campaigns": 0,
+            "overlap_days": 0,
+            "recency_days": recency_days,
+            "label": "Low",
+        }
+
+    campaign_component = min(overlap_campaigns, 6) * 9
+    days_component = min(overlap_days, 7) * 5
+    recency_component = 0
+    if recency_days is not None:
+        if recency_days <= 1:
+            recency_component = 18
+        elif recency_days <= 3:
+            recency_component = 12
+        elif recency_days <= 7:
+            recency_component = 7
+        else:
+            recency_component = 3
+    score = max(0, min(100, 25 + campaign_component + days_component + recency_component))
+    if score >= 70:
+        label = "High"
+    elif score >= 45:
+        label = "Medium"
+    else:
+        label = "Low"
+    return {
+        "score": int(score),
+        "campaigns": overlap_campaigns,
+        "overlap_days": overlap_days,
+        "recency_days": recency_days,
+        "label": label,
+    }
+
+
 def _trade_plan_signal(additional_context: dict[str, object] | None) -> dict[str, object] | None:
     trade_plan = (additional_context or {}).get("trade_plan", {})
     if not isinstance(trade_plan, dict) or not trade_plan.get("enabled"):
@@ -2422,12 +2513,15 @@ def _trade_plan_signal(additional_context: dict[str, object] | None) -> dict[str
     paid_direction = "unknown"
     if isinstance(channel_rows, list) and channel_rows:
         paid_direction, _ = _trade_plan_paid_pressure(additional_context)
+    overlap_intensity = _trade_plan_overlap_intensity(trade_plan)
 
     confidence = 56
     if campaign_names:
         confidence += 8
     if paid_direction in {"up", "down"}:
         confidence += 10
+    if int(overlap_intensity.get("score", 0) or 0) >= 60:
+        confidence += 6
     confidence = max(45, min(82, confidence))
 
     if paid_direction == "up":
@@ -2452,10 +2546,18 @@ def _trade_plan_signal(additional_context: dict[str, object] | None) -> dict[str
             "Campaign overlap detected in analyzed week "
             "(" + ", ".join(f"`{name}`" for name in campaign_names) + ")."
         )
+    yoy_availability = trade_plan.get("yoy_availability", {})
+    yoy_message = str((yoy_availability or {}).get("message", "")).strip() if isinstance(yoy_availability, dict) else ""
     return {
         "summary": summary,
         "statement": statement,
         "confidence": confidence,
+        "overlap_intensity_score": int(overlap_intensity.get("score", 0) or 0),
+        "overlap_intensity_label": str(overlap_intensity.get("label", "Low")),
+        "overlap_campaigns": int(overlap_intensity.get("campaigns", 0) or 0),
+        "overlap_days": int(overlap_intensity.get("overlap_days", 0) or 0),
+        "overlap_recency_days": overlap_intensity.get("recency_days"),
+        "yoy_availability_message": yoy_message,
     }
 
 
@@ -3612,11 +3714,30 @@ def _build_executive_summary_lines(
 
     brand_proxy = _brand_proxy_from_gsc(segment_diagnostics)
     if isinstance(trade_plan_signal, dict):
+        overlap_score = int(trade_plan_signal.get("overlap_intensity_score", 0) or 0)
+        overlap_campaigns = int(trade_plan_signal.get("overlap_campaigns", 0) or 0)
+        overlap_days = int(trade_plan_signal.get("overlap_days", 0) or 0)
+        overlap_recency = trade_plan_signal.get("overlap_recency_days")
+        overlap_text = ""
+        if overlap_score > 0:
+            overlap_text = (
+                f" Overlap intensity: {overlap_score}/100 "
+                f"(campaigns={overlap_campaigns}, overlap days={overlap_days}"
+                + (
+                    f", recency={int(overlap_recency)}d)."
+                    if isinstance(overlap_recency, (int, float))
+                    else ")."
+                )
+            )
         lines.append(
             "- **Campaign & trade-plan context**: "
             + str(trade_plan_signal.get("statement", "")).strip()
             + f" (impact likelihood: {_confidence_bucket(trade_plan_signal.get('confidence', 0))})."
+            + overlap_text
         )
+        yoy_availability_message = str(trade_plan_signal.get("yoy_availability_message", "")).strip()
+        if yoy_availability_message:
+            lines.append("- **Trade-plan YoY availability**: " + yoy_availability_message)
     if brand_enabled and brand_proxy:
         lines.append(
             "- **Brand demand baseline (Google Trends + GSC brand queries)**: "
@@ -4202,6 +4323,23 @@ def _build_what_is_happening_lines(
                     + statement
                     + f" Likelihood: {_confidence_bucket(confidence)}."
                 )
+            overlap_score = int(trade_plan_signal.get("overlap_intensity_score", 0) or 0)
+            overlap_campaigns = int(trade_plan_signal.get("overlap_campaigns", 0) or 0)
+            overlap_days = int(trade_plan_signal.get("overlap_days", 0) or 0)
+            overlap_recency = trade_plan_signal.get("overlap_recency_days")
+            if overlap_score > 0:
+                lines.append(
+                    "Trade-plan overlap intensity: "
+                    f"{overlap_score}/100 (campaigns={overlap_campaigns}, overlap days={overlap_days}"
+                    + (
+                        f", recency={int(overlap_recency)}d)."
+                        if isinstance(overlap_recency, (int, float))
+                        else ")."
+                    )
+                )
+            yoy_availability_message = str(trade_plan_signal.get("yoy_availability_message", "")).strip()
+            if yoy_availability_message:
+                lines.append("Trade-plan YoY availability: " + yoy_availability_message)
         channel_split = trade_plan.get("channel_split", [])
         if isinstance(channel_split, list) and channel_split:
             yoy_channel_hypotheses: list[str] = []
