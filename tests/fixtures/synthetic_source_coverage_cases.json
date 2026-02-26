@@ -1,0 +1,294 @@
+[
+  {
+    "name": "all_sources_missing",
+    "gsc_data_coverage": {
+      "days_total": 7,
+      "days_with_data": 0,
+      "p52w_days_used": 0
+    },
+    "gsc_daily_rows": {
+      "days_with_data": 0,
+      "days_with_previous_weekday_data": 0,
+      "days_with_yoy_day_data": 0,
+      "rows": []
+    },
+    "gsc_feature_split": {
+      "rows_weekly": [],
+      "rows_mom": []
+    },
+    "daily_serp_feature_shifts": {
+      "rows": []
+    },
+    "daily_gsc_anomalies": {
+      "rows": []
+    },
+    "weather_summary": {},
+    "additional_context": {
+      "trade_plan": {
+        "rows": []
+      },
+      "market_event_calendar": {
+        "events": [],
+        "events_yoy": []
+      },
+      "weekly_news_digest": {
+        "total_count": 0,
+        "total_count_yoy": 0
+      }
+    },
+    "expect": {
+      "GSC totals": {
+        "current_available": false,
+        "yoy_available": false
+      },
+      "Trade plan": {
+        "current_available": false,
+        "yoy_available": false
+      },
+      "Weather context": {
+        "current_available": false,
+        "yoy_available": false
+      },
+      "Market events": {
+        "current_available": false,
+        "yoy_available": false
+      }
+    }
+  },
+  {
+    "name": "partial_trade_without_yoy",
+    "gsc_data_coverage": {
+      "days_total": 7,
+      "days_with_data": 7,
+      "p52w_days_used": 7
+    },
+    "gsc_daily_rows": {
+      "days_with_data": 7,
+      "days_with_previous_weekday_data": 7,
+      "days_with_yoy_day_data": 7,
+      "rows": [
+        {
+          "date": "2026-02-16",
+          "clicks": 10
+        }
+      ]
+    },
+    "gsc_feature_split": {
+      "rows_weekly": [
+        {
+          "search_appearance": "PRODUCT_SNIPPETS",
+          "delta_clicks": 100,
+          "yoy_delta_clicks": 50
+        }
+      ],
+      "rows_mom": [
+        {
+          "search_appearance": "PRODUCT_SNIPPETS",
+          "delta_clicks": 200
+        }
+      ]
+    },
+    "daily_serp_feature_shifts": {
+      "rows": [
+        {
+          "date": "2026-02-16",
+          "dominant_feature": "PRODUCT_SNIPPETS",
+          "clicks_yoy_day": 40
+        }
+      ]
+    },
+    "daily_gsc_anomalies": {
+      "rows": [
+        {
+          "date": "2026-02-18",
+          "signal": "click_drop"
+        }
+      ]
+    },
+    "weather_summary": {
+      "daily_current": [
+        {
+          "date": "2026-02-16",
+          "temp_c": 2.5
+        }
+      ],
+      "daily_previous": [
+        {
+          "date": "2026-02-09",
+          "temp_c": 1.5
+        }
+      ],
+      "daily_yoy": []
+    },
+    "additional_context": {
+      "trade_plan": {
+        "rows": [
+          {
+            "bucket": "current",
+            "date": "2026-02-16"
+          },
+          {
+            "bucket": "previous",
+            "date": "2026-02-09"
+          }
+        ],
+        "yoy_sheet": {}
+      },
+      "market_event_calendar": {
+        "events": [
+          {
+            "date": "2026-02-16",
+            "title": "Campaign launch"
+          }
+        ],
+        "events_yoy": []
+      },
+      "weekly_news_digest": {
+        "total_count": 6,
+        "total_count_yoy": 2
+      }
+    },
+    "expect": {
+      "Trade plan": {
+        "current_available": true,
+        "yoy_available": false
+      },
+      "Weather context": {
+        "current_available": true,
+        "yoy_available": false
+      },
+      "Weekly SEO/GEO digest": {
+        "current_available": true,
+        "yoy_available": true
+      }
+    }
+  },
+  {
+    "name": "full_coverage_all_sources",
+    "gsc_data_coverage": {
+      "days_total": 7,
+      "days_with_data": 7,
+      "p52w_days_used": 7
+    },
+    "gsc_daily_rows": {
+      "days_with_data": 7,
+      "days_with_previous_weekday_data": 7,
+      "days_with_yoy_day_data": 7,
+      "rows": [
+        {
+          "date": "2026-02-16",
+          "clicks": 10
+        }
+      ]
+    },
+    "gsc_feature_split": {
+      "rows_weekly": [
+        {
+          "search_appearance": "MERCHANT_LISTINGS",
+          "delta_clicks": 400,
+          "delta_clicks_vs_yoy": 300
+        }
+      ],
+      "rows_mom": [
+        {
+          "search_appearance": "MERCHANT_LISTINGS",
+          "delta_clicks": 900
+        }
+      ]
+    },
+    "daily_serp_feature_shifts": {
+      "rows": [
+        {
+          "date": "2026-02-16",
+          "dominant_feature": "MERCHANT_LISTINGS",
+          "clicks_yoy_day": 80
+        }
+      ]
+    },
+    "daily_gsc_anomalies": {
+      "rows": [
+        {
+          "date": "2026-02-17",
+          "signal": "ctr_spike"
+        }
+      ]
+    },
+    "weather_summary": {
+      "daily_current": [
+        {
+          "date": "2026-02-16",
+          "temp_c": 4.0
+        }
+      ],
+      "daily_previous": [
+        {
+          "date": "2026-02-09",
+          "temp_c": 2.0
+        }
+      ],
+      "daily_yoy": [
+        {
+          "date": "2025-02-17",
+          "temp_c": 3.5
+        }
+      ]
+    },
+    "additional_context": {
+      "trade_plan": {
+        "rows": [
+          {
+            "bucket": "current",
+            "date": "2026-02-16"
+          },
+          {
+            "bucket": "previous",
+            "date": "2026-02-09"
+          },
+          {
+            "bucket": "yoy",
+            "date": "2025-02-17"
+          }
+        ],
+        "yoy_sheet": {
+          "id": "sheet-yoy"
+        }
+      },
+      "market_event_calendar": {
+        "events": [
+          {
+            "date": "2026-02-16",
+            "title": "Main event"
+          }
+        ],
+        "events_yoy": [
+          {
+            "date": "2025-02-17",
+            "title": "YoY event"
+          }
+        ]
+      },
+      "weekly_news_digest": {
+        "total_count": 8,
+        "total_count_yoy": 6
+      }
+    },
+    "expect": {
+      "GSC totals": {
+        "current_available": true,
+        "yoy_available": true
+      },
+      "Trade plan": {
+        "current_available": true,
+        "yoy_available": true
+      },
+      "Weather context": {
+        "current_available": true,
+        "yoy_available": true
+      },
+      "Market events": {
+        "current_available": true,
+        "yoy_available": true
+      }
+    }
+  }
+]

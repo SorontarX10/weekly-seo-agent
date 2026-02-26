@@ -695,6 +695,50 @@ def _run_country_report(
     }
 
 
+def _apply_quality_gate(
+    run_results: list[dict[str, str]],
+    *,
+    gate_enabled: bool,
+    min_score: int,
+) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
+    if not gate_enabled:
+        return run_results, []
+
+    gated_runs: list[dict[str, str]] = []
+    gate_failures: list[tuple[str, str]] = []
+    for result in run_results:
+        score = int(float(result.get("quality_score", "0") or 0.0))
+        passed = str(result.get("quality_passed", "")).lower() == "true"
+        if score < int(min_score) or not passed:
+            gate_failures.append(
+                (
+                    str(result.get("country_code", "unknown")),
+                    "Evaluation gate failed: "
+                    f"score={score}/100 (min {int(min_score)}), "
+                    f"passed={passed}, issues={result.get('quality_issues', '[]')}",
+                )
+            )
+            continue
+        gated_runs.append(result)
+    return gated_runs, gate_failures
+
+
+def _should_publish_to_drive(
+    config: AgentConfig,
+    successful_runs: list[dict[str, str]],
+    gate_failures: list[tuple[str, str]],
+) -> bool:
+    if not successful_runs:
+        return False
+    if not config.eval_gate_enabled:
+        return True
+    if not config.eval_gate_block_drive_upload:
+        return True
+    # Strict acceptance policy: publish only when every generated report
+    # passes the quality gate for the current batch.
+    return not gate_failures
+
+
 def main() -> None:
     try:
         load_dotenv(find_dotenv(usecwd=True), override=False)
@@ -801,24 +845,17 @@ def main() -> None:
                     failed_countries.append((country_code, str(exc)))
                     print(f"Country run failed: {country_code} | {exc}")
 
-    gated_runs: list[dict[str, str]] = []
-    for result in successful_runs:
-        score = int(float(result.get("quality_score", "0") or 0.0))
-        passed = str(result.get("quality_passed", "")).lower() == "true"
-        if config.eval_gate_enabled and (score < int(config.eval_gate_min_score) or not passed):
-            failed_countries.append(
-                (
-                    str(result.get("country_code", "unknown")),
-                    "Evaluation gate failed: "
-                    f"score={score}/100 (min {int(config.eval_gate_min_score)}), "
-                    f"passed={passed}, issues={result.get('quality_issues', '[]')}",
-                )
-            )
-            continue
-        gated_runs.append(result)
-    successful_runs = gated_runs
+    successful_runs, gate_failures = _apply_quality_gate(
+        successful_runs,
+        gate_enabled=bool(config.eval_gate_enabled),
+        min_score=int(config.eval_gate_min_score),
+    )
+    if gate_failures:
+        failed_countries.extend(gate_failures)
 
-    if drive_client is not None and (not config.eval_gate_enabled or not config.eval_gate_block_drive_upload or successful_runs):
+    if drive_client is not None and _should_publish_to_drive(
+        config, successful_runs, gate_failures
+    ):
         drive_upload_errors: list[str] = []
         for result in successful_runs:
             docx_path = Path(result["docx_path"])
@@ -838,6 +875,11 @@ def main() -> None:
             print("Google Drive upload completed with errors (local DOCX reports are still generated):")
             for err in drive_upload_errors:
                 print(f"- {err}")
+    elif drive_client is not None and successful_runs and gate_failures:
+        print(
+            "Google Drive upload skipped: at least one country failed the quality gate "
+            "and eval_gate_block_drive_upload=true."
+        )
 
     if config.telemetry_enabled and telemetry_rows:
         telemetry_dir = output_dir / "_telemetry"
