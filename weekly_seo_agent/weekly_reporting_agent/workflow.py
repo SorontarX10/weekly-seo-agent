@@ -1795,7 +1795,7 @@ def _extract_key_data_packets(
                     "key": row.key,
                     "delta_vs_previous": row.click_delta_vs_previous,
                     "delta_vs_yoy": row.click_delta_vs_yoy,
-                    "current_clicks": row.current.clicks,
+                    "current_clicks": row.current_clicks,
                 }
                 for row in (getattr(query_scope, "top_winners", [])[:10] if query_scope else [])
             ],
@@ -1804,7 +1804,7 @@ def _extract_key_data_packets(
                     "key": row.key,
                     "delta_vs_previous": row.click_delta_vs_previous,
                     "delta_vs_yoy": row.click_delta_vs_yoy,
-                    "current_clicks": row.current.clicks,
+                    "current_clicks": row.current_clicks,
                 }
                 for row in (getattr(query_scope, "top_losers", [])[:10] if query_scope else [])
             ],
@@ -1813,7 +1813,7 @@ def _extract_key_data_packets(
                     "key": row.key,
                     "delta_vs_previous": row.click_delta_vs_previous,
                     "delta_vs_yoy": row.click_delta_vs_yoy,
-                    "current_clicks": row.current.clicks,
+                    "current_clicks": row.current_clicks,
                 }
                 for row in (getattr(page_scope, "top_winners", [])[:10] if page_scope else [])
             ],
@@ -1822,12 +1822,12 @@ def _extract_key_data_packets(
                     "key": row.key,
                     "delta_vs_previous": row.click_delta_vs_previous,
                     "delta_vs_yoy": row.click_delta_vs_yoy,
-                    "current_clicks": row.current.clicks,
+                    "current_clicks": row.current_clicks,
                 }
                 for row in (getattr(page_scope, "top_losers", [])[:10] if page_scope else [])
             ],
         }
-        payload = json.dumps(data, ensure_ascii=False)
+        payload = json.dumps(data, ensure_ascii=False, default=str)
         return {
             "name": "GSC metrics and movers",
             "payload": _trim_text_by_lines(payload, payload_max_chars),
@@ -1848,7 +1848,7 @@ def _extract_key_data_packets(
                 top_n=6,
             ),
         }
-        payload = json.dumps(data, ensure_ascii=False)
+        payload = json.dumps(data, ensure_ascii=False, default=str)
         return {
             "name": "External and seasonal context",
             "payload": _trim_text_by_lines(payload, payload_max_chars),
@@ -1941,7 +1941,7 @@ def _extract_key_data_packets(
                 top_n=12,
             ),
         }
-        payload = json.dumps(data, ensure_ascii=False)
+        payload = json.dumps(data, ensure_ascii=False, default=str)
         return {
             "name": "Market intelligence and continuity",
             "payload": _trim_text_by_lines(payload, payload_max_chars),
@@ -1953,7 +1953,11 @@ def _extract_key_data_packets(
             if isinstance(additional_context, dict)
             else {}
         )
-        payload = json.dumps(long_window if isinstance(long_window, dict) else {}, ensure_ascii=False)
+        payload = json.dumps(
+            long_window if isinstance(long_window, dict) else {},
+            ensure_ascii=False,
+            default=str,
+        )
         return {
             "name": "Broader 28-day context overlay",
             "payload": _trim_text_by_lines(payload, payload_max_chars),
@@ -2391,16 +2395,16 @@ Anti-hallucination rules:
 
 Output format: strict JSON only, no markdown.
 Schema:
-{
+{{
   "facts": [
-    {"claim": "...", "evidence": "...", "confidence_0_100": 0}
+    {{"claim": "...", "evidence": "...", "confidence_0_100": 0}}
   ],
   "signals": [
-    {"type": "risk|opportunity|context", "statement": "...", "evidence": "..."}
+    {{"type": "risk|opportunity|context", "statement": "...", "evidence": "..."}}
   ],
   "unknowns": ["..."],
   "quality_notes": ["..."]
-}
+}}
 Limits:
 - max 8 facts
 - max 5 signals
@@ -2421,8 +2425,7 @@ Validator feedback to address (if any):
             ),
         ]
     )
-    map_llm = llm.bind(max_tokens=max(200, int(config.llm_map_max_tokens)))
-    map_chain = map_prompt | map_llm | StrOutputParser()
+    map_chain = map_prompt | llm | StrOutputParser()
     partial_summaries: list[str] = []
     for idx, packet in enumerate(packets, start=1):
         packet_label = f"{idx}. {packet['name']}"
@@ -2558,8 +2561,7 @@ Validator feedback to address (if any):
             ),
         ]
     )
-    reduce_llm = llm.bind(max_tokens=max(400, int(config.llm_reduce_max_tokens)))
-    reduce_chain = reduce_prompt | reduce_llm | StrOutputParser()
+    reduce_chain = reduce_prompt | llm | StrOutputParser()
     reduce_payload = {
         "feedback": feedback_block,
         "compressed_packet_summaries": "\n\n".join(partial_summaries),
@@ -2618,12 +2620,12 @@ def _run_llm_document_validator(llm, report_text: str, config: AgentConfig) -> d
 You validate SEO reports in one pass.
 Return strict JSON only.
 Schema:
-{
+{{
   "approved": true|false,
   "issues": [{"severity":"high|medium|low","message":"...","section":"..."}],
   "unsupported_claims": [{"claim":"...","why":"...","section":"..."}],
   "feedback_for_rewrite": ["..."]
-}
+}}
 
 Validation checklist:
 - Unsupported numeric/date/entity claims.
@@ -2645,8 +2647,7 @@ Decision rule:
         ]
     )
     parser = StrOutputParser()
-    validator_llm = llm.bind(max_tokens=max(300, int(config.llm_validator_max_tokens)))
-    chain = validator_prompt | validator_llm | parser
+    chain = validator_prompt | llm | parser
     cache_key_payload = json.dumps(
         {
             "model": config.gaia_model,
@@ -3976,7 +3977,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                     "key": row.key,
                     "delta_vs_previous": row.click_delta_vs_previous,
                     "delta_vs_yoy": row.click_delta_vs_yoy,
-                    "current_clicks": row.current.clicks,
+                    "current_clicks": row.current_clicks,
                 }
                 for row in long_analysis.top_winners[:10]
             ],
@@ -3985,7 +3986,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                     "key": row.key,
                     "delta_vs_previous": row.click_delta_vs_previous,
                     "delta_vs_yoy": row.click_delta_vs_yoy,
-                    "current_clicks": row.current.clicks,
+                    "current_clicks": row.current_clicks,
                 }
                 for row in long_analysis.top_losers[:10]
             ],

@@ -483,7 +483,7 @@ class AgentConfig:
             eval_gate_min_score=_env_int("EVAL_GATE_MIN_SCORE", 75),
             eval_gate_block_drive_upload=_env_bool("EVAL_GATE_BLOCK_DRIVE_UPLOAD", True),
             strict_llm_profile_enabled=_env_bool(
-                "WEEKLY_STRICT_LLM_PROFILE_ENABLED", True
+                "WEEKLY_STRICT_LLM_PROFILE_ENABLED", False
             ),
             startup_preflight_enabled=_env_bool("STARTUP_PREFLIGHT_ENABLED", True),
             startup_preflight_blocking_sources=tuple(
