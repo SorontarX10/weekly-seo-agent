@@ -1506,6 +1506,241 @@ def _confidence_bucket(value: int | float | None) -> str:
     return "Low"
 
 
+def _hypothesis_impact_score(row: dict[str, object]) -> int:
+    category = _normalize_text(str(row.get("category", "")))
+    if any(token in category for token in ("technical", "seo visibility", "algorithm", "page name", "demand mix")):
+        return 5
+    if any(token in category for token in ("campaign", "seasonality", "events", "non-brand", "competitive")):
+        return 4
+    if any(token in category for token in ("macro", "weather", "continuity", "internal")):
+        return 3
+    if any(token in category for token in ("data quality",)):
+        return 2
+    return 3
+
+
+def _hypothesis_controllability_score(row: dict[str, object]) -> int:
+    owner = _normalize_text(str(row.get("owner", "")))
+    category = _normalize_text(str(row.get("category", "")))
+    if any(token in owner for token in ("seo ops", "web performance", "seo + product")):
+        return 5
+    if any(token in category for token in ("technical", "page name", "execution continuity", "internal initiatives")):
+        return 4
+    if any(token in category for token in ("campaign", "demand mix", "non-brand", "events", "seasonality")):
+        return 3
+    if any(token in category for token in ("macro", "weather", "algorithm", "serp behavior")):
+        return 2
+    return 3
+
+
+def _apply_driver_priority_model(hypotheses: list[dict[str, object]]) -> list[dict[str, object]]:
+    for idx, row in enumerate(hypotheses):
+        if not isinstance(row, dict):
+            continue
+        confidence = int(row.get("confidence", 0) or 0)
+        impact = _hypothesis_impact_score(row)
+        controllability = _hypothesis_controllability_score(row)
+        score = int(round((impact / 5.0) * (controllability / 5.0) * (max(0, min(100, confidence)) / 100.0) * 100.0))
+        score = max(1, min(100, score))
+        row["impact_score"] = impact
+        row["controllability_score"] = controllability
+        row["driver_priority_score"] = score
+        row["priority_rank_hint"] = idx + 1
+    hypotheses.sort(
+        key=lambda row: (
+            1 if bool(row.get("supporting_context_only")) else 0,
+            -int(row.get("driver_priority_score", 0) or 0),
+            -int(row.get("confidence", 0) or 0),
+        )
+    )
+    return hypotheses
+
+
+def _top_hypotheses_for_actions(hypotheses: list[dict[str, object]], limit: int = 3) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for row in hypotheses:
+        if not isinstance(row, dict):
+            continue
+        if bool(row.get("supporting_context_only")):
+            continue
+        rows.append(row)
+    if not rows:
+        rows = [row for row in hypotheses if isinstance(row, dict)]
+    rows.sort(
+        key=lambda row: (
+            -int(row.get("driver_priority_score", 0) or 0),
+            -int(row.get("confidence", 0) or 0),
+        )
+    )
+    return rows[: max(1, limit)]
+
+
+def _uncertainty_action_template(confidence: int) -> str:
+    if confidence >= 80:
+        return "Likely driver; execute action now and verify with next-week checkpoint."
+    if confidence >= 65:
+        return "Plausible driver; validate before major escalation."
+    return "Low-certainty signal; monitor and collect more evidence before action."
+
+
+def _next_week_validation_plan_lines(hypotheses: list[dict[str, object]], limit: int = 3) -> list[str]:
+    rows = _top_hypotheses_for_actions(hypotheses, limit=limit)
+    lines: list[str] = []
+    for row in rows:
+        category = str(row.get("category", "Unknown")).strip() or "Unknown"
+        metric = str(row.get("validation_metric", "")).strip() or "segment-level KPI check"
+        date_label = str(row.get("validation_date", "")).strip() or (date.today() + timedelta(days=7)).isoformat()
+        owner = str(row.get("owner", "")).strip() or "SEO Team"
+        priority = int(row.get("driver_priority_score", 0) or 0)
+        confidence = int(row.get("confidence", 0) or 0)
+        lines.append(
+            f"- `{category}` [{priority}/100 priority; {_confidence_bucket(confidence)} confidence]: "
+            f"validate `{metric}` by {date_label} (owner: {owner})."
+        )
+    return lines[: max(1, limit)]
+
+
+def _counterfactual_check_lines(hypotheses: list[dict[str, object]], limit: int = 3) -> list[str]:
+    rows = _top_hypotheses_for_actions(hypotheses, limit=limit)
+    out: list[str] = []
+    for row in rows:
+        category = str(row.get("category", "Unknown")).strip() or "Unknown"
+        falsifier = str(row.get("falsifier", "")).strip() or "No falsifier provided."
+        out.append(f"- `{category}`: {falsifier}")
+    return out[: max(1, limit)]
+
+
+def _causality_guardrail_summary(hypotheses: list[dict[str, object]]) -> str:
+    if not hypotheses:
+        return ""
+    correlation_only = [
+        row for row in hypotheses if isinstance(row, dict) and str(row.get("causality_level", "")).strip() == "correlation-only"
+    ]
+    if not correlation_only:
+        return (
+            "Causality guardrail: top hypotheses are triangulated across primary KPI evidence and context signals; "
+            "continue validation before hard root-cause lock."
+        )
+    categories = ", ".join(
+        f"`{str(row.get('category', '')).strip()}`"
+        for row in correlation_only[:3]
+        if str(row.get("category", "")).strip()
+    )
+    return (
+        "Causality guardrail: correlation-only context cannot be treated as standalone root cause "
+        "or trigger technical escalation. "
+        + (f"Flagged: {categories}." if categories else "")
+    ).strip()
+
+
+def _contradiction_reconciliation_lines(
+    *,
+    totals: dict[str, MetricSummary],
+    segment_diagnostics: dict[str, list[dict[str, float | str]]] | None,
+    additional_context: dict[str, object] | None,
+) -> list[str]:
+    current = totals["current_28d"]
+    previous = totals["previous_28d"]
+    contradictions: list[str] = []
+
+    clicks_delta = float(current.clicks - previous.clicks)
+    impressions_delta = float(current.impressions - previous.impressions)
+    ctr_delta_pp = (float(current.ctr) - float(previous.ctr)) * 100.0
+    position_delta = float(current.position - previous.position)
+
+    template_rows = (segment_diagnostics or {}).get("page_template") or []
+    if isinstance(template_rows, list):
+        home_row = next(
+            (row for row in template_rows if str(row.get("segment", "")).strip().lower() == "home"),
+            None,
+        )
+        if isinstance(home_row, dict):
+            home_delta = float(home_row.get("delta_vs_previous", 0.0) or 0.0)
+            if clicks_delta > 0 and home_delta < 0:
+                contradictions.append(
+                    "Total clicks are up while `home` is down; reconcile as routing mix shift "
+                    "between templates/SERP features rather than a sitewide demand collapse."
+                )
+
+    brand_context = (additional_context or {}).get("google_trends_brand", {})
+    brand_summary = brand_context.get("summary", {}) if isinstance(brand_context, dict) else {}
+    brand_proxy = _brand_proxy_from_gsc(segment_diagnostics)
+    if isinstance(brand_summary, dict) and isinstance(brand_proxy, dict) and brand_context.get("enabled"):
+        trends_wow = float(brand_summary.get("delta_pct_vs_previous", 0.0) or 0.0)
+        brand_clicks_wow = float(brand_proxy.get("delta_pct_vs_previous", 0.0) or 0.0)
+        if trends_wow > 0.2 and brand_clicks_wow < -0.2:
+            contradictions.append(
+                "Brand interest is up in Google Trends but brand organic clicks are down in GSC; "
+                "reconcile as possible paid-overlap/SERP allocation shift before technical SEO diagnosis."
+            )
+
+    if clicks_delta < 0 and impressions_delta >= 0 and ctr_delta_pp < 0:
+        contradictions.append(
+            "Impressions are stable/up while clicks decline with weaker CTR; "
+            "reconcile as visibility-to-click efficiency issue (SERP mix/competition), not pure demand drop."
+        )
+    if clicks_delta < 0 and position_delta <= 0 and ctr_delta_pp < 0:
+        contradictions.append(
+            "Average position improved/stayed flat while clicks fell; "
+            "reconcile via SERP layout and feature-share shift rather than ranking-only explanation."
+        )
+    return contradictions[:3]
+
+
+def _technical_seo_escalation_gate(
+    *,
+    totals: dict[str, MetricSummary],
+    hypotheses: list[dict[str, object]],
+    contradiction_count: int = 0,
+) -> dict[str, object]:
+    current = totals["current_28d"]
+    previous = totals["previous_28d"]
+    wow_clicks_pct = _ratio_delta(current.clicks, previous.clicks)
+    ctr_wow_pp = (float(current.ctr) - float(previous.ctr)) * 100.0
+    pos_wow = float(current.position - previous.position)
+
+    technical_like = [
+        row
+        for row in hypotheses
+        if isinstance(row, dict)
+        and not bool(row.get("supporting_context_only"))
+        and any(
+            token in _normalize_text(str(row.get("category", "")))
+            for token in ("technical", "seo visibility", "algorithm", "page name")
+        )
+    ]
+    top_technical_conf = max((int(row.get("confidence", 0) or 0) for row in technical_like), default=0)
+
+    severe_efficiency_deterioration = wow_clicks_pct <= -0.08 and ctr_wow_pp <= -0.15 and pos_wow >= 0.15
+    moderate_efficiency_deterioration = wow_clicks_pct <= -0.04 and ctr_wow_pp <= -0.08 and pos_wow >= 0.05
+
+    if severe_efficiency_deterioration and top_technical_conf >= 70:
+        return {
+            "status": "Escalate now",
+            "reason": (
+                "Material WoW efficiency deterioration with high-confidence technical/algorithm hypothesis."
+            ),
+            "next_action": "Trigger technical SEO investigation in 24-48h (templates, indexing, internal linking, CWV).",
+        }
+    if severe_efficiency_deterioration or (moderate_efficiency_deterioration and top_technical_conf >= 65):
+        return {
+            "status": "Escalate if persists",
+            "reason": "Efficiency deterioration is visible but causality is not yet fully locked.",
+            "next_action": "Run one strict validation cycle next week; escalate immediately if deterioration persists.",
+        }
+    if contradiction_count > 0:
+        return {
+            "status": "Hold escalation",
+            "reason": "Mixed directional signals require reconciliation before technical escalation.",
+            "next_action": "Prioritize reconciliation checks (routing/SERP mix/paid overlap) in the next run.",
+        }
+    return {
+        "status": "No technical escalation",
+        "reason": "Current movement is better explained by demand/timing/allocation context.",
+        "next_action": "Continue monitoring with hypothesis validation plan; escalate only if efficiency weakens.",
+    }
+
+
 def _comparability_summary(
     additional_context: dict[str, object] | None,
     *,
@@ -2154,6 +2389,7 @@ def _build_evidence_ledger(
     windows: dict[str, DateWindow],
     external_signals: list[ExternalSignal],
     additional_context: dict[str, object] | None,
+    weather_summary: dict[str, float] | None = None,
     limit: int = 12,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
@@ -2243,7 +2479,103 @@ def _build_evidence_ledger(
                     ),
                 }
             )
+        market_events = additional_context.get("market_event_calendar", {})
+        if isinstance(market_events, dict) and market_events.get("enabled"):
+            rows.append(
+                {
+                    "id": f"E{len(rows) + 1}",
+                    "source": "Market event calendar",
+                    "date": str(market_events.get("country_code", "")).strip() or "-",
+                    "note": f"rows={len(market_events.get('events', []) if isinstance(market_events.get('events', []), list) else [])}",
+                }
+            )
+        trends = additional_context.get("product_trends", {})
+        if isinstance(trends, dict) and trends.get("enabled"):
+            rows.append(
+                {
+                    "id": f"E{len(rows) + 1}",
+                    "source": "Product trends sheets",
+                    "date": str(trends.get("horizon_days", 31)),
+                    "note": "YoY/current/upcoming non-brand trend context.",
+                }
+            )
+    if isinstance(weather_summary, dict):
+        rows.append(
+            {
+                "id": f"E{len(rows) + 1}",
+                "source": "Weather context",
+                "date": "-",
+                "note": (
+                    f"temp_diff={float(weather_summary.get('avg_temp_diff_c', 0.0) or 0.0):+.1f}C; "
+                    f"precip_change={float(weather_summary.get('precip_change_pct', 0.0) or 0.0):+.1f}%"
+                ),
+            }
+        )
     return rows[: max(1, limit)]
+
+
+def _pick_evidence_anchor_id(
+    evidence_ledger: list[dict[str, str]],
+    *,
+    source_tokens: tuple[str, ...],
+) -> str:
+    for row in evidence_ledger:
+        source = _normalize_text(str(row.get("source", "")))
+        note = _normalize_text(str(row.get("note", "")))
+        blob = f"{source} {note}".strip()
+        if any(token in blob for token in source_tokens):
+            return str(row.get("id", "")).strip()
+    return ""
+
+
+def _claim_evidence_completeness_rows(
+    *,
+    executive_lines: list[str],
+    narrative_lines: list[str],
+    evidence_ledger: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    candidates = [str(line).strip() for line in (executive_lines + narrative_lines) if str(line).strip()]
+    for line in candidates:
+        normalized = _normalize_text(line)
+        if any(token in normalized for token in ("what changed", "wow diagnosis", "yoy diagnosis", "facts observed")):
+            rows.append({"claim": line, "anchor_id": "E1", "status": "mapped"})
+            continue
+        if any(token in normalized for token in ("campaign", "trade-plan", "marketplace timeline", "weekly market storyline")):
+            anchor = _pick_evidence_anchor_id(
+                evidence_ledger,
+                source_tokens=("trade plan", "campaign tracker", "market event", "weekly seo/geo digest"),
+            )
+            rows.append({"claim": line, "anchor_id": anchor, "status": "mapped" if anchor else "missing"})
+            continue
+        if any(token in normalized for token in ("weather context", "weather timing hint", "forward 7d")):
+            anchor = _pick_evidence_anchor_id(evidence_ledger, source_tokens=("weather",))
+            rows.append({"claim": line, "anchor_id": anchor, "status": "mapped" if anchor else "missing"})
+            continue
+        if any(token in normalized for token in ("google updates timeline", "algorithm context")):
+            anchor = _pick_evidence_anchor_id(evidence_ledger, source_tokens=("google updates timeline", "google search status", "google search central"))
+            rows.append({"claim": line, "anchor_id": anchor, "status": "mapped" if anchor else "missing"})
+            continue
+        if any(token in normalized for token in ("case-study", "serp behavior context", "serp appearance")):
+            anchor = _pick_evidence_anchor_id(evidence_ledger, source_tokens=("serp case-study scanner", "google updates timeline"))
+            rows.append({"claim": line, "anchor_id": anchor, "status": "mapped" if anchor else "missing"})
+            continue
+        if any(token in normalized for token in ("brand demand", "brand search trend")):
+            rows.append({"claim": line, "anchor_id": "E1", "status": "mapped"})
+            continue
+    # De-duplicate by normalized claim text.
+    dedup: dict[str, dict[str, str]] = {}
+    for row in rows:
+        key = _normalize_text(str(row.get("claim", "")))
+        if not key:
+            continue
+        existing = dedup.get(key)
+        if existing is None:
+            dedup[key] = row
+            continue
+        if existing.get("status") != "mapped" and row.get("status") == "mapped":
+            dedup[key] = row
+    return list(dedup.values())[:12]
 
 
 def _governance_lines(
@@ -4472,6 +4804,17 @@ def _build_what_is_happening_lines(
             f"Evidence: {str(brand_ads_hyp.get('evidence', '')).strip()}. "
             f"Confidence: {_confidence_bucket(brand_ads_hyp.get('confidence', 0))}."
         )
+    contradiction_rows = _contradiction_reconciliation_lines(
+        totals=totals,
+        segment_diagnostics=segment_diagnostics,
+        additional_context=additional_context,
+    )
+    if contradiction_rows:
+        lines.append(
+            "Contradiction check: mixed directional signals were detected; each contradiction requires explicit reconciliation before escalation."
+        )
+        for row in contradiction_rows[:2]:
+            lines.append("Reconciliation: " + row)
 
     movement_direction = "up" if (current.clicks - previous.clicks) >= 0 else "down"
     causal_chain = (
@@ -4487,6 +4830,9 @@ def _build_what_is_happening_lines(
     if template_conf is not None:
         causal_chain += f" Confidence (template/routing): {_confidence_bucket(template_conf)}."
     lines.append(causal_chain)
+    causality_guardrail = _causality_guardrail_summary(hypotheses)
+    if causality_guardrail:
+        lines.append(causality_guardrail)
 
     causal_confidence = int(hypotheses[0].get("confidence", 65)) if hypotheses else 65
     conflict_flags: list[str] = []
@@ -5040,6 +5386,50 @@ def _build_what_is_happening_lines(
         ]
         lines.append("")
         lines.append("Top drivers this week: " + "; ".join(top_driver_bits) + ".")
+    top_action_hypotheses = _top_hypotheses_for_actions(hypotheses, limit=3)
+    if top_action_hypotheses:
+        priority_bits = []
+        for row in top_action_hypotheses:
+            category = str(row.get("category", "Unknown")).strip() or "Unknown"
+            priority = int(row.get("driver_priority_score", 0) or 0)
+            impact = int(row.get("impact_score", 0) or 0)
+            controllability = int(row.get("controllability_score", 0) or 0)
+            confidence = int(row.get("confidence", 0) or 0)
+            priority_bits.append(
+                f"`{category}`={priority}/100 (impact {impact}/5 x confidence {confidence}/100 x controllability {controllability}/5)"
+            )
+        if priority_bits:
+            lines.append(
+                "Driver priority model (impact x confidence x controllability): "
+                + "; ".join(priority_bits[:3])
+                + "."
+            )
+        lines.append("Uncertainty framing (actionable):")
+        for row in top_action_hypotheses[:3]:
+            category = str(row.get("category", "Unknown")).strip() or "Unknown"
+            confidence = int(row.get("confidence", 0) or 0)
+            lines.append(
+                f"- `{category}`: {_uncertainty_action_template(confidence)}"
+            )
+        validation_plan = _next_week_validation_plan_lines(hypotheses, limit=3)
+        if validation_plan:
+            lines.append("Validation plan (next week, top hypotheses):")
+            lines.extend(validation_plan[:3])
+        counterfactual_lines = _counterfactual_check_lines(hypotheses, limit=3)
+        if counterfactual_lines:
+            lines.append("Counterfactual checks (what would disprove top hypotheses?):")
+            lines.extend(counterfactual_lines[:3])
+    escalation_gate = _technical_seo_escalation_gate(
+        totals=totals,
+        hypotheses=hypotheses,
+        contradiction_count=len(contradiction_rows),
+    )
+    lines.append(
+        "Technical SEO escalation gate: "
+        f"{str(escalation_gate.get('status', '')).strip()} "
+        f"-> {str(escalation_gate.get('reason', '')).strip()} "
+        f"Next action: {str(escalation_gate.get('next_action', '')).strip()}"
+    )
 
     lines.append("")
     lines.append("**Reasoning ledger (facts -> hypotheses -> validation)**")
@@ -5069,12 +5459,9 @@ def _build_what_is_happening_lines(
         sanitized = [row for row in sanitized if row]
         if sanitized:
             lines.append("- Data gaps affecting certainty: " + "; ".join(sanitized[:2]) + ".")
-    lines.append(
-        "- Validation plan (next run): verify top 3 hypotheses against refreshed campaign timeline, brand-demand baseline, "
-        "and segment-level GSC deltas before escalating technical actions."
-    )
+    lines.append("- Escalation logic is applied only after validation checks and contradiction reconciliation.")
 
-    return _compact_manager_section(lines, max_lines=24)
+    return _compact_manager_section(lines, max_lines=40)
 
 
 def _focus_terms_from_query_scope(query_scope: AnalysisResult | None) -> list[str]:
@@ -5777,6 +6164,14 @@ def _build_reasoning_hypotheses(
             row.setdefault("falsifier", default_protocol["falsifier"])
             row.setdefault("validation_metric", default_protocol["validation_metric"])
         row.setdefault("validation_date", default_protocol["validation_date"])
+        evidence_count = len(row.get("evidence", [])) if isinstance(row.get("evidence"), list) else 0
+        if evidence_count >= 2 and not any(token in category for token in SUPPORTING_CONTEXT_CATEGORY_TOKENS):
+            row["causality_level"] = "triangulated"
+        else:
+            row["causality_level"] = "correlation-only"
+            row["causality_guardrail_note"] = (
+                "Use as contextual signal only; do not treat as standalone root cause."
+            )
         if any(token in category for token in SUPPORTING_CONTEXT_CATEGORY_TOKENS):
             row["supporting_context_only"] = True
             row["confidence"] = min(63, int(row.get("confidence", 0) or 0))
@@ -5785,13 +6180,7 @@ def _build_reasoning_hypotheses(
                 + " (supporting context only; not a primary fact)."
             ).strip()
 
-    hypotheses.sort(
-        key=lambda row: (
-            1 if bool(row.get("supporting_context_only")) else 0,
-            -int(row.get("confidence", 0) or 0),
-        )
-    )
-    return hypotheses
+    return _apply_driver_priority_model(hypotheses)
 
 
 def _build_integrated_reasoning(
@@ -5962,37 +6351,36 @@ def build_markdown_report(
     lines.append(f"# Weekly SEO Intelligence Report ({run_date.isoformat()} | {country_label})")
     lines.append("")
     lines.append("## Executive summary")
-    lines.extend(
-        _build_executive_summary_lines(
-            totals=totals,
-            scope_results=scope_results,
-            hypotheses=hypotheses,
-            external_signals=external_signals,
-            weather_summary=weather_summary,
-            segment_diagnostics=segment_diagnostics,
-            additional_context=additional_context,
-            senuto_summary=senuto_summary,
-            senuto_error=senuto_error,
-        )
+    executive_lines = _build_executive_summary_lines(
+        totals=totals,
+        scope_results=scope_results,
+        hypotheses=hypotheses,
+        external_signals=external_signals,
+        weather_summary=weather_summary,
+        segment_diagnostics=segment_diagnostics,
+        additional_context=additional_context,
+        senuto_summary=senuto_summary,
+        senuto_error=senuto_error,
     )
+    lines.extend(executive_lines)
     lines.append("")
     lines.append("## What is happening and why")
-    lines.extend(
-        _build_what_is_happening_lines(
-            totals=totals,
-            windows=windows,
-            scope_results=scope_results,
-            hypotheses=hypotheses,
-            external_signals=external_signals,
-            weather_summary=weather_summary,
-            segment_diagnostics=segment_diagnostics,
-            additional_context=additional_context,
-        )
+    narrative_lines = _build_what_is_happening_lines(
+        totals=totals,
+        windows=windows,
+        scope_results=scope_results,
+        hypotheses=hypotheses,
+        external_signals=external_signals,
+        weather_summary=weather_summary,
+        segment_diagnostics=segment_diagnostics,
+        additional_context=additional_context,
     )
+    lines.extend(narrative_lines)
     evidence_ledger = _build_evidence_ledger(
         windows=windows,
         external_signals=external_signals,
         additional_context=additional_context,
+        weather_summary=weather_summary,
         limit=12,
     )
     if evidence_ledger:
@@ -6001,12 +6389,39 @@ def build_markdown_report(
             lines.append("")
             lines.append(f"- Evidence anchors used in this report: {anchor_ids}.")
             lines.append("- Key claim mapping: KPI movement [E1]; external context and timeline claims use subsequent evidence IDs from the ledger.")
+    claim_evidence_rows = _claim_evidence_completeness_rows(
+        executive_lines=executive_lines,
+        narrative_lines=narrative_lines,
+        evidence_ledger=evidence_ledger,
+    )
+    if claim_evidence_rows:
+        mapped = sum(1 for row in claim_evidence_rows if str(row.get("status", "")).strip() == "mapped")
+        total_claims = len(claim_evidence_rows)
+        coverage_pct = (mapped / total_claims * 100.0) if total_claims else 0.0
+        lines.append("")
+        lines.append("## Evidence coverage check")
+        lines.append(
+            f"- Major-claim evidence coverage: {mapped}/{total_claims} ({coverage_pct:.0f}%) claims are mapped to evidence anchors."
+        )
+        if mapped < total_claims:
+            lines.append("- Unmapped claims are treated as hypotheses (not confirmed facts) until evidence mapping is available.")
+            missing = [row for row in claim_evidence_rows if str(row.get("status", "")).strip() != "mapped"]
+            for row in missing[:3]:
+                claim_text = _shorten(str(row.get("claim", "")).strip(), 140)
+                lines.append(f"- Evidence gap: `{claim_text}`")
+        lines.append("| Claim snippet | Evidence anchor | Status |")
+        lines.append("|---|---|---|")
+        for row in claim_evidence_rows[:6]:
+            claim_text = _shorten(str(row.get("claim", "")).strip(), 110)
+            anchor = str(row.get("anchor_id", "")).strip() or "-"
+            status = str(row.get("status", "")).strip() or "missing"
+            lines.append(f"| {claim_text} | {anchor} | {status} |")
 
     lines.append("")
     lines.append("## Hypothesis protocol")
     lines.append("- Protocol markers: falsifier | validation metric | validation date.")
-    lines.append("| Hypothesis | Confidence | Falsifier | Validation metric | Validation date |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| Hypothesis | Priority | Confidence | Falsifier | Validation metric | Validation date |")
+    lines.append("|---|---|---|---|---|---|")
     emitted = 0
     for row in hypotheses:
         if not isinstance(row, dict):
@@ -6014,20 +6429,61 @@ def build_markdown_report(
         category = str(row.get("category", "")).strip() or "Unknown"
         thesis = str(row.get("thesis", "")).strip()
         confidence = int(row.get("confidence", 0) or 0)
+        priority_score = int(row.get("driver_priority_score", 0) or 0)
         falsifier = str(row.get("falsifier", "")).strip() or "-"
         validation_metric = str(row.get("validation_metric", "")).strip() or "-"
         validation_date = str(row.get("validation_date", "")).strip() or "-"
         if not thesis:
             continue
         lines.append(
-            f"| {category}: {thesis} | {_confidence_bucket(confidence)} ({confidence}/100) | "
+            f"| {category}: {thesis} | {priority_score}/100 | {_confidence_bucket(confidence)} ({confidence}/100) | "
             f"{falsifier} | {validation_metric} | {validation_date} |"
         )
         emitted += 1
-        if emitted >= 2:
+        if emitted >= 3:
             break
     if emitted == 0:
-        lines.append("| (no tracked hypotheses) | - | - | - | - |")
+        lines.append("| (no tracked hypotheses) | - | - | - | - | - |")
+
+    lines.append("")
+    lines.append("## Validation plan (next week)")
+    validation_lines = _next_week_validation_plan_lines(hypotheses, limit=3)
+    if validation_lines:
+        lines.extend(validation_lines)
+    else:
+        lines.append("- No prioritized hypotheses available for next-week validation plan.")
+
+    lines.append("")
+    lines.append("## Counterfactual checks")
+    counterfactual_lines = _counterfactual_check_lines(hypotheses, limit=3)
+    if counterfactual_lines:
+        lines.extend(counterfactual_lines)
+    else:
+        lines.append("- Counterfactual checks unavailable (no active hypotheses).")
+
+    lines.append("")
+    lines.append("## Causality guardrail")
+    guardrail_summary = _causality_guardrail_summary(hypotheses)
+    lines.append("- " + (guardrail_summary or "Causality guardrail status unavailable."))
+
+    lines.append("")
+    lines.append("## Escalation rule")
+    contradiction_rows = _contradiction_reconciliation_lines(
+        totals=totals,
+        segment_diagnostics=segment_diagnostics,
+        additional_context=additional_context,
+    )
+    escalation_gate = _technical_seo_escalation_gate(
+        totals=totals,
+        hypotheses=hypotheses,
+        contradiction_count=len(contradiction_rows),
+    )
+    lines.append(
+        "- Technical SEO escalation gate: "
+        f"{str(escalation_gate.get('status', '')).strip()} | "
+        f"{str(escalation_gate.get('reason', '')).strip()} | "
+        f"Next action: {str(escalation_gate.get('next_action', '')).strip()}"
+    )
 
     lines.append("")
     lines.extend(

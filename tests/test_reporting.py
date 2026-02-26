@@ -1176,3 +1176,173 @@ def test_report_surfaces_marketplace_event_yoy_density_context():
 
     assert "Marketplace events YoY context:" in report
     assert "8 events now vs 5 YoY" in report
+
+
+def test_report_includes_reasoning_engine_sections_for_f_block():
+    run_date = date(2026, 2, 25)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=14_200_000, impressions=300_000_000, ctr=0.0472, position=6.27),
+        "previous_28d": MetricSummary(clicks=14_000_000, impressions=297_000_000, ctr=0.0470, position=6.29),
+        "yoy_52w": MetricSummary(clicks=15_900_000, impressions=315_000_000, ctr=0.0500, position=4.92),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    external_signals = [
+        ExternalSignal(
+            source="Google Search Status",
+            day=date(2026, 2, 20),
+            title="Search volatility update",
+            details="Update note",
+            severity="medium",
+        ),
+    ]
+    additional_context = {
+        "country_code": "PL",
+        "trade_plan": {
+            "enabled": True,
+            "campaign_rows": [
+                {
+                    "campaign": "MegaRaty February",
+                    "first_date": "2026-02-20",
+                    "last_date": "2026-02-24",
+                    "current_spend": 120.0,
+                }
+            ],
+        },
+        "product_trends": {
+            "enabled": True,
+            "top_rows": 5,
+            "horizon_days": 31,
+            "top_yoy_non_brand": [
+                {"trend": "wielkanoc dekoracje", "current_value": 1200.0, "previous_value": 600.0, "delta_value": 600.0},
+                {"trend": "smart week promocja", "current_value": 900.0, "previous_value": 1400.0, "delta_value": -500.0},
+            ],
+        },
+        "market_event_calendar": {
+            "enabled": True,
+            "events": [
+                {
+                    "date": "2026-02-21",
+                    "title": "Campaign event signal",
+                    "source": "example.com",
+                    "impact_level": "MEDIUM",
+                    "impact_direction": "Upside potential",
+                    "confidence": 60,
+                }
+            ],
+        },
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=external_signals,
+        weather_summary={"avg_temp_diff_c": -2.6, "precip_change_pct": 112.0},
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "## Evidence coverage check" in report
+    assert "## Validation plan (next week)" in report
+    assert "## Counterfactual checks" in report
+    assert "## Causality guardrail" in report
+    assert "## Escalation rule" in report
+    assert "| Hypothesis | Priority | Confidence | Falsifier | Validation metric | Validation date |" in report
+    assert "Technical SEO escalation gate:" in report
+
+
+def test_contradiction_check_adds_reconciliation_sentence():
+    run_date = date(2026, 2, 25)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=14_200_000, impressions=300_000_000, ctr=0.0472, position=6.27),
+        "previous_28d": MetricSummary(clicks=14_000_000, impressions=297_000_000, ctr=0.0470, position=6.29),
+        "yoy_52w": MetricSummary(clicks=15_900_000, impressions=315_000_000, ctr=0.0500, position=4.92),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    additional_context = {
+        "country_code": "PL",
+        "google_trends_brand": {
+            "enabled": True,
+            "summary": {"delta_pct_vs_previous": 1.2, "delta_pct_vs_yoy": -0.3},
+        },
+    }
+    segment_diagnostics = {
+        "page_template": [
+            {
+                "segment": "home",
+                "current_clicks": 2_460_000.0,
+                "previous_clicks": 2_520_000.0,
+                "yoy_clicks": 2_500_000.0,
+                "delta_vs_previous": -60_000.0,
+                "delta_pct_vs_previous": -0.0238,
+                "delta_vs_yoy": -40_000.0,
+                "delta_pct_vs_yoy": -0.016,
+            }
+        ],
+        "brand_non_brand": [
+            {
+                "segment": "brand",
+                "current_clicks": 2_600_000.0,
+                "previous_clicks": 2_700_000.0,
+                "yoy_clicks": 2_650_000.0,
+                "delta_vs_previous": -100_000.0,
+                "delta_pct_vs_previous": -0.037,
+                "delta_vs_yoy": -50_000.0,
+                "delta_pct_vs_yoy": -0.019,
+                "current_impressions": 3_300_000.0,
+                "previous_impressions": 3_350_000.0,
+                "yoy_impressions": 3_360_000.0,
+                "impressions_delta_vs_previous": -50_000.0,
+                "impressions_delta_pct_vs_previous": -0.015,
+                "impressions_delta_vs_yoy": -60_000.0,
+                "impressions_delta_pct_vs_yoy": -0.018,
+                "current_ctr": 0.7878,
+                "previous_ctr": 0.8060,
+                "yoy_ctr": 0.7890,
+            }
+        ],
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=[],
+        weather_summary={},
+        additional_context=additional_context,
+        segment_diagnostics=segment_diagnostics,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "Contradiction check:" in report
+    assert "Reconciliation:" in report
