@@ -4,7 +4,9 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 import json
+import platform
 import shutil
+import subprocess
 from datetime import date, timedelta
 from pathlib import Path
 import time
@@ -30,6 +32,7 @@ from weekly_seo_agent.weekly_reporting_agent.workflow import run_weekly_workflow
 
 QUALITY_MAX_GAIA_MODEL = "gpt-5.2"
 QUALITY_MAX_MIN_EVAL_SCORE = 88
+LLM_MODE_ENFORCED = True
 RUNTIME_SOURCE_TOGGLES: dict[str, str] = {
     "news": "news_scraping_enabled",
     "weather": "weather_context_enabled",
@@ -168,6 +171,28 @@ def _apply_runtime_toggles(
     if updated.strict_llm_profile_enabled:
         return _apply_weekly_quality_max_profile(updated)
     return updated
+
+
+def _enforce_llm_only_mode(config: AgentConfig) -> AgentConfig:
+    if not LLM_MODE_ENFORCED:
+        return config
+    return replace(
+        config,
+        use_llm_analysis=True,
+        use_llm_validator=True,
+    )
+
+
+def _assert_llm_runtime_ready(config: AgentConfig) -> None:
+    if not bool(config.use_llm_analysis):
+        raise SystemExit("LLM-only mode violation: use_llm_analysis must be enabled.")
+    if not bool(config.use_llm_validator):
+        raise SystemExit("LLM-only mode violation: use_llm_validator must be enabled.")
+    if not bool(config.gaia_llm_enabled):
+        raise SystemExit(
+            "LLM-only mode requires GAIA/OpenAI runtime configuration "
+            "(GAIA_ENDPOINT, GAIA_API_KEY, GAIA_API_VERSION, GAIA_MODEL)."
+        )
 
 
 def _run_merchant_center_health_check(
@@ -663,7 +688,7 @@ def _run_country_report(
     config: AgentConfig,
     country_code: str,
     output_dir_str: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     started = time.time()
     country_config, senuto_country_id, gsc_country_filter = _build_country_config(
         config, country_code
@@ -672,39 +697,111 @@ def _run_country_report(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     state = run_weekly_workflow(run_date, country_config)
+    llm_commentary = str(state.get("llm_commentary", "")).strip()
+    llm_failure_prefixes = (
+        "llm analysis disabled",
+        "llm analysis skipped",
+        "llm analysis failed",
+    )
+    if not llm_commentary or any(
+        llm_commentary.lower().startswith(prefix) for prefix in llm_failure_prefixes
+    ):
+        raise RuntimeError(
+            "LLM-only mode violation: workflow did not produce a valid LLM narrative."
+        )
+
     final_report = state.get("final_report") or state["markdown_report"]
     final_report = enforce_manager_quality_guardrail(final_report, max_words=1260)
     quality = evaluate_report_text(final_report)
     report_stem = f"{run_date.strftime('%Y_%m_%d')}_{country_code.lower()}_seo_weekly_report"
     docx_path = output_dir / f"{report_stem}.docx"
+    existed_before_write = docx_path.exists()
+    if existed_before_write:
+        docx_path.unlink()
     write_docx(
         docx_path,
         title=f"Weekly SEO Report {run_date.isoformat()} ({country_code})",
         content=final_report,
     )
+    additional_context = state.get("additional_context", {})
+    if not isinstance(additional_context, dict):
+        additional_context = {}
+    source_freshness = additional_context.get("source_freshness", [])
+    if not isinstance(source_freshness, list):
+        source_freshness = []
+    metric_window_availability = additional_context.get("metric_window_availability", {})
+    date_windows = {}
+    if isinstance(metric_window_availability, dict):
+        raw_windows = metric_window_availability.get("windows", {})
+        if isinstance(raw_windows, dict):
+            date_windows = raw_windows
+    source_warning_rows = []
+    for row in source_freshness:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status", "")).strip().lower()
+        if status in {"stale", "degraded"}:
+            source_warning_rows.append(
+                {
+                    "source": str(row.get("source", "")).strip(),
+                    "status": status,
+                    "note": str(row.get("note", "")).strip(),
+                }
+            )
+
+    source_status_counts: dict[str, int] = {}
+    for row in source_freshness:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status", "")).strip().lower() or "unknown"
+        source_status_counts[status] = source_status_counts.get(status, 0) + 1
+
+    ingestion_snapshot = additional_context.get("ingestion_snapshot", {})
+    ingestion_snapshot_path = ""
+    if isinstance(ingestion_snapshot, dict):
+        ingestion_snapshot_path = str(ingestion_snapshot.get("path", "")).strip()
+
+    llm_model_used = str(additional_context.get("gaia_model", "")).strip() or str(
+        country_config.gaia_model
+    ).strip()
+
     return {
         "country_code": country_code,
         "docx_path": str(docx_path),
         "gsc_country_filter": gsc_country_filter,
         "senuto_country_id": str(senuto_country_id),
+        "idempotency_key": f"{run_date.isoformat()}:{country_code}:weekly_seo_report",
+        "local_docx_overwritten": bool(existed_before_write),
         "quality_score": str(int(quality.get("score", 0) or 0)),
         "quality_passed": "true" if bool(quality.get("passed", False)) else "false",
         "quality_issues": json.dumps(quality.get("issues", []), ensure_ascii=False),
         "quality_metrics": json.dumps(quality.get("metrics", {}), ensure_ascii=False),
+        "llm_model": llm_model_used,
+        "llm_mode": "enforced",
+        "source_freshness": source_freshness,
+        "source_warning_rows": source_warning_rows,
+        "source_status_counts": source_status_counts,
+        "source_warning_count": len(source_warning_rows),
+        "date_windows": date_windows,
+        "ingestion_snapshot_path": ingestion_snapshot_path,
+        "drive_status": "pending",
+        "drive_verification": {},
+        "drive_doc_id": "",
+        "drive_doc_link": "",
         "runtime_sec": f"{(time.time() - started):.2f}",
     }
 
 
 def _apply_quality_gate(
-    run_results: list[dict[str, str]],
+    run_results: list[dict[str, Any]],
     *,
     gate_enabled: bool,
     min_score: int,
-) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     if not gate_enabled:
         return run_results, []
 
-    gated_runs: list[dict[str, str]] = []
+    gated_runs: list[dict[str, Any]] = []
     gate_failures: list[tuple[str, str]] = []
     for result in run_results:
         score = int(float(result.get("quality_score", "0") or 0.0))
@@ -725,7 +822,7 @@ def _apply_quality_gate(
 
 def _should_publish_to_drive(
     config: AgentConfig,
-    successful_runs: list[dict[str, str]],
+    successful_runs: list[dict[str, Any]],
     gate_failures: list[tuple[str, str]],
 ) -> bool:
     if not successful_runs:
@@ -737,6 +834,150 @@ def _should_publish_to_drive(
     # Strict acceptance policy: publish only when every generated report
     # passes the quality gate for the current batch.
     return not gate_failures
+
+
+def _git_value(args: list[str]) -> str:
+    try:
+        output = subprocess.check_output(args, stderr=subprocess.DEVNULL, text=True)
+        return output.strip()
+    except Exception:
+        return ""
+
+
+def _initial_country_status(country_codes: list[str]) -> dict[str, dict[str, Any]]:
+    return {
+        code: {
+            "country_code": code,
+            "generation_status": "pending",
+            "quality_gate_status": "pending",
+            "drive_status": "pending",
+            "final_status": "pending",
+            "quality_score": 0,
+            "quality_passed": False,
+            "runtime_sec": 0.0,
+            "error": "",
+            "warnings": [],
+        }
+        for code in country_codes
+    }
+
+
+def _print_country_status_summary(country_status: dict[str, dict[str, Any]]) -> None:
+    print("Per-country run status:")
+    for country_code in sorted(country_status.keys()):
+        row = country_status[country_code]
+        print(
+            f"- {country_code}: "
+            f"generation={row.get('generation_status')} | "
+            f"gate={row.get('quality_gate_status')} | "
+            f"drive={row.get('drive_status')} | "
+            f"final={row.get('final_status')} | "
+            f"quality={row.get('quality_score', 0)}/100 | "
+            f"runtime={row.get('runtime_sec', 0.0)}s"
+        )
+        if str(row.get("error", "")).strip():
+            print(f"  error: {row.get('error')}")
+        warnings = row.get("warnings", [])
+        if isinstance(warnings, list):
+            for warning in warnings[:5]:
+                if str(warning).strip():
+                    print(f"  warning: {warning}")
+
+
+def _post_run_notification(country_status: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    rows = list(country_status.values())
+    total = len(rows)
+    success = sum(
+        1
+        for row in rows
+        if str(row.get("final_status", "")).strip().lower()
+        in {"success", "success_local_only"}
+    )
+    failed = total - success
+    uploaded = sum(1 for row in rows if row.get("drive_status") == "uploaded")
+    gated = sum(1 for row in rows if row.get("quality_gate_status") == "failed")
+    scores = [
+        int(float(row.get("quality_score", 0) or 0))
+        for row in rows
+        if row.get("generation_status") == "success"
+    ]
+    avg_quality = round(sum(scores) / len(scores), 2) if scores else 0.0
+    min_quality = min(scores) if scores else 0
+    max_quality = max(scores) if scores else 0
+    return {
+        "total_countries": total,
+        "success_count": success,
+        "failed_count": failed,
+        "uploaded_count": uploaded,
+        "gate_failed_count": gated,
+        "avg_quality_score": avg_quality,
+        "min_quality_score": min_quality,
+        "max_quality_score": max_quality,
+    }
+
+
+def _build_run_manifest(
+    *,
+    run_date: date,
+    run_started_at: float,
+    run_finished_at: float,
+    config: AgentConfig,
+    country_codes: list[str],
+    country_status: dict[str, dict[str, Any]],
+    gate_failures: list[tuple[str, str]],
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    for _, message in gate_failures:
+        warnings.append(message)
+    for row in country_status.values():
+        error = str(row.get("error", "")).strip()
+        if error:
+            warnings.append(f"{row.get('country_code')}: {error}")
+        row_warnings = row.get("warnings", [])
+        if isinstance(row_warnings, list):
+            for item in row_warnings:
+                text = str(item).strip()
+                if text:
+                    warnings.append(f"{row.get('country_code')}: {text}")
+
+    runtime_summary = _post_run_notification(country_status)
+    return {
+        "schema_version": "weekly_run_manifest_v1",
+        "run_date": run_date.isoformat(),
+        "run_started_at": run_started_at,
+        "run_finished_at": run_finished_at,
+        "duration_sec": round(max(0.0, run_finished_at - run_started_at), 3),
+        "llm_mode": {
+            "enforced": bool(LLM_MODE_ENFORCED),
+            "analysis_enabled": bool(config.use_llm_analysis),
+            "validator_enabled": bool(config.use_llm_validator),
+            "model": str(config.gaia_model),
+            "strict_profile_enabled": bool(config.strict_llm_profile_enabled),
+        },
+        "runtime": {
+            "python_version": platform.python_version(),
+            "platform": platform.platform(),
+            "git_commit": _git_value(["git", "rev-parse", "HEAD"]),
+            "git_branch": _git_value(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
+        },
+        "countries_requested": list(country_codes),
+        "countries": [country_status[code] for code in sorted(country_status.keys())],
+        "summary": runtime_summary,
+        "warnings": warnings,
+    }
+
+
+def _write_run_manifest(output_dir: Path, run_date: date, manifest: dict[str, Any]) -> Path:
+    telemetry_dir = output_dir / "_telemetry"
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = (
+        telemetry_dir / f"{run_date.strftime('%Y_%m_%d')}_weekly_reporting_run_manifest.json"
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return manifest_path
 
 
 def main() -> None:
@@ -755,6 +996,8 @@ def main() -> None:
         enable_sources=list(args.enable_source or []),
         disable_sources=list(args.disable_source or []),
     )
+    config = _enforce_llm_only_mode(config)
+    _assert_llm_runtime_ready(config)
 
     if not config.gsc_enabled:
         raise SystemExit(
@@ -788,8 +1031,10 @@ def main() -> None:
         )
 
     failed_countries: list[tuple[str, str]] = []
-    successful_runs: list[dict[str, str]] = []
-    telemetry_rows: list[dict[str, str]] = []
+    successful_runs: list[dict[str, Any]] = []
+    country_status = _initial_country_status(country_codes)
+    run_started_at = time.time()
+    gate_failures: list[tuple[str, str]] = []
     max_workers = max(1, min(len(country_codes), 4))
     force_serial = len(country_codes) == 1
     mode_label = "serial" if force_serial else "parallel"
@@ -807,7 +1052,27 @@ def main() -> None:
                 output_dir_str=str(output_dir),
             )
             successful_runs.append(result)
-            telemetry_rows.append(result)
+            country_status[country_code].update(
+                {
+                    "generation_status": "success",
+                    "quality_score": int(float(result.get("quality_score", "0") or 0.0)),
+                    "quality_passed": str(result.get("quality_passed", "")).lower() == "true",
+                    "runtime_sec": float(result.get("runtime_sec", "0.0") or 0.0),
+                    "warnings": [
+                        str(item.get("note", "")).strip()
+                        for item in (result.get("source_warning_rows", []) or [])
+                        if isinstance(item, dict) and str(item.get("note", "")).strip()
+                    ],
+                    "docx_path": str(result.get("docx_path", "")),
+                    "llm_model": str(result.get("llm_model", "")),
+                    "date_windows": result.get("date_windows", {}),
+                    "source_status_counts": result.get("source_status_counts", {}),
+                    "source_freshness": result.get("source_freshness", []),
+                    "idempotency_key": str(result.get("idempotency_key", "")),
+                    "local_docx_overwritten": bool(result.get("local_docx_overwritten", False)),
+                    "ingestion_snapshot_path": str(result.get("ingestion_snapshot_path", "")),
+                }
+            )
             print(
                 "Report generated: "
                 f"{result['docx_path']} | country={result['country_code']} | "
@@ -816,6 +1081,15 @@ def main() -> None:
             )
         except Exception as exc:
             failed_countries.append((country_code, str(exc)))
+            country_status[country_code].update(
+                {
+                    "generation_status": "failed",
+                    "quality_gate_status": "failed",
+                    "drive_status": "skipped",
+                    "final_status": "failed",
+                    "error": str(exc),
+                }
+            )
             print(f"Country run failed: {country_code} | {exc}")
     else:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -834,7 +1108,35 @@ def main() -> None:
                 try:
                     result = future.result()
                     successful_runs.append(result)
-                    telemetry_rows.append(result)
+                    country_status[country_code].update(
+                        {
+                            "generation_status": "success",
+                            "quality_score": int(
+                                float(result.get("quality_score", "0") or 0.0)
+                            ),
+                            "quality_passed": str(result.get("quality_passed", "")).lower()
+                            == "true",
+                            "runtime_sec": float(result.get("runtime_sec", "0.0") or 0.0),
+                            "warnings": [
+                                str(item.get("note", "")).strip()
+                                for item in (result.get("source_warning_rows", []) or [])
+                                if isinstance(item, dict)
+                                and str(item.get("note", "")).strip()
+                            ],
+                            "docx_path": str(result.get("docx_path", "")),
+                            "llm_model": str(result.get("llm_model", "")),
+                            "date_windows": result.get("date_windows", {}),
+                            "source_status_counts": result.get("source_status_counts", {}),
+                            "source_freshness": result.get("source_freshness", []),
+                            "idempotency_key": str(result.get("idempotency_key", "")),
+                            "local_docx_overwritten": bool(
+                                result.get("local_docx_overwritten", False)
+                            ),
+                            "ingestion_snapshot_path": str(
+                                result.get("ingestion_snapshot_path", "")
+                            ),
+                        }
+                    )
                     print(
                         "Report generated: "
                         f"{result['docx_path']} | country={result['country_code']} | "
@@ -843,6 +1145,15 @@ def main() -> None:
                     )
                 except Exception as exc:
                     failed_countries.append((country_code, str(exc)))
+                    country_status[country_code].update(
+                        {
+                            "generation_status": "failed",
+                            "quality_gate_status": "failed",
+                            "drive_status": "skipped",
+                            "final_status": "failed",
+                            "error": str(exc),
+                        }
+                    )
                     print(f"Country run failed: {country_code} | {exc}")
 
     successful_runs, gate_failures = _apply_quality_gate(
@@ -853,23 +1164,88 @@ def main() -> None:
     if gate_failures:
         failed_countries.extend(gate_failures)
 
+    gate_failure_by_country = {code: message for code, message in gate_failures}
+    passed_country_codes = {
+        str(result.get("country_code", "")).strip().upper()
+        for result in successful_runs
+        if str(result.get("country_code", "")).strip()
+    }
+    for country_code, status_row in country_status.items():
+        if status_row.get("generation_status") != "success":
+            continue
+        if country_code in passed_country_codes:
+            status_row["quality_gate_status"] = "passed"
+        else:
+            status_row["quality_gate_status"] = "failed"
+            status_row["drive_status"] = "skipped"
+            status_row["final_status"] = "failed"
+            gate_message = gate_failure_by_country.get(country_code, "")
+            if gate_message:
+                status_row["error"] = gate_message
+                status_row.setdefault("warnings", []).append("Quality gate failed.")
+
     if drive_client is not None and _should_publish_to_drive(
         config, successful_runs, gate_failures
     ):
         drive_upload_errors: list[str] = []
         for result in successful_runs:
-            docx_path = Path(result["docx_path"])
+            country_code = str(result.get("country_code", "")).strip().upper() or "UNKNOWN"
+            docx_path = Path(str(result.get("docx_path", "")))
             try:
                 uploaded = drive_client.upload_docx_as_google_doc(docx_path)
+                verification = uploaded.get("verification", {})
+                if not isinstance(verification, dict):
+                    verification = {}
+                if not bool(verification.get("exists", False)):
+                    raise RuntimeError("Drive verification failed: file not found after upload.")
+                verified_name = str(verification.get("name", "")).strip()
+                verified_folder = str(verification.get("folder_id", "")).strip()
+                verified_at = str(verification.get("verified_at", "")).strip()
+                if verified_name != docx_path.stem:
+                    raise RuntimeError(
+                        f"Drive verification failed: title mismatch ({verified_name} != {docx_path.stem})."
+                    )
+                if not verified_folder:
+                    raise RuntimeError("Drive verification failed: folder id missing.")
+                if not verified_at:
+                    raise RuntimeError("Drive verification failed: verified timestamp missing.")
+                result["drive_status"] = "uploaded"
+                result["drive_doc_id"] = str(uploaded.get("id", "")).strip()
+                result["drive_doc_link"] = str(uploaded.get("webViewLink", "")).strip()
+                result["drive_verification"] = verification
+                result["drive_replaced_docs_count"] = int(
+                    uploaded.get("replaced_docs_count", 0) or 0
+                )
+                country_status[country_code].update(
+                    {
+                        "drive_status": "uploaded",
+                        "drive_doc_id": result.get("drive_doc_id", ""),
+                        "drive_doc_link": result.get("drive_doc_link", ""),
+                        "drive_replaced_docs_count": result.get(
+                            "drive_replaced_docs_count", 0
+                        ),
+                        "drive_verification": verification,
+                        "final_status": "success",
+                    }
+                )
                 print(
-                    "Google Doc created: "
-                    f"{uploaded.get('name')} | {uploaded.get('webViewLink', 'no-link')}"
+                    "Google Doc verified: "
+                    f"{uploaded.get('name')} | {uploaded.get('webViewLink', 'no-link')} | "
+                    f"folder={verified_folder} | verified_at={verified_at}"
                 )
             except Exception as exc:
-                message = (
-                    f"{result.get('country_code', 'unknown')}: {exc}"
-                )
+                message = f"{country_code}: {exc}"
                 drive_upload_errors.append(message)
+                failed_countries.append((country_code, f"Drive upload failed: {exc}"))
+                result["drive_status"] = "failed"
+                result["drive_verification"] = {}
+                country_status[country_code].update(
+                    {
+                        "drive_status": "failed",
+                        "final_status": "failed",
+                        "error": f"Drive upload failed: {exc}",
+                    }
+                )
                 print(f"Google Drive upload failed: {message}")
         if drive_upload_errors:
             print("Google Drive upload completed with errors (local DOCX reports are still generated):")
@@ -880,23 +1256,77 @@ def main() -> None:
             "Google Drive upload skipped: at least one country failed the quality gate "
             "and eval_gate_block_drive_upload=true."
         )
+        for result in successful_runs:
+            country_code = str(result.get("country_code", "")).strip().upper()
+            if country_code and country_code in country_status:
+                country_status[country_code]["drive_status"] = "skipped_batch_gate"
+                country_status[country_code]["final_status"] = "held_by_batch_gate"
+                country_status[country_code].setdefault("warnings", []).append(
+                    "Drive upload skipped due to batch-level quality gate policy."
+                )
+    elif drive_client is None:
+        for country_code in passed_country_codes:
+            if country_code in country_status:
+                country_status[country_code]["drive_status"] = "disabled"
+                country_status[country_code]["final_status"] = "success_local_only"
+                country_status[country_code].setdefault("warnings", []).append(
+                    "Google Drive upload disabled; local DOCX output only."
+                )
 
-    if config.telemetry_enabled and telemetry_rows:
+    run_finished_at = time.time()
+    manifest = _build_run_manifest(
+        run_date=run_date,
+        run_started_at=run_started_at,
+        run_finished_at=run_finished_at,
+        config=config,
+        country_codes=country_codes,
+        country_status=country_status,
+        gate_failures=gate_failures,
+    )
+    manifest_path = _write_run_manifest(output_dir, run_date, manifest)
+    print(f"Run manifest written: {manifest_path}")
+
+    _print_country_status_summary(country_status)
+    post_run_summary = _post_run_notification(country_status)
+    print(
+        "Post-run summary: "
+        f"success={post_run_summary['success_count']}/{post_run_summary['total_countries']} | "
+        f"failed={post_run_summary['failed_count']} | "
+        f"uploaded={post_run_summary['uploaded_count']} | "
+        f"gate_failed={post_run_summary['gate_failed_count']} | "
+        f"quality(avg/min/max)={post_run_summary['avg_quality_score']}/"
+        f"{post_run_summary['min_quality_score']}/{post_run_summary['max_quality_score']}"
+    )
+
+    if config.telemetry_enabled and country_status:
         telemetry_dir = output_dir / "_telemetry"
         telemetry_dir.mkdir(parents=True, exist_ok=True)
-        telemetry_path = telemetry_dir / f"{run_date.strftime('%Y_%m_%d')}_weekly_reporting_observability.jsonl"
+        telemetry_path = (
+            telemetry_dir
+            / f"{run_date.strftime('%Y_%m_%d')}_weekly_reporting_observability.jsonl"
+        )
         with telemetry_path.open("w", encoding="utf-8") as handle:
-            for row in telemetry_rows:
+            for code in sorted(country_status.keys()):
+                row = country_status[code]
                 handle.write(
                     json.dumps(
                         {
                             "country_code": row.get("country_code", ""),
+                            "generation_status": row.get("generation_status", ""),
+                            "quality_gate_status": row.get("quality_gate_status", ""),
+                            "drive_status": row.get("drive_status", ""),
+                            "final_status": row.get("final_status", ""),
+                            "quality_score": int(float(row.get("quality_score", 0) or 0.0)),
+                            "quality_passed": bool(row.get("quality_passed", False)),
+                            "runtime_sec": float(row.get("runtime_sec", 0.0) or 0.0),
                             "docx_path": row.get("docx_path", ""),
-                            "quality_score": int(float(row.get("quality_score", "0") or 0.0)),
-                            "quality_passed": str(row.get("quality_passed", "")).lower() == "true",
-                            "runtime_sec": float(row.get("runtime_sec", "0.0") or 0.0),
-                            "quality_issues": json.loads(str(row.get("quality_issues", "[]") or "[]")),
-                            "quality_metrics": json.loads(str(row.get("quality_metrics", "{}") or "{}")),
+                            "idempotency_key": row.get("idempotency_key", ""),
+                            "local_docx_overwritten": bool(
+                                row.get("local_docx_overwritten", False)
+                            ),
+                            "source_status_counts": row.get("source_status_counts", {}),
+                            "warnings": row.get("warnings", []),
+                            "error": row.get("error", ""),
                             "timestamp": time.time(),
                         },
                         ensure_ascii=False,
@@ -907,8 +1337,8 @@ def main() -> None:
 
     if not successful_runs:
         raise SystemExit(
-            "Run failed: no country report was generated. "
-            "Check credentials/secrets and country-level errors above."
+            "Run failed: no country report passed generation + quality gate. "
+            "Check per-country status summary above."
         )
 
     if failed_countries:

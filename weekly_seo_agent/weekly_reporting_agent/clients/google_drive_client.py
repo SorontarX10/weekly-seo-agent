@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import time
@@ -141,7 +142,7 @@ class GoogleDriveClient:
             raise RuntimeError("Failed to create Google Drive folder.")
         return folder_id
 
-    def _delete_existing_docs(self, folder_id: str, doc_name: str) -> None:
+    def _delete_existing_docs(self, folder_id: str, doc_name: str) -> int:
         service = self._get_service()
         escaped = self._escape_query_value(doc_name)
         query = (
@@ -154,11 +155,59 @@ class GoogleDriveClient:
             .execute()
         )
         files = response.get("files", [])
+        deleted_count = 0
         for file_row in files:
             file_id = str(file_row.get("id", "")).strip()
             if not file_id:
                 continue
             service.files().delete(fileId=file_id).execute()
+            deleted_count += 1
+        return deleted_count
+
+    def _verify_uploaded_doc(
+        self,
+        *,
+        file_id: str,
+        expected_name: str,
+        expected_folder_id: str,
+    ) -> dict:
+        service = self._get_service()
+        metadata = (
+            service.files()
+            .get(
+                fileId=file_id,
+                fields="id,name,parents,trashed,createdTime,modifiedTime,webViewLink",
+            )
+            .execute()
+        )
+        resolved_name = str(metadata.get("name", "")).strip()
+        parents = metadata.get("parents", [])
+        parent_ids = [str(item).strip() for item in parents if str(item).strip()]
+        is_trashed = bool(metadata.get("trashed", False))
+
+        if is_trashed:
+            raise RuntimeError(f"Uploaded Google Doc is trashed: {file_id}")
+        if expected_name and resolved_name != expected_name:
+            raise RuntimeError(
+                "Uploaded Google Doc title mismatch: "
+                f"expected '{expected_name}' got '{resolved_name}'."
+            )
+        if expected_folder_id and expected_folder_id not in parent_ids:
+            raise RuntimeError(
+                "Uploaded Google Doc folder mismatch: "
+                f"expected parent '{expected_folder_id}', got '{parent_ids}'."
+            )
+        return {
+            "exists": True,
+            "id": file_id,
+            "name": resolved_name,
+            "folder_id": expected_folder_id,
+            "parents": parent_ids,
+            "created_time": str(metadata.get("createdTime", "")).strip(),
+            "modified_time": str(metadata.get("modifiedTime", "")).strip(),
+            "web_view_link": str(metadata.get("webViewLink", "")).strip(),
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     def upload_docx_as_google_doc(self, local_docx_path: Path) -> dict:
         if not local_docx_path.exists():
@@ -168,7 +217,7 @@ class GoogleDriveClient:
         doc_name = local_docx_path.stem
         service = self._get_service()
 
-        self._delete_existing_docs(folder_id=folder_id, doc_name=doc_name)
+        replaced_docs = self._delete_existing_docs(folder_id=folder_id, doc_name=doc_name)
 
         media = MediaFileUpload(
             str(local_docx_path),
@@ -229,6 +278,15 @@ class GoogleDriveClient:
                 raise last_error
             raise RuntimeError("Failed to upload/convert DOCX to Google Docs.")
 
-        if not created.get("id"):
+        created_id = str(created.get("id", "")).strip()
+        if not created_id:
             raise RuntimeError("Failed to upload/convert DOCX to Google Docs.")
+        verification = self._verify_uploaded_doc(
+            file_id=created_id,
+            expected_name=doc_name,
+            expected_folder_id=folder_id,
+        )
+        created["folder_id"] = folder_id
+        created["replaced_docs_count"] = int(replaced_docs)
+        created["verification"] = verification
         return created

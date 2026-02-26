@@ -30,6 +30,8 @@ class _FakeFiles:
         self.created: list[tuple[dict, object, str | None]] = []
         self.deleted: list[str] = []
         self.queries: list[str] = []
+        self.last_doc_name: str = ""
+        self.last_doc_parent: str = ""
 
     def list(self, q=None, **kwargs):
         self.queries.append(q or "")
@@ -43,6 +45,10 @@ class _FakeFiles:
         self.created.append((body or {}, media_body, fields))
         if (body or {}).get("mimeType") == "application/vnd.google-apps.folder":
             return _FakeRequest({"id": "folder-123", "name": body.get("name")})
+        self.last_doc_name = str((body or {}).get("name", ""))
+        parents = (body or {}).get("parents") or []
+        if isinstance(parents, list) and parents:
+            self.last_doc_parent = str(parents[0])
         return _FakeRequest(
             {
                 "id": "doc-999",
@@ -55,6 +61,19 @@ class _FakeFiles:
         if fileId:
             self.deleted.append(fileId)
         return _FakeRequest({})
+
+    def get(self, fileId=None, fields=None):
+        return _FakeRequest(
+            {
+                "id": str(fileId or ""),
+                "name": self.last_doc_name or "doc",
+                "parents": [self.last_doc_parent or "folder-123"],
+                "trashed": False,
+                "createdTime": "2026-02-26T10:00:00Z",
+                "modifiedTime": "2026-02-26T10:00:05Z",
+                "webViewLink": "https://docs.google.com/document/d/doc-999/edit",
+            }
+        )
 
 
 class _FakeDriveService:
