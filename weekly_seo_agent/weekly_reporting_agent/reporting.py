@@ -192,6 +192,39 @@ TREND_EVENT_DRIVER_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Campaign periods", CAMPAIGN_EVENT_TOKENS),
 )
 
+TREND_SEASONAL_CALENDAR_TOKENS: tuple[str, ...] = (
+    "walentyn",
+    "valentin",
+    "wielkanoc",
+    "easter",
+    "pisank",
+    "zajac",
+    "swieconk",
+    "winter",
+    "sanki",
+    "snieg",
+    "lod",
+    "fajerwerk",
+    "petard",
+    "pellet",
+    "spring",
+    "wiosen",
+    "glebogryz",
+    "wertykulator",
+    "kosiark",
+    "ogrod",
+    "opony letnie",
+    "opona letnia",
+)
+
+TREND_EVENT_CAMPAIGN_TOKENS: tuple[str, ...] = CAMPAIGN_EVENT_TOKENS + (
+    "wosp",
+    "charity",
+    "licytac",
+    "event",
+    "campaign",
+)
+
 EXTERNAL_SIGNAL_SOURCE_QUALITY: tuple[tuple[str, str], ...] = (
     ("Google Search Status", "high"),
     ("Google Search Central Blog", "high"),
@@ -3168,6 +3201,131 @@ def _infer_trend_drivers(
     return drivers[:3]
 
 
+def _trend_demand_bucket(trend: str) -> str:
+    normalized = _normalize_text(trend)
+    if any(token in normalized for token in TREND_EVENT_CAMPAIGN_TOKENS):
+        return "Campaign/event-driven"
+    if any(token in normalized for token in TREND_SEASONAL_CALENDAR_TOKENS):
+        return "Seasonal/calendar-driven"
+    return "Evergreen/base-demand"
+
+
+def _trend_seasonality_decomposition(
+    *,
+    yoy_rows: list[dict[str, object]],
+    upcoming_rows: list[dict[str, object]],
+    horizon_days: int,
+) -> dict[str, str]:
+    if not yoy_rows:
+        return {}
+
+    bucket_weights: dict[str, float] = {
+        "Seasonal/calendar-driven": 0.0,
+        "Campaign/event-driven": 0.0,
+        "Evergreen/base-demand": 0.0,
+    }
+    bucket_examples: dict[str, list[tuple[str, float]]] = {
+        "Seasonal/calendar-driven": [],
+        "Campaign/event-driven": [],
+        "Evergreen/base-demand": [],
+    }
+
+    total_abs_delta = 0.0
+    net_delta = 0.0
+    for row in yoy_rows:
+        if not isinstance(row, dict):
+            continue
+        trend = str(row.get("trend", "")).strip()
+        if not trend:
+            continue
+        delta = float(_safe_float(row, "delta_value"))
+        weight = abs(delta)
+        if weight <= 0.0:
+            continue
+        bucket = _trend_demand_bucket(trend)
+        bucket_weights[bucket] = bucket_weights.get(bucket, 0.0) + weight
+        bucket_examples.setdefault(bucket, []).append((trend, weight))
+        total_abs_delta += weight
+        net_delta += delta
+
+    if total_abs_delta <= 0.0:
+        return {}
+
+    ranking = sorted(bucket_weights.items(), key=lambda item: item[1], reverse=True)
+    parts: list[str] = []
+    for bucket, weight in ranking:
+        if weight <= 0.0:
+            continue
+        share = (weight / total_abs_delta) * 100.0
+        examples_raw = sorted(
+            bucket_examples.get(bucket, []),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        examples = ", ".join(
+            f"`{name}`" for name, _ in examples_raw[:2] if str(name).strip()
+        )
+        if examples:
+            parts.append(f"{bucket} {share:.0f}% (e.g. {examples})")
+        else:
+            parts.append(f"{bucket} {share:.0f}%")
+
+    if not parts:
+        return {}
+
+    decomposition_line = (
+        "Seasonality decomposition (plain language): "
+        + "; ".join(parts)
+        + "."
+    )
+
+    top_bucket = ranking[0][0] if ranking else ""
+    top_share = (ranking[0][1] / total_abs_delta * 100.0) if ranking else 0.0
+    if top_bucket == "Seasonal/calendar-driven" and top_share >= 50.0:
+        plain_line = (
+            "Plain-language trend read: most YoY trend movement looks like calendar seasonality, "
+            "so this is primarily a demand-timing story rather than a technical SEO deterioration."
+        )
+    elif top_bucket == "Campaign/event-driven" and top_share >= 45.0:
+        plain_line = (
+            "Plain-language trend read: YoY trend movement is mainly campaign/event-driven, "
+            "so validate campaign overlap and paid pressure before technical SEO escalation."
+        )
+    else:
+        plain_line = (
+            "Plain-language trend read: YoY trend movement is mixed, with a meaningful evergreen component; "
+            "check assortment/content coverage together with timing effects."
+        )
+
+    delta_direction = "up" if net_delta >= 0 else "down"
+    plain_line += f" Net non-brand YoY trend direction is {delta_direction} ({_fmt_signed_compact(net_delta)})."
+
+    watchlist_line = ""
+    upcoming_candidates = [row for row in upcoming_rows if isinstance(row, dict)]
+    if upcoming_candidates:
+        seasonal_count = 0
+        event_count = 0
+        for row in upcoming_candidates[:8]:
+            trend_name = str(row.get("trend", "")).strip()
+            bucket = _trend_demand_bucket(trend_name)
+            if bucket == "Seasonal/calendar-driven":
+                seasonal_count += 1
+            elif bucket == "Campaign/event-driven":
+                event_count += 1
+        if seasonal_count > 0 or event_count > 0:
+            watchlist_line = (
+                f"Seasonality watchlist (next {horizon_days} days): "
+                f"{seasonal_count} seasonal/calendar and {event_count} campaign/event trend(s) in top upcoming signals, "
+                "so demand rotation can continue even if SEO efficiency stays stable."
+            )
+
+    return {
+        "seasonality_decomposition_line": decomposition_line,
+        "plain_language_line": plain_line,
+        "seasonality_watchlist_line": watchlist_line,
+    }
+
+
 def _build_product_trend_summary(
     scope_results: list[tuple[str, AnalysisResult]],
     external_signals: list[ExternalSignal],
@@ -3285,12 +3443,21 @@ def _build_product_trend_summary(
                 snippet_parts.append(f"likely drivers: {driver_names}")
         executive_line = "Product-trend summary: " + "; ".join(snippet_parts) + "."
 
+    decomposition = _trend_seasonality_decomposition(
+        yoy_rows=yoy_rows,
+        upcoming_rows=upcoming_rows,
+        horizon_days=horizon_days,
+    )
+
     return {
         "executive_line": executive_line,
         "yoy_line": yoy_line,
         "current_line": current_line,
         "upcoming_line": upcoming_line,
         "drivers_line": drivers_line,
+        "seasonality_decomposition_line": str(decomposition.get("seasonality_decomposition_line", "")).strip(),
+        "plain_language_line": str(decomposition.get("plain_language_line", "")).strip(),
+        "seasonality_watchlist_line": str(decomposition.get("seasonality_watchlist_line", "")).strip(),
     }
 
 
@@ -3399,7 +3566,15 @@ def _build_appendix_highlights_lines(
         external_signals=external_signals,
         additional_context=additional_context,
     )
-    for key in ("yoy_line", "current_line", "upcoming_line", "drivers_line"):
+    for key in (
+        "yoy_line",
+        "seasonality_decomposition_line",
+        "plain_language_line",
+        "seasonality_watchlist_line",
+        "current_line",
+        "upcoming_line",
+        "drivers_line",
+    ):
         text = trend_summary.get(key, "").strip()
         if text:
             lines.append(f"- {text}")
@@ -4188,6 +4363,19 @@ def _build_what_is_happening_lines(
             f"({non_brand_share:+.1f}% of total YoY click delta)."
         )
     lines.append(yoy_line.strip())
+
+    trend_summary = _build_product_trend_summary(
+        scope_results=scope_results,
+        external_signals=external_signals,
+        additional_context=additional_context,
+    )
+    trend_decomposition_line = str(trend_summary.get("seasonality_decomposition_line", "")).strip()
+    if trend_decomposition_line:
+        lines.append(trend_decomposition_line)
+    trend_plain_line = str(trend_summary.get("plain_language_line", "")).strip()
+    if trend_plain_line:
+        lines.append(trend_plain_line)
+
     brand_proxy = _brand_proxy_from_gsc(segment_diagnostics)
     if brand_enabled and brand_proxy:
         lines.append(

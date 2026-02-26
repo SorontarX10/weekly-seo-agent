@@ -311,6 +311,8 @@ def test_report_contains_reasoning_and_upcoming_trends(tmp_path):
     assert "Marketplace timeline (market events + promo calendar)" in report
     assert "Weekly market storyline on one timeline:" in report
     assert "Reasoning ledger (facts -> hypotheses -> validation)" in report
+    assert "Seasonality decomposition (plain language):" in report
+    assert "Plain-language trend read:" in report
     assert "## Appendix" not in report
     assert "## Date windows" not in report
     assert "### Market event calendar (API)" not in report
@@ -690,6 +692,67 @@ def test_daily_weather_hint_is_directional_non_causal_and_confidence_tagged():
     assert "non-causal" in report
     assert "confidence:" in report
     assert "/100" in report
+
+
+def test_report_includes_trend_yoy_seasonality_decomposition_in_plain_language():
+    run_date = date(2026, 2, 24)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=1_420_000, impressions=30_000_000, ctr=0.047, position=6.3),
+        "previous_28d": MetricSummary(clicks=1_390_000, impressions=29_500_000, ctr=0.047, position=6.2),
+        "yoy_52w": MetricSummary(clicks=1_590_000, impressions=31_500_000, ctr=0.05, position=4.9),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    additional_context = {
+        "country_code": "PL",
+        "product_trends": {
+            "enabled": True,
+            "top_rows": 8,
+            "horizon_days": 31,
+            "top_yoy_non_brand": [
+                {"trend": "prezent walentynki", "current_value": 1900.0, "previous_value": 1000.0, "delta_value": 900.0},
+                {"trend": "black friday promocja tv", "current_value": 300.0, "previous_value": 1000.0, "delta_value": -700.0},
+                {"trend": "buty do biegania", "current_value": 800.0, "previous_value": 500.0, "delta_value": 300.0},
+            ],
+            "upcoming_31d": [
+                {"date": "2026-03-01", "trend": "wielkanoc dekoracje", "value": 1200.0},
+                {"date": "2026-03-02", "trend": "megaraty smart week", "value": 900.0},
+            ],
+            "current_non_brand": [
+                {"date": "2026-02-24", "trend": "wiosenne ogrodnictwo", "value": 1400.0},
+            ],
+        },
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=[],
+        weather_summary={},
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "Seasonality decomposition (plain language):" in report
+    assert "Seasonal/calendar-driven" in report
+    assert "Campaign/event-driven" in report
+    assert "Evergreen/base-demand" in report
+    assert "Plain-language trend read:" in report
 
 
 def test_quality_guardrail_enforces_markers_and_compacts_optional_lines():
