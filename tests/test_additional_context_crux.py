@@ -1,5 +1,7 @@
 from datetime import date
 
+import requests
+
 from weekly_seo_agent.additional_context import (
     _fetch_campaign_tracker_signals,
     _fetch_market_event_calendar,
@@ -34,9 +36,26 @@ class _FakeResponse:
     def __init__(self, text: str = "", payload=None):
         self.text = text
         self._payload = payload
+        self.status_code = 200
+        self.headers: dict[str, str] = {}
 
     def raise_for_status(self) -> None:
         return None
+
+    def json(self):
+        return self._payload
+
+
+class _RetryResponse:
+    def __init__(self, status_code: int, payload=None, headers: dict[str, str] | None = None):
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = headers or {}
+        self.text = ""
+
+    def raise_for_status(self) -> None:
+        if int(self.status_code) >= 400:
+            raise requests.HTTPError(f"{self.status_code} error")
 
     def json(self):
         return self._payload
@@ -119,3 +138,35 @@ def test_fetch_market_event_calendar_parses_gdelt_rows(monkeypatch) -> None:
     assert rows
     assert any(row["event_type"] == "Campaign/Promotions" for row in rows)
     assert any(row["event_type"] == "Logistics/Delivery" for row in rows)
+
+
+def test_fetch_market_event_calendar_retries_on_429(monkeypatch) -> None:
+    payload = {
+        "articles": [
+            {
+                "title": "Allegro Days campaign starts in Poland",
+                "url": "https://example.com/allegro-days",
+                "domain": "example.com",
+                "seendate": "20260210T080000Z",
+            }
+        ]
+    }
+    attempts = {"count": 0}
+
+    def _mock_get(url: str, params=None, timeout: int = 35):
+        del url, params, timeout
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return _RetryResponse(status_code=429, payload={"articles": []}, headers={"Retry-After": "0"})
+        return _RetryResponse(status_code=200, payload=payload)
+
+    monkeypatch.setattr("weekly_seo_agent.additional_context.requests.get", _mock_get)
+    monkeypatch.setattr("weekly_seo_agent.additional_context.time.sleep", lambda _: None)
+    rows = _fetch_market_event_calendar(
+        country_code="PL",
+        since=date(2026, 2, 1),
+        until=date(2026, 2, 15),
+        top_rows=5,
+    )
+    assert attempts["count"] == 3
+    assert rows

@@ -1132,6 +1132,56 @@ def _gmv_impact_from_text(text: str) -> tuple[str, str, int, str]:
     return level, direction, confidence, reason
 
 
+def _request_gdelt_with_retry(
+    api_base_url: str,
+    *,
+    params: dict[str, Any],
+    timeout: int = 35,
+    max_attempts: int = 10,
+    base_sleep_sec: float = 2.0,
+    max_sleep_sec: float = 90.0,
+) -> dict[str, Any]:
+    """Fetch GDELT payload with aggressive retry for rate limits/timeouts."""
+    last_error: Exception | None = None
+    retryable_statuses = {429, 500, 502, 503, 504}
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(api_base_url, params=params, timeout=timeout)
+            status_code = int(getattr(response, "status_code", 200) or 200)
+            if status_code in retryable_statuses and attempt < max_attempts:
+                headers = getattr(response, "headers", {}) or {}
+                retry_after_raw = ""
+                if isinstance(headers, dict):
+                    retry_after_raw = str(headers.get("Retry-After", "")).strip()
+                retry_after_sec = 0.0
+                if retry_after_raw:
+                    try:
+                        retry_after_sec = max(0.0, float(retry_after_raw))
+                    except Exception:
+                        retry_after_sec = 0.0
+                sleep_sec = min(max_sleep_sec, base_sleep_sec * (2 ** (attempt - 1)))
+                sleep_sec = max(sleep_sec, retry_after_sec)
+                time.sleep(sleep_sec)
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                return payload
+            raise RuntimeError("Unexpected JSON payload from market-event API.")
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < max_attempts:
+                sleep_sec = min(max_sleep_sec, base_sleep_sec * (2 ** (attempt - 1)))
+                time.sleep(sleep_sec)
+                continue
+            break
+
+    raise RuntimeError(
+        f"GDELT request failed after {max_attempts} attempts: {last_error}"
+    )
+
+
 def _fetch_market_event_calendar(
     country_code: str,
     since: date,
@@ -1170,13 +1220,17 @@ def _fetch_market_event_calendar(
             "sort": "DateDesc",
             "maxrecords": str(max(top_rows * 6, 30)),
         }
-        response = requests.get(api_base_url, params=params, timeout=35)
-        response.raise_for_status()
         try:
-            payload = response.json()
-        except Exception:
-            snippet = response.text[:180].strip()
-            last_error = snippet or "Non-JSON response from market-event API."
+            payload = _request_gdelt_with_retry(
+                api_base_url=api_base_url,
+                params=params,
+                timeout=35,
+                max_attempts=10,
+                base_sleep_sec=2.0,
+                max_sleep_sec=90.0,
+            )
+        except Exception as exc:
+            last_error = str(exc).strip()
             continue
         if isinstance(payload, dict):
             rows_raw = payload.get("articles", [])
