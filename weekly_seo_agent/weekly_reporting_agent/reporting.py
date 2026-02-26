@@ -781,6 +781,321 @@ def _top_priority_actions(
     return out
 
 
+def _direction_marker(
+    delta: float,
+    *,
+    better_when_lower: bool = False,
+    tolerance: float = 0.0,
+) -> str:
+    if abs(float(delta)) <= float(tolerance):
+        return "FLAT"
+    is_positive = float(delta) > 0.0
+    is_good = (not better_when_lower and is_positive) or (better_when_lower and not is_positive)
+    return "UP" if is_good else "DOWN"
+
+
+def _format_marker_with_value(marker: str, value_text: str) -> str:
+    return f"{marker} {value_text}".strip()
+
+
+def _kpi_snapshot_table_lines(
+    *,
+    totals: dict[str, MetricSummary],
+    additional_context: dict[str, object] | None,
+) -> list[str]:
+    current = totals["current_28d"]
+    previous = totals["previous_28d"]
+    yoy = totals["yoy_52w"]
+    long_kpi = ((additional_context or {}).get("long_window_context", {}) or {}).get("kpi", {})
+    if not isinstance(long_kpi, dict):
+        long_kpi = {}
+
+    clicks_wow_pct = _ratio_delta(current.clicks, previous.clicks) * 100.0
+    clicks_yoy_pct = _ratio_delta(current.clicks, yoy.clicks) * 100.0
+    clicks_mom_pct = long_kpi.get("clicks_delta_pct_vs_previous")
+    clicks_mom_text = (
+        _format_marker_with_value(
+            _direction_marker(float(clicks_mom_pct), tolerance=0.15),
+            f"{float(clicks_mom_pct):+.2f}%",
+        )
+        if isinstance(clicks_mom_pct, (int, float))
+        else "n/a"
+    )
+
+    impressions_wow_pct = _ratio_delta(current.impressions, previous.impressions) * 100.0
+    impressions_yoy_pct = _ratio_delta(current.impressions, yoy.impressions) * 100.0
+    impressions_mom_pct = long_kpi.get("impressions_delta_pct_vs_previous")
+    impressions_mom_text = (
+        _format_marker_with_value(
+            _direction_marker(float(impressions_mom_pct), tolerance=0.15),
+            f"{float(impressions_mom_pct):+.2f}%",
+        )
+        if isinstance(impressions_mom_pct, (int, float))
+        else "n/a"
+    )
+
+    ctr_wow_pp = (current.ctr - previous.ctr) * 100.0
+    ctr_yoy_pp = (current.ctr - yoy.ctr) * 100.0
+    ctr_mom_pp = long_kpi.get("ctr_delta_pp_vs_previous")
+    ctr_mom_text = (
+        _format_marker_with_value(
+            _direction_marker(float(ctr_mom_pp), tolerance=0.02),
+            f"{float(ctr_mom_pp):+.2f} pp",
+        )
+        if isinstance(ctr_mom_pp, (int, float))
+        else "n/a"
+    )
+
+    position_wow = current.position - previous.position
+    position_yoy = current.position - yoy.position
+    position_mom = long_kpi.get("position_delta_vs_previous")
+    position_mom_text = (
+        _format_marker_with_value(
+            _direction_marker(float(position_mom), better_when_lower=True, tolerance=0.02),
+            f"{float(position_mom):+.2f}",
+        )
+        if isinstance(position_mom, (int, float))
+        else "n/a"
+    )
+
+    lines = [
+        "## KPI snapshot (WoW/MoM/YoY)",
+        "| KPI | WoW | MoM | YoY |",
+        "|---|---|---|---|",
+        "| Clicks | "
+        + _format_marker_with_value(_direction_marker(clicks_wow_pct, tolerance=0.15), f"{clicks_wow_pct:+.2f}%")
+        + " | "
+        + clicks_mom_text
+        + " | "
+        + _format_marker_with_value(_direction_marker(clicks_yoy_pct, tolerance=0.15), f"{clicks_yoy_pct:+.2f}%")
+        + " |",
+        "| Impressions | "
+        + _format_marker_with_value(_direction_marker(impressions_wow_pct, tolerance=0.15), f"{impressions_wow_pct:+.2f}%")
+        + " | "
+        + impressions_mom_text
+        + " | "
+        + _format_marker_with_value(_direction_marker(impressions_yoy_pct, tolerance=0.15), f"{impressions_yoy_pct:+.2f}%")
+        + " |",
+        "| CTR | "
+        + _format_marker_with_value(_direction_marker(ctr_wow_pp, tolerance=0.02), f"{ctr_wow_pp:+.2f} pp")
+        + " | "
+        + ctr_mom_text
+        + " | "
+        + _format_marker_with_value(_direction_marker(ctr_yoy_pp, tolerance=0.02), f"{ctr_yoy_pp:+.2f} pp")
+        + " |",
+        "| Avg position | "
+        + _format_marker_with_value(_direction_marker(position_wow, better_when_lower=True, tolerance=0.02), f"{position_wow:+.2f}")
+        + " | "
+        + position_mom_text
+        + " | "
+        + _format_marker_with_value(_direction_marker(position_yoy, better_when_lower=True, tolerance=0.02), f"{position_yoy:+.2f}")
+        + " |",
+    ]
+    return lines
+
+
+def _driver_scoreboard_lines(hypotheses: list[dict[str, object]], limit: int = 4) -> list[str]:
+    rows = _top_hypotheses_for_actions(hypotheses, limit=limit)
+    lines = [
+        "## Driver scoreboard",
+        "| Driver | Impact | Confidence | Action owner |",
+        "|---|---|---|---|",
+    ]
+    if not rows:
+        lines.append("| (no prioritized drivers) | - | - | SEO Team |")
+        return lines
+    for row in rows[: max(1, limit)]:
+        category = str(row.get("category", "Unknown")).strip() or "Unknown"
+        impact_score = int(row.get("impact_score", 0) or 0)
+        if impact_score >= 4:
+            impact_label = "High"
+        elif impact_score == 3:
+            impact_label = "Medium"
+        else:
+            impact_label = "Low"
+        confidence = int(row.get("confidence", 0) or 0)
+        owner = str(row.get("owner", "")).strip() or "SEO Team"
+        lines.append(
+            f"| {category} | {impact_label} ({impact_score}/5) | {_confidence_bucket(confidence)} ({confidence}/100) | {owner} |"
+        )
+    return lines
+
+
+def _meeting_ready_talking_points(
+    *,
+    totals: dict[str, MetricSummary],
+    hypotheses: list[dict[str, object]],
+) -> list[str]:
+    current = totals["current_28d"]
+    previous = totals["previous_28d"]
+    wow_clicks_pct = _ratio_delta(current.clicks, previous.clicks) * 100.0
+    top_rows = _top_hypotheses_for_actions(hypotheses, limit=2)
+    top_driver = str(top_rows[0].get("category", "Demand timing")).strip() if top_rows else "Demand timing"
+    second_driver = str(top_rows[1].get("category", "Campaign timing")).strip() if len(top_rows) > 1 else "Campaign timing"
+    primary_action = _top_priority_actions(hypotheses, limit=1)
+    action_text = primary_action[0] if primary_action else "SEO Team: Validate top driver on next run (SEO Team | next run)"
+    direction_text = "up" if wow_clicks_pct >= 0 else "down"
+    return [
+        "## Meeting-ready talking points",
+        f"- Start with: organic clicks are {direction_text} WoW ({wow_clicks_pct:+.2f}%), and this week is mainly a demand/mix story.",
+        f"- Main business risk: if `{top_driver}` persists without action, short-term traffic allocation can underperform in priority categories.",
+        f"- Main opportunity: `{second_driver}` is actionable now and can recover traffic share in the next cycle.",
+        "- Decision to align on: keep technical SEO escalation as step two unless efficiency weakens.",
+        f"- Confirm next step and owner: {action_text}.",
+    ]
+
+
+def _context_snapshot_lines(
+    *,
+    scope_results: list[tuple[str, AnalysisResult]],
+    external_signals: list[ExternalSignal],
+    weather_summary: dict[str, float],
+    additional_context: dict[str, object] | None,
+) -> list[str]:
+    lines: list[str] = ["## Context snapshot"]
+    query_scope = _find_scope(scope_results, "query")
+    campaign_context = _campaign_event_context(
+        external_signals=external_signals,
+        query_scope=query_scope,
+    )
+    country_hint = str((additional_context or {}).get("country_code", "")).strip().upper() or "PL"
+    timeline_rows = _marketplace_timeline_rows(
+        additional_context=additional_context,
+        campaign_context=campaign_context,
+        report_country_code=country_hint,
+        max_rows=20,
+    )
+    if timeline_rows:
+        first_day = timeline_rows[0].get("day")
+        last_day = timeline_rows[-1].get("day")
+        if isinstance(first_day, date) and isinstance(last_day, date):
+            lines.append(
+                "- **Marketplace timeline (market events + promo calendar)**: "
+                f"{_fmt_int(len(timeline_rows))} events on one axis "
+                f"({first_day.isoformat()} to {last_day.isoformat()}) for {country_hint}."
+            )
+
+    serp_split_line = _serp_appearance_summary_text(additional_context)
+    if serp_split_line:
+        lines.append("- **SERP appearance mix (WoW/MoM/YoY)**: " + serp_split_line.replace("SERP appearance split (GSC searchAppearance): ", ""))
+    daily_serp_line = _daily_serp_feature_shift_line(additional_context)
+    if daily_serp_line:
+        lines.append("- **Daily SERP feature shifts**: " + daily_serp_line.replace("Daily SERP feature-share shifts: ", ""))
+    daily_anomaly_line = _daily_anomaly_detector_line(additional_context)
+    if daily_anomaly_line:
+        lines.append("- **Daily KPI anomalies**: " + daily_anomaly_line.replace("Daily KPI anomaly detector: ", ""))
+
+    updates_timeline_line = _google_updates_timeline_text(additional_context)
+    if updates_timeline_line:
+        lines.append("- **Google updates timeline (13 months)**: " + updates_timeline_line.replace("Google update timeline (13M): ", ""))
+        lines.append(updates_timeline_line)
+
+    case_study_line = _serp_case_study_text(additional_context)
+    if case_study_line:
+        lines.append("- **External case-study context (13 months)**: " + case_study_line.replace("SERP case-study scanner (13M): ", ""))
+        lines.append(case_study_line)
+
+    daily_story = _build_daily_gsc_storyline(
+        additional_context=additional_context,
+        external_signals=external_signals,
+        weather_summary=weather_summary,
+        top_n=3,
+    )
+    daily_executive_line = str(daily_story.get("executive_line", "")).strip()
+    if daily_executive_line:
+        lines.append(daily_executive_line)
+
+    if len(lines) == 1:
+        lines.append("- Context snapshot has no additional signals in this run.")
+    return lines
+
+
+def _dedupe_report_lines(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    seen_text: set[str] = set()
+    previous_blank = False
+    for raw in lines:
+        line = str(raw)
+        stripped = line.strip()
+        if not stripped:
+            if previous_blank:
+                continue
+            out.append("")
+            previous_blank = True
+            continue
+        previous_blank = False
+        if stripped.startswith("#") or stripped.startswith("|"):
+            out.append(line)
+            continue
+        norm = _normalize_text(stripped)
+        if norm in seen_text:
+            continue
+        seen_text.add(norm)
+        out.append(line)
+    return out
+
+
+def _enforce_section_line_limits(lines: list[str]) -> list[str]:
+    limits = {
+        "Executive summary": 6,
+        "What is happening and why": 40,
+        "KPI snapshot (WoW/MoM/YoY)": 8,
+        "Driver scoreboard": 8,
+        "Meeting-ready talking points": 6,
+        "Context snapshot": 9,
+        "Evidence coverage check": 12,
+        "Hypothesis protocol": 10,
+        "Validation plan (next week)": 4,
+        "Counterfactual checks": 4,
+        "Causality guardrail": 3,
+        "Escalation rule": 3,
+        "Evidence ledger": 14,
+    }
+    out: list[str] = []
+    idx = 0
+    while idx < len(lines):
+        line = str(lines[idx])
+        out.append(line)
+        stripped = line.strip()
+        if not stripped.startswith("## "):
+            idx += 1
+            continue
+        title = stripped[3:].strip()
+        max_body = limits.get(title)
+        if max_body is None:
+            idx += 1
+            continue
+        body: list[str] = []
+        look = idx + 1
+        while look < len(lines) and not str(lines[look]).strip().startswith("## "):
+            body.append(str(lines[look]))
+            look += 1
+        if len(body) > max_body:
+            trimmed = body[:max_body]
+            # If section has table, keep header/separator and first rows.
+            if any(str(item).strip().startswith("|") for item in body):
+                table_header: list[str] = []
+                table_rows: list[str] = []
+                for row in body:
+                    s = str(row).strip()
+                    if s.startswith("|"):
+                        if len(table_header) < 2:
+                            table_header.append(row)
+                        else:
+                            table_rows.append(row)
+                non_table = [row for row in body if not str(row).strip().startswith("|")]
+                merged = non_table[: max(0, max_body - min(4, len(table_header) + 2))]
+                merged.extend(table_header[:2])
+                merged.extend(table_rows[:2])
+                trimmed = merged[:max_body]
+            trimmed.append("- (Auto-compressed for readability.)")
+            out.extend(trimmed)
+        else:
+            out.extend(body)
+        idx = look
+    return out
+
+
 def _cluster_label_for_query(query: str) -> str:
     normalized = _normalize_text(query)
     for label, tokens in QUERY_CLUSTER_RULES:
@@ -4139,332 +4454,85 @@ def _build_executive_summary_lines(
 
     click_wow_pct = _signed_pct(_ratio_delta(current.clicks, previous.clicks))
     click_yoy_pct = _signed_pct(_ratio_delta(current.clicks, yoy.clicks))
-    impr_wow_pct = _signed_pct(_ratio_delta(current.impressions, previous.impressions))
-    impr_yoy_pct = _signed_pct(_ratio_delta(current.impressions, yoy.impressions))
+    impression_wow_pct = _signed_pct(_ratio_delta(current.impressions, previous.impressions))
+    impression_yoy_pct = _signed_pct(_ratio_delta(current.impressions, yoy.impressions))
     ctr_wow_pp = (current.ctr - previous.ctr) * 100.0
     ctr_yoy_pp = (current.ctr - yoy.ctr) * 100.0
-    pos_yoy_delta = current.position - yoy.position
-
-    lines: list[str] = []
-
     query_scope = _find_scope(scope_results, "query")
     growth_themes = ""
     decline_themes = ""
-    val_timing_line = ""
     if query_scope:
         growth_themes, decline_themes = _executive_yoy_theme_summary(query_scope, limit=3)
-        cluster_rows = _query_cluster_rows(query_scope)
-        val_row = next(
-            (row for row in cluster_rows if str(row.get("cluster", "")).strip() == "Valentine's demand"),
-            None,
-        )
-        if isinstance(val_row, dict):
-            val_wow = float(val_row.get("delta_vs_previous", 0.0))
-            val_yoy = float(val_row.get("delta_vs_yoy", 0.0))
-            if val_wow > 0 and val_yoy < 0:
-                val_timing_line = (
-                    "Valentine's cluster is up WoW "
-                    f"({_fmt_signed_compact(val_wow)}) but still down YoY ({_fmt_signed_compact(val_yoy)}), "
-                    "which points to timing shift rather than structural annual growth."
-                )
+    pos_wow_delta = current.position - previous.position
+    pos_yoy_delta = current.position - yoy.position
 
-    template_rows = (segment_diagnostics or {}).get("page_template") or []
-    home_wow = 0.0
-    home_yoy = 0.0
-    home_wow_pct = ""
-    home_yoy_pct = ""
-    brand_wow = 0.0
-    brand_yoy = 0.0
-    brand_enabled = False
-    brand_note = ""
-    if isinstance(template_rows, list) and template_rows:
-        home_row = next(
-            (
-                row
-                for row in template_rows
-                if str(row.get("segment", "")).strip().lower() == "home"
-            ),
-            None,
-        )
-        if isinstance(home_row, dict):
-            home_wow = float(home_row.get("delta_vs_previous", 0.0))
-            home_yoy = float(home_row.get("delta_vs_yoy", 0.0))
-            home_prev = float(home_row.get("previous_clicks", 0.0))
-            home_yoy_clicks = float(home_row.get("yoy_clicks", 0.0))
-            home_wow_pct = _signed_pct(_ratio_delta(home_prev + home_wow, home_prev))
-            home_yoy_pct = _signed_pct(_ratio_delta(home_yoy_clicks + home_yoy, home_yoy_clicks))
-            if home_wow < 0 and home_prev >= 10_000:
-                brand_context = (additional_context or {}).get("google_trends_brand", {})
-                brand_summary = brand_context.get("summary", {}) if isinstance(brand_context, dict) else {}
-                if isinstance(brand_summary, dict):
-                    brand_wow = float(brand_summary.get("delta_pct_vs_previous", 0.0))
-                    brand_yoy = float(brand_summary.get("delta_pct_vs_yoy", 0.0))
-                    brand_enabled = bool(brand_context.get("enabled")) if isinstance(brand_context, dict) else False
-                    if brand_wow > 0:
-                        brand_note = "Brand demand is up WoW in Google Trends, so clicks likely moved across search-result placements rather than demand collapsing."
-                    elif brand_wow < 0:
-                        brand_note = "Brand demand is also down WoW in Google Trends, so part of homepage softness is likely demand-side."
+    top_driver_rows = _top_hypotheses_for_actions(hypotheses, limit=2)
+    top_driver = top_driver_rows[0] if top_driver_rows else {}
+    top_driver_name = str(top_driver.get("category", "Demand timing")).strip() or "Demand timing"
+    top_driver_priority = int(top_driver.get("driver_priority_score", 0) or 0)
 
-    if not brand_enabled:
-        brand_context = (additional_context or {}).get("google_trends_brand", {})
-        brand_summary = brand_context.get("summary", {}) if isinstance(brand_context, dict) else {}
-        if isinstance(brand_context, dict) and isinstance(brand_summary, dict) and brand_context.get("enabled"):
-            brand_wow = float(brand_summary.get("delta_pct_vs_previous", 0.0))
-            brand_yoy = float(brand_summary.get("delta_pct_vs_yoy", 0.0))
-            brand_enabled = True
-
-    # Executive summary in decision format.
-    lines.append(
-        "- **What changed**: GSC organic moved to **clicks "
-        f"{_fmt_compact(current.clicks)} ({click_wow_pct} WoW; {click_yoy_pct} YoY)**, "
-        f"impressions {_fmt_compact(current.impressions)} ({impr_wow_pct} WoW; {impr_yoy_pct} YoY), "
-        f"CTR {_pct(current.ctr)} ({ctr_wow_pp:+.2f} pp WoW; {ctr_yoy_pp:+.2f} pp YoY), "
-        f"avg position {current.position:.2f} ({_position_delta_label(pos_yoy_delta)} YoY). [E1]"
-    )
     why_parts: list[str] = []
     if growth_themes:
-        why_parts.append(f"growth themes: {growth_themes}")
+        why_parts.append(f"gainers: {growth_themes}")
     if decline_themes:
-        why_parts.append(f"decline themes: {decline_themes}")
-    why_text = "; ".join(why_parts) if why_parts else "cluster-level pattern shows category-level demand rotation rather than one systemic SEO failure mode"
-    lines.append(
-        "- **Why**: current movement is **driven by category-level demand rotation with broadly stable short-term efficiency**; "
-        + why_text
-        + "."
-        + (f" {val_timing_line}" if val_timing_line else "")
-    )
-    business_text = (
-        "short-term risk is mainly allocation (which Page Names capture demand) rather than broad ranking/indexation degradation."
-    )
-    trade_plan_signal = _trade_plan_signal(additional_context)
-    if home_wow < 0:
-        business_text += (
-            f" **home** is down **{_fmt_signed_compact(home_wow)} WoW ({home_wow_pct})** and "
-            f"{_fmt_signed_compact(home_yoy)} YoY ({home_yoy_pct})."
-        )
-    if brand_note:
-        business_text += f" {brand_note}"
-    lines.append("- **Business implication**: " + business_text)
-    lines.append(
-        "- **In plain language**: this looks mainly like a **demand timing and traffic mix shift**, "
-        "not a broad SEO technical breakdown."
-    )
+        why_parts.append(f"decliners: {decline_themes}")
+    why_text = "; ".join(why_parts) if why_parts else "traffic changed mostly because demand rotated between themes and pages"
 
-    campaign_context = _campaign_event_context(
-        external_signals=external_signals,
-        query_scope=query_scope,
-    )
-    country_hint = str((additional_context or {}).get("country_code", "")).strip().upper() or "PL"
-    timeline_rows = _marketplace_timeline_rows(
-        additional_context=additional_context,
-        campaign_context=campaign_context,
-        report_country_code=country_hint,
-        max_rows=20,
-    )
-    if timeline_rows:
-        first_day = timeline_rows[0].get("day")
-        last_day = timeline_rows[-1].get("day")
-        if isinstance(first_day, date) and isinstance(last_day, date):
-            lines.append(
-                "- **Marketplace timeline (market events + promo calendar)**: "
-                f"{_fmt_int(len(timeline_rows))} events on one axis "
-                f"({first_day.isoformat()} to {last_day.isoformat()}) for {country_hint}."
-            )
+    risk_bits: list[str] = []
+    if _ratio_delta(current.clicks, yoy.clicks) <= -0.08:
+        risk_bits.append("YoY traffic gap is still material")
+    if ctr_yoy_pp <= -0.20:
+        risk_bits.append("YoY click efficiency is weaker")
+    if pos_yoy_delta >= 0.20:
+        risk_bits.append("average ranking quality is below last year")
+    if not risk_bits:
+        risk_bits.append("main risk is traffic allocation between page types, not a broad technical outage")
 
-    serp_split_line = _serp_appearance_summary_text(additional_context)
-    if serp_split_line:
-        lines.append("- **SERP appearance mix (WoW/MoM/YoY)**: " + serp_split_line.replace("SERP appearance split (GSC searchAppearance): ", ""))
-    daily_serp_line = _daily_serp_feature_shift_line(additional_context)
-    if daily_serp_line:
-        lines.append("- **Daily SERP feature shifts**: " + daily_serp_line.replace("Daily SERP feature-share shifts: ", ""))
-    daily_anomaly_line = _daily_anomaly_detector_line(additional_context)
-    if daily_anomaly_line:
-        lines.append("- **Daily KPI anomalies**: " + daily_anomaly_line.replace("Daily KPI anomaly detector: ", ""))
-
-    updates_timeline_line = _google_updates_timeline_text(additional_context)
-    if updates_timeline_line:
-        lines.append("- **Google updates timeline (13 months)**: " + updates_timeline_line.replace("Google update timeline (13M): ", ""))
-
-    case_study_line = _serp_case_study_text(additional_context)
-    if case_study_line:
-        lines.append("- **External case-study context (13 months)**: " + case_study_line.replace("SERP case-study scanner (13M): ", ""))
-
-    daily_story = _build_daily_gsc_storyline(
-        additional_context=additional_context,
-        external_signals=external_signals,
-        weather_summary=weather_summary,
-        top_n=3,
-    )
-    daily_executive_line = str(daily_story.get("executive_line", "")).strip()
-    if daily_executive_line:
-        lines.append(daily_executive_line)
-
-    if hypotheses:
-        top_signals = "; ".join(
-            f"{str(row.get('category', 'Unknown')).strip()} ({_confidence_bucket(row.get('confidence', 0))})"
-            for row in hypotheses[:3]
-            if isinstance(row, dict)
-        )
-        if top_signals:
-            lines.append(f"- **Top signals**: {top_signals}.")
-        actions = _top_priority_actions(hypotheses, limit=3)
-        if actions:
-            lines.append("- **Priority actions (owner | ETA)**: " + "; ".join(actions) + ".")
-
-    brand_proxy = _brand_proxy_from_gsc(segment_diagnostics)
-    if isinstance(trade_plan_signal, dict):
-        overlap_score = int(trade_plan_signal.get("overlap_intensity_score", 0) or 0)
-        overlap_campaigns = int(trade_plan_signal.get("overlap_campaigns", 0) or 0)
-        overlap_days = int(trade_plan_signal.get("overlap_days", 0) or 0)
-        overlap_recency = trade_plan_signal.get("overlap_recency_days")
-        overlap_text = ""
-        if overlap_score > 0:
-            overlap_text = (
-                f" Overlap intensity: {overlap_score}/100 "
-                f"(campaigns={overlap_campaigns}, overlap days={overlap_days}"
-                + (
-                    f", recency={int(overlap_recency)}d)."
-                    if isinstance(overlap_recency, (int, float))
-                    else ")."
-                )
-            )
-        lines.append(
-            "- **Campaign & trade-plan context**: "
-            + str(trade_plan_signal.get("statement", "")).strip()
-            + f" (impact likelihood: {_confidence_bucket(trade_plan_signal.get('confidence', 0))})."
-            + overlap_text
-        )
-        yoy_availability_message = str(trade_plan_signal.get("yoy_availability_message", "")).strip()
-        if yoy_availability_message:
-            lines.append("- **Trade-plan YoY availability**: " + yoy_availability_message)
-    if brand_enabled and brand_proxy:
-        lines.append(
-            "- **Brand demand baseline (Google Trends + GSC brand queries)**: "
-            f"Google Trends **{brand_wow:+.2f}% WoW**, **{brand_yoy:+.2f}% YoY**; "
-            f"GSC brand clicks **{brand_proxy.get('delta_pct_vs_previous', 0.0):+.2f}% WoW** "
-            f"({_fmt_signed_compact(brand_proxy.get('delta_vs_previous', 0.0))}), "
-            f"**{brand_proxy.get('delta_pct_vs_yoy', 0.0):+.2f}% YoY** "
-            f"({_fmt_signed_compact(brand_proxy.get('delta_vs_yoy', 0.0))}); "
-            f"GSC brand impressions **{brand_proxy.get('impressions_delta_pct_vs_previous', 0.0):+.2f}% WoW** "
-            f"({_fmt_signed_compact(brand_proxy.get('impressions_delta_vs_previous', 0.0))}), "
-            f"**{brand_proxy.get('impressions_delta_pct_vs_yoy', 0.0):+.2f}% YoY** "
-            f"({_fmt_signed_compact(brand_proxy.get('impressions_delta_vs_yoy', 0.0))})."
-        )
-    elif brand_enabled:
-        lines.append(
-            "- **Brand search trend (Google Trends)**: "
-            f"WoW **{brand_wow:+.2f}%**, YoY **{brand_yoy:+.2f}%**. "
-            "GSC brand-query proxy was unavailable in this run."
-        )
-    elif brand_proxy:
-        lines.append(
-            "- **Brand demand proxy (GSC brand queries)**: "
-            f"WoW **{brand_proxy.get('delta_pct_vs_previous', 0.0):+.2f}%** "
-            f"({_fmt_signed_compact(brand_proxy.get('delta_vs_previous', 0.0))}), "
-            f"impressions WoW **{brand_proxy.get('impressions_delta_pct_vs_previous', 0.0):+.2f}%** "
-            f"({_fmt_signed_compact(brand_proxy.get('impressions_delta_vs_previous', 0.0))}); "
-            f"YoY **{brand_proxy.get('delta_pct_vs_yoy', 0.0):+.2f}%** "
-            f"({_fmt_signed_compact(brand_proxy.get('delta_vs_yoy', 0.0))}), "
-            f"impressions YoY **{brand_proxy.get('impressions_delta_pct_vs_yoy', 0.0):+.2f}%** "
-            f"({_fmt_signed_compact(brand_proxy.get('impressions_delta_vs_yoy', 0.0))}). "
-            "Google Trends was unavailable, so this proxy is used for brand/home interpretation."
-        )
-    else:
-        lines.append(
-            "- **Brand search trend (Google Trends)**: unavailable in this run (no valid brand time-series response), "
-            "and GSC brand-proxy segment was not available."
-        )
-
-    demand_read = "brand demand is unavailable this week"
-    if brand_enabled:
-        if brand_wow > 0.5:
-            demand_read = "brand demand is up WoW"
-        elif brand_wow < -0.5:
-            demand_read = "brand demand is down WoW"
-        else:
-            demand_read = "brand demand is broadly flat WoW"
-    elif isinstance(brand_proxy, dict):
-        brand_proxy_wow = float(brand_proxy.get("delta_pct_vs_previous", 0.0) or 0.0)
-        if brand_proxy_wow > 0.5:
-            demand_read = "GSC brand proxy is up WoW"
-        elif brand_proxy_wow < -0.5:
-            demand_read = "GSC brand proxy is down WoW"
-        else:
-            demand_read = "GSC brand proxy is broadly flat WoW"
-
-    country_code = str((additional_context or {}).get("country_code", "")).strip().upper()
-    brand_ctr_proxy = _brand_ctr_proxy_from_gsc(segment_diagnostics)
-    if (
-        country_code in {"CZ", "SK"}
-        and _has_allegro_days_like_signal(external_signals, country_code=country_code)
-        and isinstance(brand_ctr_proxy, dict)
-        and float(brand_ctr_proxy.get("delta_pp_vs_previous", 0.0)) <= -0.10
-    ):
-        lines.append(
-            "- **Brand CTR campaign hypothesis (CZ/SK)**: detected `Allegro Days`-type campaign context with "
-            f"brand CTR down **{float(brand_ctr_proxy.get('delta_pp_vs_previous', 0.0)):+.2f} pp WoW**. "
-            "A likely driver is stronger brand paid-search presence (Google Ads) capturing part of clicks from organic brand results."
-        )
-    brand_ads_hyp = _brand_ads_hypothesis(
-        segment_diagnostics=segment_diagnostics,
-        additional_context=additional_context,
-        external_signals=external_signals,
-    )
-    if isinstance(brand_ads_hyp, dict):
-        lines.append(
-            "- **Brand Ads overlap hypothesis (WoW)**: "
-            f"{str(brand_ads_hyp.get('statement', '')).strip()} "
-            f"(evidence: {str(brand_ads_hyp.get('evidence', '')).strip()})."
-        )
-    lines.append(
-        "- **Decision this week**: current data indicates an exposure/demand effect first "
-        f"({demand_read}; impressions/CTR trend), while campaign timing and paid activity are likely incremental factors; "
-        "treat technical SEO escalation as second step unless efficiency signals deteriorate."
-    )
     source_quality = _source_quality_summary(additional_context)
     comparability = _comparability_summary(
         additional_context,
-        brand_trends_available=brand_enabled,
-        brand_proxy_available=isinstance(brand_proxy, dict),
+        brand_trends_available=bool(((additional_context or {}).get("google_trends_brand", {}) or {}).get("enabled")),
+        brand_proxy_available=isinstance(_brand_proxy_from_gsc(segment_diagnostics), dict),
     )
-    if source_quality:
-        if comparability:
-            lines.append(f"- **Data reliability & comparability**: {source_quality} {comparability}")
-        else:
-            lines.append(f"- **Data reliability & comparability**: {source_quality}")
+    reliability_line = " Data reliability: baseline acceptable for decision use."
+    if source_quality and comparability:
+        reliability_line = f" Data reliability: {source_quality} {comparability}"
+    elif source_quality:
+        reliability_line = f" Data reliability: {source_quality}"
     elif comparability:
-        lines.append(f"- **Data reliability & comparability**: {comparability}")
+        reliability_line = f" Data reliability: {comparability}"
 
-    # Manager-friendly ordering to avoid truncating key decision lines.
-    priority_prefixes = (
-        "- **What changed**:",
-        "- **Why**:",
-        "- **Business implication**:",
-        "- **In plain language**:",
-        "- **Top signals**:",
-        "- **Priority actions",
-        "- **Marketplace timeline",
-        "- **SERP appearance mix (WoW/MoM/YoY)**:",
-        "- **Daily SERP feature shifts**:",
-        "- **Daily KPI anomalies**:",
-        "- **Google updates timeline (13 months)**:",
-        "- **External case-study context (13 months)**:",
-        "- **Daily GSC pulse (day-by-day)**:",
-        "- **Decision this week**:",
-        "- **Data reliability & comparability**:",
-        "- **Campaign & trade-plan context**:",
-        "- **Brand demand baseline",
-        "- **Brand demand proxy",
-        "- **Brand search trend",
+    opportunity = (
+        f"`{top_driver_name}` is the biggest lever this week"
+        + (f" ({top_driver_priority}/100 priority)" if top_driver_priority else "")
+        + "; quick execution can recover traffic share in the next run."
     )
-    selected: list[str] = []
-    for prefix in priority_prefixes:
-        row = next((line for line in lines if line.startswith(prefix)), None)
-        if row and row not in selected:
-            selected.append(row)
-    if not selected:
-        selected = lines
-    return selected[:14]
+    decision_text = (
+        "Decision this week: keep demand/timing and routing actions first, and escalate technical SEO only if "
+        "CTR/position deteriorate in the next validation window."
+    )
+    actions = _top_priority_actions(hypotheses, limit=2)
+    next_action_text = "; ".join(actions) if actions else "SEO Team: validate top hypothesis on refreshed weekly data (SEO Team | next run)"
+
+    return [
+        "- **What changed**: clicks "
+        f"{_fmt_compact(current.clicks)} ({click_wow_pct} WoW; {click_yoy_pct} YoY), impressions "
+        f"{_fmt_compact(current.impressions)} ({impression_wow_pct} WoW; {impression_yoy_pct} YoY), "
+        f"CTR {_pct(current.ctr)} ({ctr_wow_pp:+.2f} pp WoW; {ctr_yoy_pp:+.2f} pp YoY), avg position "
+        f"{current.position:.2f} ({_position_delta_label(pos_wow_delta)} WoW; {_position_delta_label(pos_yoy_delta)} YoY). [E1]",
+        "- **Why**: In plain language, this week looks like demand and page-mix rotation, not one broad technical SEO failure mode; "
+        + why_text
+        + ".",
+        "- **Risk**: Business implication: "
+        + "; ".join(risk_bits[:2])
+        + ".",
+        "- **Opportunity**: "
+        + opportunity
+        + "."
+        + reliability_line,
+        "- **Decision**: " + decision_text,
+        "- **Next action**: Priority actions (owner | ETA): " + next_action_text + ".",
+    ]
 
 
 def _build_leadership_snapshot_lines(
@@ -6363,6 +6431,32 @@ def build_markdown_report(
         senuto_error=senuto_error,
     )
     lines.extend(executive_lines)
+
+    lines.append("")
+    lines.extend(
+        _kpi_snapshot_table_lines(
+            totals=totals,
+            additional_context=additional_context,
+        )
+    )
+    lines.append("")
+    lines.extend(_driver_scoreboard_lines(hypotheses=hypotheses, limit=4))
+    lines.append("")
+    lines.extend(
+        _meeting_ready_talking_points(
+            totals=totals,
+            hypotheses=hypotheses,
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _context_snapshot_lines(
+            scope_results=scope_results,
+            external_signals=external_signals,
+            weather_summary=weather_summary,
+            additional_context=additional_context,
+        )
+    )
     lines.append("")
     lines.append("## What is happening and why")
     narrative_lines = _build_what_is_happening_lines(
@@ -6505,12 +6599,13 @@ def build_markdown_report(
             )
 
     # Decision-layer report only (Executive summary + narrative).
+    lines = _enforce_section_line_limits(_dedupe_report_lines(lines))
     if not INCLUDE_APPENDIX_IN_REPORT:
         return "\n".join(lines).strip() + "\n"
 
     lines.append("")
-    lines.append("## Appendix")
-    lines.append("Supporting data tables and diagnostics start below.")
+    lines.append("## Appendix (optional technical details)")
+    lines.append("Technical diagnostics below are optional and separated from the manager decision brief.")
     lines.append("")
     lines.append("## Date windows")
     lines.append("| Window | Start | End | Days |")
