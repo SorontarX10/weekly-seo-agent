@@ -313,6 +313,8 @@ def test_report_contains_reasoning_and_upcoming_trends(tmp_path):
     assert "Reasoning ledger (facts -> hypotheses -> validation)" in report
     assert "Seasonality decomposition (plain language):" in report
     assert "Plain-language trend read:" in report
+    assert "Confirmed facts vs plausible drivers vs open questions" in report
+    assert "Open questions for next run:" in report
     assert "## Appendix" not in report
     assert "## Date windows" not in report
     assert "### Market event calendar (API)" not in report

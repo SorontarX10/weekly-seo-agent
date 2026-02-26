@@ -1599,13 +1599,19 @@ def enforce_manager_quality_guardrail(
     lines = text.splitlines()
     lowered = text.lower()
 
-    if "confirmed vs hypothesis" not in lowered:
+    has_confirmed_split = (
+        "confirmed vs hypothesis" in lowered
+        or "confirmed facts vs plausible drivers vs open questions" in lowered
+    )
+    if not has_confirmed_split:
         lines.append("")
-        lines.append("## Confirmed vs hypothesis")
+        lines.append("## Confirmed Facts Vs Plausible Drivers Vs Open Questions")
         lines.append("### Confirmed facts from data")
         lines.append("- Weekly KPI movement is grounded in evidence anchors from this run [E1].")
-        lines.append("### Working hypotheses")
+        lines.append("### Plausible drivers (need validation)")
         lines.append("- Causal interpretation remains provisional and is validated in the next run [E2].")
+        lines.append("### Open questions for next run")
+        lines.append("- Which hypothesis should be falsified first before escalation? [E3]")
 
     lowered = "\n".join(lines).lower()
     if "priority actions" not in lowered or "owner | eta" not in lowered:
@@ -2065,18 +2071,44 @@ def _compact_manager_section(lines: list[str], max_lines: int = 24) -> list[str]
             seen.add(key)
         out.append(row)
 
-        if stripped == "**Confirmed vs hypothesis**":
+        confirmed_split_headers = {
+            "**Confirmed vs hypothesis**",
+            "**Confirmed facts vs plausible drivers vs open questions**",
+        }
+        if stripped in confirmed_split_headers:
             look_ahead = idx + 1
             while look_ahead < len(lines):
                 candidate = lines[look_ahead]
                 cand_strip = candidate.strip()
-                if cand_strip.startswith("**") and cand_strip != "**Confirmed vs hypothesis**":
+                if cand_strip.startswith("**") and cand_strip not in confirmed_split_headers:
                     break
                 if (
                     cand_strip.startswith("Confirmed facts from data:")
                     or cand_strip.startswith("Working hypotheses:")
+                    or cand_strip.startswith("Plausible drivers (need validation):")
+                    or cand_strip.startswith("Open questions for next run:")
                     or cand_strip.startswith("- ")
                 ):
+                    cand_key = _norm(candidate)
+                    if cand_key not in seen:
+                        seen.add(cand_key)
+                        out.append(candidate)
+                look_ahead += 1
+                if len(out) >= max_lines:
+                    break
+            idx = look_ahead
+            if len(out) >= max_lines:
+                break
+            continue
+
+        if stripped == "**Reasoning ledger (facts -> hypotheses -> validation)**":
+            look_ahead = idx + 1
+            while look_ahead < len(lines):
+                candidate = lines[look_ahead]
+                cand_strip = candidate.strip()
+                if cand_strip.startswith("**") and cand_strip != "**Reasoning ledger (facts -> hypotheses -> validation)**":
+                    break
+                if cand_strip.startswith("- "):
                     cand_key = _norm(candidate)
                     if cand_key not in seen:
                         seen.add(cand_key)
@@ -4896,18 +4928,45 @@ def _build_what_is_happening_lines(
         hypothesis_points.append(
             "Paid-channel timing may reallocate brand/category clicks between organic and ads."
         )
+    open_questions: list[str] = []
+    if not brand_enabled and not isinstance(brand_proxy, dict):
+        open_questions.append(
+            "Do we have a complete brand-demand baseline (Google Trends brand series or GSC brand proxy) for this market?"
+        )
+    if isinstance(trade_plan_signal, dict):
+        trade_conf = int(trade_plan_signal.get("confidence", 0) or 0)
+        if trade_conf < 70:
+            open_questions.append(
+                "How much of weekly movement is explained by campaign/paid overlap versus underlying organic demand rotation?"
+            )
+    else:
+        open_questions.append(
+            "Do we need additional campaign or paid-channel inputs to explain this week's movement with higher confidence?"
+        )
+    source_errors = (additional_context or {}).get("errors", [])
+    if isinstance(source_errors, list) and source_errors:
+        open_questions.append(
+            "Which missing/degraded external source had the biggest impact on interpretation confidence this week?"
+        )
+    if not open_questions:
+        open_questions.append(
+            "Which single hypothesis should be falsified first in the next run before escalation?"
+        )
 
     if confirmed_points or hypothesis_points:
         lines.append("")
-        lines.append("**Confirmed vs hypothesis**")
+        lines.append("**Confirmed facts vs plausible drivers vs open questions**")
         if confirmed_points:
             lines.append("Confirmed facts from data:")
             for item in confirmed_points[:2]:
                 lines.append(f"- {item}")
         if hypothesis_points:
-            lines.append("Working hypotheses:")
+            lines.append("Plausible drivers (need validation):")
             for item in hypothesis_points[:2]:
                 lines.append(f"- {item}")
+        lines.append("Open questions for next run:")
+        for item in open_questions[:2]:
+            lines.append(f"- {item}")
 
     # Dynamic driver table (only active/contextual drivers for this run).
     driver_rows: list[tuple[str, str, str, str, str]] = []
@@ -5015,7 +5074,7 @@ def _build_what_is_happening_lines(
         "and segment-level GSC deltas before escalating technical actions."
     )
 
-    return _compact_manager_section(lines, max_lines=20)
+    return _compact_manager_section(lines, max_lines=24)
 
 
 def _focus_terms_from_query_scope(query_scope: AnalysisResult | None) -> list[str]:
