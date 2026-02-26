@@ -621,6 +621,77 @@ def test_report_includes_daily_gsc_storyline_with_context_links():
     assert "trade-plan campaign active: MegaRaty February" in report
 
 
+def test_daily_weather_hint_is_directional_non_causal_and_confidence_tagged():
+    run_date = date(2026, 2, 24)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=1_200_000, impressions=25_000_000, ctr=0.048, position=6.1),
+        "previous_28d": MetricSummary(clicks=1_180_000, impressions=24_800_000, ctr=0.047, position=6.2),
+        "yoy_52w": MetricSummary(clicks=1_300_000, impressions=26_000_000, ctr=0.050, position=5.7),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    additional_context = {
+        "country_code": "PL",
+        "gsc_daily_rows": {
+            "enabled": True,
+            "days_total": 7,
+            "days_with_data": 7,
+            "days_with_previous_weekday_data": 7,
+            "weekly_clicks_sum": 1_200_000.0,
+            "rows": [
+                {
+                    "date": "2026-02-20",
+                    "clicks": 185000.0,
+                    "impressions": 3700000.0,
+                    "ctr": 0.05,
+                    "position": 6.0,
+                    "previous_weekday_has_data": True,
+                    "delta_clicks_vs_previous_weekday": -22000.0,
+                    "delta_pct_vs_previous_weekday": -10.2,
+                    "yoy_day_has_data": False,
+                    "delta_pct_vs_yoy_day": 0.0,
+                },
+            ],
+        },
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=[],
+        weather_summary={
+            "daily_current": [
+                {"date": "2026-02-20", "temp_c": -3.0, "precip_mm": 8.0},
+            ],
+            "daily_previous": [
+                {"date": "2026-02-13", "temp_c": 2.0, "precip_mm": 1.0},
+            ],
+        },
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "weather timing hint:" in report
+    assert "non-causal" in report
+    assert "confidence:" in report
+    assert "/100" in report
+
+
 def test_quality_guardrail_enforces_markers_and_compacts_optional_lines():
     long_optional = "\n".join(
         [
@@ -977,3 +1048,66 @@ def test_report_includes_trade_plan_overlap_intensity_and_yoy_fallback_message()
     assert "Overlap intensity:" in report or "Trade-plan overlap intensity:" in report
     assert "Trade-plan YoY availability" in report
     assert "YoY comparator skipped" in report
+
+
+def test_report_surfaces_marketplace_event_yoy_density_context():
+    run_date = date(2026, 2, 25)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=150000, impressions=2500000, ctr=0.06, position=5.2),
+        "previous_28d": MetricSummary(clicks=149000, impressions=2490000, ctr=0.06, position=5.2),
+        "yoy_52w": MetricSummary(clicks=158000, impressions=2590000, ctr=0.061, position=5.1),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    additional_context = {
+        "country_code": "PL",
+        "market_event_calendar": {
+            "enabled": True,
+            "counts": {
+                "current": 8,
+                "yoy": 5,
+                "delta_vs_yoy": 3,
+                "delta_pct_vs_yoy": 60.0,
+            },
+            "events": [
+                {
+                    "date": "2026-02-20",
+                    "country_code": "PL",
+                    "title": "Allegro campaign event",
+                    "source": "example.com",
+                    "event_type": "Campaign/Promotions",
+                    "impact_level": "MEDIUM",
+                    "impact_direction": "Upside potential",
+                    "confidence": 60,
+                    "gmv_reason": "Promo demand shift.",
+                }
+            ],
+        },
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=[],
+        weather_summary={},
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "Marketplace events YoY context:" in report
+    assert "8 events now vs 5 YoY" in report

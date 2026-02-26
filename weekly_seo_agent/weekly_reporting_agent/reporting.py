@@ -1758,6 +1758,60 @@ def _trade_plan_tags_for_day(
     return tags
 
 
+def _daily_weather_impact_hint(temp_diff: float, precip_diff: float) -> tuple[str, int] | None:
+    if abs(temp_diff) < 2.0 and abs(precip_diff) < 4.0:
+        return None
+
+    if temp_diff <= -2.0:
+        temp_state = "colder"
+    elif temp_diff >= 2.0:
+        temp_state = "warmer"
+    else:
+        temp_state = "temperature-stable"
+
+    if precip_diff >= 4.0:
+        precip_state = "wetter"
+    elif precip_diff <= -4.0:
+        precip_state = "drier"
+    else:
+        precip_state = "precipitation-stable"
+
+    if temp_state == "temperature-stable" and precip_state == "precipitation-stable":
+        return None
+
+    if temp_state != "temperature-stable" and precip_state != "precipitation-stable":
+        weather_state = f"{temp_state} and {precip_state}"
+    elif temp_state != "temperature-stable":
+        weather_state = temp_state
+    else:
+        weather_state = precip_state
+
+    if temp_diff <= -2.0 and precip_diff >= 4.0:
+        likely_effect = "likely lower discretionary outdoor demand and stronger indoor/home demand rotation"
+    elif temp_diff >= 2.0 and precip_diff <= -4.0:
+        likely_effect = "likely higher discretionary/outdoor demand and softer weather-driven indoor demand"
+    elif precip_diff >= 4.0:
+        likely_effect = "likely demand reallocation due to heavier precipitation"
+    elif precip_diff <= -4.0:
+        likely_effect = "likely demand reallocation due to lighter precipitation"
+    elif temp_diff <= -2.0:
+        likely_effect = "likely colder-weather demand rotation"
+    else:
+        likely_effect = "likely warmer-weather demand rotation"
+
+    score = int(round(52.0 + abs(temp_diff) * 2.5 + abs(precip_diff) * 1.2))
+    if temp_state != "temperature-stable" and precip_state != "precipitation-stable":
+        score += 4
+    score = max(52, min(82, score))
+
+    label = (
+        "weather timing hint: "
+        f"{weather_state} vs previous-weekday; {likely_effect} "
+        f"(non-causal, {_confidence_bucket(score)} confidence: {score}/100)"
+    )
+    return label, score
+
+
 def _daily_context_tags_for_day(
     *,
     day: date,
@@ -1809,19 +1863,22 @@ def _daily_context_tags_for_day(
     previous_weather = _weather_daily_map(weather_summary, "daily_previous")
     current_row = current_weather.get(day)
     previous_row = previous_weather.get(day - timedelta(days=7))
+    limit_safe = max(1, limit)
     if current_row and previous_row:
         temp_diff = float(current_row[0] - previous_row[0])
         precip_diff = float(current_row[1] - previous_row[1])
-        if abs(temp_diff) >= 2.0 or abs(precip_diff) >= 4.0:
-            weather_tag = (
-                "weather changed vs previous-weekday "
-                f"(temp {temp_diff:+.1f}C, precipitation {precip_diff:+.1f}mm)"
-            )
+        weather_hint = _daily_weather_impact_hint(temp_diff=temp_diff, precip_diff=precip_diff)
+        if weather_hint:
+            weather_tag, _ = weather_hint
+            weather_tag += f"; observed change: temp {temp_diff:+.1f}C, precipitation {precip_diff:+.1f}mm"
             canonical = _normalize_text(weather_tag)
             if canonical and canonical not in seen:
-                tags.append(weather_tag)
+                if len(tags) >= limit_safe:
+                    tags = tags[: limit_safe - 1] + [weather_tag]
+                else:
+                    tags.append(weather_tag)
 
-    return tags[: max(1, limit)]
+    return tags[:limit_safe]
 
 
 def _build_daily_gsc_storyline(
@@ -1869,7 +1926,10 @@ def _build_daily_gsc_storyline(
     )[: max(1, top_n)]
 
     detail_snippets: list[str] = []
-    narrative_lines: list[str] = ["**Daily trend view (GSC by day)**: day-level checks show which specific dates drove the weekly outcome."]
+    narrative_lines: list[str] = [
+        "**Daily trend view (GSC by day)**: day-level checks show which specific dates drove the weekly outcome; "
+        "context tags (weather/news/campaigns) are directional hints, not proof of causality."
+    ]
     context_tags_flat: list[str] = []
 
     for row in ranked:
