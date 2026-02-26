@@ -1,7 +1,11 @@
 from weekly_seo_agent.config import AgentConfig
+from weekly_seo_agent.weekly_reporting_agent.config import AgentConfig as WeeklyAgentConfig
 from weekly_seo_agent.weekly_reporting_agent.main import (
     QUALITY_MAX_GAIA_MODEL,
     _apply_weekly_quality_max_profile,
+    _apply_runtime_toggles,
+    _is_gsc_mapping_explicit,
+    _preflight_severity,
 )
 
 
@@ -113,3 +117,111 @@ def test_weekly_quality_max_profile_forces_llm_settings(monkeypatch):
     assert profiled.llm_appendix_max_chars >= 2600
     assert profiled.llm_map_max_packets >= 6
     assert profiled.llm_validation_max_rounds >= 3
+
+
+def test_weekly_agent_merchant_center_config_from_env(monkeypatch):
+    monkeypatch.setenv("MERCHANT_CENTER_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_CENTER_CREDENTIALS_PATH", "secret.json")
+    monkeypatch.setenv("MERCHANT_CENTER_MCA_ID", "123456")
+    monkeypatch.setenv("MERCHANT_CENTER_ACCOUNT_ID_MAP", "PL:111,CZ:222")
+    cfg = WeeklyAgentConfig.from_env()
+    assert cfg.merchant_center_enabled is True
+    assert cfg.merchant_center_api_enabled is True
+    assert cfg.merchant_center_credentials_path == "secret.json"
+    assert cfg.merchant_center_mca_id == "123456"
+    assert cfg.merchant_center_account_id_map["PL"] == "111"
+    assert cfg.merchant_center_account_id_map["CZ"] == "222"
+
+
+def test_runtime_toggles_can_disable_strict_profile(monkeypatch):
+    monkeypatch.setenv("GAIA_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("WEEKLY_STRICT_LLM_PROFILE_ENABLED", "true")
+    cfg = WeeklyAgentConfig.from_env()
+
+    toggled = _apply_runtime_toggles(
+        cfg,
+        merchant_center_enabled=True,
+        strict_llm_profile_enabled=False,
+        enable_sources=[],
+        disable_sources=[],
+    )
+    assert toggled.merchant_center_enabled is True
+    assert toggled.strict_llm_profile_enabled is False
+    assert toggled.gaia_model == "gpt-4o-mini"
+
+
+def test_runtime_toggles_can_force_strict_profile(monkeypatch):
+    monkeypatch.setenv("GAIA_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("WEEKLY_STRICT_LLM_PROFILE_ENABLED", "false")
+    cfg = WeeklyAgentConfig.from_env()
+
+    toggled = _apply_runtime_toggles(
+        cfg,
+        merchant_center_enabled=None,
+        strict_llm_profile_enabled=True,
+        enable_sources=[],
+        disable_sources=[],
+    )
+    assert toggled.strict_llm_profile_enabled is True
+    assert toggled.gaia_model == QUALITY_MAX_GAIA_MODEL
+
+
+def test_runtime_source_toggles(monkeypatch):
+    monkeypatch.setenv("NEWS_SCRAPING_ENABLED", "true")
+    monkeypatch.setenv("WEATHER_CONTEXT_ENABLED", "true")
+    monkeypatch.setenv("TRADE_PLAN_ENABLED", "true")
+    monkeypatch.setenv("WEEKLY_STRICT_LLM_PROFILE_ENABLED", "false")
+    cfg = WeeklyAgentConfig.from_env()
+
+    toggled = _apply_runtime_toggles(
+        cfg,
+        merchant_center_enabled=None,
+        strict_llm_profile_enabled=False,
+        enable_sources=["news"],
+        disable_sources=["weather", "trade-plan"],
+    )
+    assert toggled.news_scraping_enabled is True
+    assert toggled.weather_context_enabled is False
+    assert toggled.trade_plan_enabled is False
+
+
+def test_startup_preflight_defaults(monkeypatch):
+    monkeypatch.delenv("STARTUP_PREFLIGHT_ENABLED", raising=False)
+    monkeypatch.delenv("STARTUP_PREFLIGHT_BLOCKING_SOURCES", raising=False)
+    cfg = WeeklyAgentConfig.from_env()
+    assert cfg.startup_preflight_enabled is True
+    assert "gsc" in cfg.startup_preflight_blocking_sources
+    assert "drive" in cfg.startup_preflight_blocking_sources
+
+
+def test_preflight_severity_uses_blocking_sources(monkeypatch):
+    monkeypatch.setenv("STARTUP_PREFLIGHT_BLOCKING_SOURCES", "gsc,drive")
+    cfg = WeeklyAgentConfig.from_env()
+    assert _preflight_severity(cfg, "gsc") == "blocker"
+    assert _preflight_severity(cfg, "sheets") == "warning"
+
+
+def test_ingestion_snapshot_defaults(monkeypatch):
+    monkeypatch.delenv("INGESTION_SNAPSHOT_ENABLED", raising=False)
+    monkeypatch.delenv("INGESTION_SNAPSHOT_RETENTION_DAYS", raising=False)
+    cfg = WeeklyAgentConfig.from_env()
+    assert cfg.ingestion_snapshot_enabled is True
+    assert cfg.ingestion_snapshot_retention_days == 45
+
+
+def test_ingestion_snapshot_env_override(monkeypatch):
+    monkeypatch.setenv("INGESTION_SNAPSHOT_ENABLED", "false")
+    monkeypatch.setenv("INGESTION_SNAPSHOT_RETENTION_DAYS", "10")
+    cfg = WeeklyAgentConfig.from_env()
+    assert cfg.ingestion_snapshot_enabled is False
+    assert cfg.ingestion_snapshot_retention_days == 10
+
+
+def test_gsc_mapping_explicit_only_when_all_countries_present(monkeypatch):
+    monkeypatch.setenv(
+        "GSC_SITE_URL_MAP",
+        "PL:https://allegro.pl,CZ:https://allegro.cz,SK:https://allegro.sk,HU:https://allegro.hu",
+    )
+    cfg = WeeklyAgentConfig.from_env()
+    assert _is_gsc_mapping_explicit(cfg, ["PL", "CZ", "SK", "HU"]) is True
+    assert _is_gsc_mapping_explicit(cfg, ["PL", "DE"]) is False

@@ -761,6 +761,48 @@ class ContinuityClient:
                 return idx
         return None
 
+    @staticmethod
+    def _cell_text(row: list[object], idx: int | None) -> str:
+        if idx is None or idx < 0 or idx >= len(row):
+            return ""
+        return str(row[idx]).strip()
+
+    @staticmethod
+    def _set_cell_text(row: list[object], idx: int, value: str) -> None:
+        if idx < 0:
+            return
+        if idx >= len(row):
+            row.extend([""] * (idx - len(row) + 1))
+        row[idx] = value
+
+    @classmethod
+    def _fill_down_sparse_rows(
+        cls,
+        rows: list[list[object]],
+        *,
+        filldown_indices: tuple[int | None, ...],
+    ) -> list[list[object]]:
+        tracked = [idx for idx in filldown_indices if isinstance(idx, int) and idx >= 0]
+        if not tracked:
+            return list(rows)
+
+        carry: dict[int, str] = {}
+        out: list[list[object]] = []
+        for raw in rows:
+            if not isinstance(raw, list):
+                continue
+            row = list(raw)
+            for idx in tracked:
+                value = cls._cell_text(row, idx)
+                if value:
+                    carry[idx] = value
+                    continue
+                fallback = carry.get(idx, "")
+                if fallback:
+                    cls._set_cell_text(row, idx, fallback)
+            out.append(row)
+        return out
+
     @classmethod
     def _is_non_brand_phrase(cls, value: str) -> bool:
         normalized = cls._normalize_text(value)
@@ -1755,9 +1797,37 @@ class ContinuityClient:
             }
 
         header_candidates: list[tuple[int, list[str], int | None, int | None, int | None, int]] = []
-        date_header_tokens = ("campaign start", "week start", "start date", "date", "data")
-        campaign_header_tokens = ("campaign name", "initiative name", "nazwa kampanii", "nazwa")
-        campaign_fallback_tokens = ("campaign", "akcja", "event", "initiative")
+        date_header_tokens = (
+            "campaign start",
+            "week start",
+            "start date",
+            "launch date",
+            "week commencing",
+            "week",
+            "date",
+            "data",
+            "dzien",
+            "tydzien",
+        )
+        campaign_header_tokens = (
+            "campaign name",
+            "initiative name",
+            "campaign title",
+            "activity name",
+            "project name",
+            "nazwa kampanii",
+            "nazwa akcji",
+            "nazwa",
+        )
+        campaign_fallback_tokens = (
+            "campaign",
+            "initiative",
+            "activity",
+            "project",
+            "event",
+            "akcja",
+            "projekt",
+        )
         max_header_scan = min(8, len(values))
         for idx in range(max_header_scan):
             row = values[idx]
@@ -1843,11 +1913,11 @@ class ContinuityClient:
         )
         campaign_start_idx = self._pick_text_column(
             headers,
-            ("campaign start", "start", "week start", "from"),
+            ("campaign start", "start", "week start", "from", "launch date", "week commencing"),
         )
         campaign_end_idx = self._pick_text_column(
             headers,
-            ("campaign end", "end", "week end", "to"),
+            ("campaign end", "end", "week end", "to", "finish date", "close date"),
         )
         campaign_idx = self._pick_text_column(
             headers,
@@ -1860,11 +1930,11 @@ class ContinuityClient:
             )
         channel_idx = self._pick_text_column(
             headers,
-            ("channel", "kanal", "source", "medium", "publisher", "platform"),
+            ("channel", "kanal", "source", "medium", "publisher", "platform", "media"),
         )
         team_idx = self._pick_text_column(
             headers,
-            ("executing team", "team", "owner"),
+            ("executing team", "team", "owner", "responsible"),
         )
         type_idx = self._pick_text_column(
             headers,
@@ -1952,6 +2022,21 @@ class ContinuityClient:
                 "errors": [f"Trade plan tab '{tab_name}' is missing a date-like column."],
                 "rows": [],
             }
+
+        # Fill down sparse values produced by merged cells in Sheets tabs.
+        body_rows = self._fill_down_sparse_rows(
+            body_rows,
+            filldown_indices=(
+                date_idx,
+                campaign_start_idx,
+                campaign_end_idx,
+                campaign_idx,
+                channel_idx,
+                team_idx,
+                type_idx,
+                category_idx,
+            ),
+        )
 
         def _bucket(row_day: date) -> str:
             if current_window_start <= row_day <= current_window_end:

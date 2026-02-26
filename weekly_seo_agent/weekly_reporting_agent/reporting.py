@@ -232,6 +232,13 @@ CONTINUITY_THEME_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Non-brand trends", ("non-brand", "trend", "product", "query cluster")),
 )
 
+SUPPORTING_CONTEXT_CATEGORY_TOKENS = (
+    "algorithm",
+    "algorithm/serp context",
+    "serp behavior context",
+    "serp features",
+)
+
 
 def _pct(value: float) -> str:
     return f"{value * 100:.2f}%"
@@ -465,6 +472,50 @@ def _extract_country_hint(text: str, fallback_country: str) -> str:
     return (fallback_country or "PL").strip().upper() or "PL"
 
 
+def _canonical_timeline_event(text: str) -> tuple[str, str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return "", ""
+
+    trimmed = re.sub(r"\s*[-|]\s*[^-|]{1,80}$", "", raw).strip()
+    normalized = _normalize_text(trimmed)
+    normalized = re.sub(r"\b(via|source|zrodlo)\b.*$", "", normalized).strip()
+
+    known_rules = (
+        ("allegro days", "Allegro Days"),
+        ("megaraty", "MegaRaty"),
+        ("smart week", "Smart Week"),
+        ("black friday", "Black Friday"),
+        ("cyber monday", "Cyber Monday"),
+        ("black week", "Black Week"),
+        ("prime day", "Prime Day"),
+        ("wosp", "WOSP"),
+    )
+    for token, label in known_rules:
+        if token in normalized:
+            return token, label
+
+    tokens = [
+        row
+        for row in normalized.split()
+        if row not in {"planned", "campaign", "event", "update", "breaking", "news"}
+    ]
+    canonical = " ".join(tokens[:12]).strip() or normalized
+    display = " ".join(canonical.split()[:8]).strip() or trimmed
+    return canonical, display
+
+
+def _timeline_impact_rank(value: str) -> int:
+    lowered = _normalize_text(value)
+    if "high" in lowered:
+        return 3
+    if "medium" in lowered:
+        return 2
+    if "low" in lowered:
+        return 1
+    return 0
+
+
 def _marketplace_timeline_rows(
     *,
     additional_context: dict[str, object] | None,
@@ -580,8 +631,7 @@ def _marketplace_timeline_rows(
                     }
                 )
 
-    deduped: list[dict[str, object]] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    merged: dict[tuple[str, str, str], dict[str, object]] = {}
     for row in sorted(
         rows,
         key=lambda item: (
@@ -592,15 +642,66 @@ def _marketplace_timeline_rows(
         day = row.get("day")
         if not isinstance(day, date):
             continue
-        key = (
-            day.isoformat(),
-            _normalize_text(str(row.get("country", ""))),
-            _normalize_text(str(row.get("track", ""))),
-            _normalize_text(str(row.get("event", ""))),
-        )
-        if key in seen:
+
+        country = str(row.get("country", "")).strip().upper() or base_country
+        track = str(row.get("track", "")).strip()
+        source = str(row.get("source", "")).strip()
+        impact = str(row.get("impact", "")).strip()
+        canonical_key, canonical_label = _canonical_timeline_event(str(row.get("event", "")))
+        canonical_key = canonical_key or _normalize_text(str(row.get("event", ""))).strip()
+        if not canonical_key:
             continue
-        seen.add(key)
+        key = (day.isoformat(), _normalize_text(country), canonical_key)
+        score = _timeline_impact_rank(impact)
+
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = {
+                "day": day,
+                "country": country,
+                "track": track,
+                "event": _shorten(canonical_label or str(row.get("event", "")), 130) or "Market signal",
+                "source": _shorten(source, 50),
+                "impact": impact or "info",
+                "_impact_score": score,
+                "_tracks": [track] if track else [],
+                "_sources": [source] if source else [],
+                "canonical_event": canonical_key,
+            }
+            continue
+
+        tracks = existing.get("_tracks", [])
+        if isinstance(tracks, list) and track and track not in tracks:
+            tracks.append(track)
+        sources = existing.get("_sources", [])
+        if isinstance(sources, list) and source and source not in sources:
+            sources.append(source)
+
+        current_score = int(existing.get("_impact_score", 0) or 0)
+        if score > current_score:
+            existing["impact"] = impact or existing.get("impact", "info")
+            existing["_impact_score"] = score
+
+    deduped: list[dict[str, object]] = []
+    for row in sorted(
+        merged.values(),
+        key=lambda item: (
+            item.get("day") if isinstance(item.get("day"), date) else date.min,
+            str(item.get("country", "")),
+            str(item.get("event", "")),
+        ),
+    ):
+        tracks = row.pop("_tracks", [])
+        sources = row.pop("_sources", [])
+        row.pop("_impact_score", None)
+        if isinstance(tracks, list) and tracks:
+            dedup_tracks = sorted({str(item).strip() for item in tracks if str(item).strip()})
+            if dedup_tracks:
+                row["track"] = " + ".join(dedup_tracks[:2]) + (" + more" if len(dedup_tracks) > 2 else "")
+        if isinstance(sources, list) and sources:
+            dedup_sources = sorted({str(item).strip() for item in sources if str(item).strip()})
+            if dedup_sources:
+                row["source"] = _shorten("; ".join(dedup_sources[:2]), 50)
         deduped.append(row)
     return deduped[: max(1, max_rows)]
 
@@ -1394,18 +1495,40 @@ def _comparability_summary(
 
 def _source_quality_summary(additional_context: dict[str, object] | None) -> str:
     rows = _source_freshness_rows(additional_context)
+    reliability = (additional_context or {}).get("external_source_reliability", {})
+    reliability_text = ""
+    if isinstance(reliability, dict) and reliability.get("enabled"):
+        summary = reliability.get("summary", {})
+        if isinstance(summary, dict):
+            weighted_score = float(summary.get("weighted_score", 0.0) or 0.0)
+            sources_count = int(summary.get("sources_count", 0) or 0)
+            tiers = summary.get("tier_counts", {})
+            official = 0
+            high_quality = 0
+            if isinstance(tiers, dict):
+                official = int(tiers.get("official", 0) or 0) + int(tiers.get("public-institution", 0) or 0)
+                high_quality = int(tiers.get("high-quality media", 0) or 0)
+            reliability_text = (
+                "Source reliability score "
+                f"{weighted_score:.1f}/100 across {sources_count} sources "
+                f"(official/public={official}, high-quality media={high_quality})."
+            )
     if not rows:
-        return ""
+        return reliability_text
     fresh = sum(1 for row in rows if str(row.get("status", "")).strip().lower() == "fresh")
     stale = sum(1 for row in rows if str(row.get("status", "")).strip().lower() == "stale")
     degraded = sum(1 for row in rows if str(row.get("status", "")).strip().lower() == "degraded")
     total = len(rows)
     if stale == 0 and degraded == 0:
-        return f"Data quality check: all core sources are fresh ({fresh}/{total})."
-    return (
-        "Data quality check: some sources are delayed or degraded "
-        f"(fresh={fresh}, stale={stale}, degraded={degraded}; total={total})."
-    )
+        freshness = f"Data quality check: all core sources are fresh ({fresh}/{total})."
+    else:
+        freshness = (
+            "Data quality check: some sources are delayed or degraded "
+            f"(fresh={fresh}, stale={stale}, degraded={degraded}; total={total})."
+        )
+    if reliability_text:
+        return freshness + " " + reliability_text
+    return freshness
 
 
 QUALITY_GUARDRAIL_DROP_PREFIXES = (
@@ -1963,6 +2086,38 @@ def _build_evidence_ledger(
                     "note": f"rows={len(weekly_news.get('rows', []) if isinstance(weekly_news.get('rows', []), list) else [])}",
                 }
             )
+        updates_timeline = additional_context.get("google_updates_timeline", {})
+        if isinstance(updates_timeline, dict) and updates_timeline.get("enabled"):
+            summary = updates_timeline.get("summary", {})
+            rows.append(
+                {
+                    "id": f"E{len(rows) + 1}",
+                    "source": "Google updates timeline (13M)",
+                    "date": f"{updates_timeline.get('scan_start','')}..{updates_timeline.get('scan_end','')}",
+                    "note": (
+                        f"30d={int((summary or {}).get('count_current_30d', 0) or 0)}; "
+                        f"latest={str((summary or {}).get('latest_update_date', '')).strip()}"
+                        if isinstance(summary, dict)
+                        else "timeline summary"
+                    ),
+                }
+            )
+        case_studies = additional_context.get("serp_case_studies", {})
+        if isinstance(case_studies, dict) and case_studies.get("enabled"):
+            summary = case_studies.get("summary", {})
+            rows.append(
+                {
+                    "id": f"E{len(rows) + 1}",
+                    "source": "SERP case-study scanner (13M)",
+                    "date": f"{case_studies.get('scan_start','')}..{case_studies.get('scan_end','')}",
+                    "note": (
+                        f"total={int((summary or {}).get('total_count_13m', 0) or 0)}; "
+                        f"latest={str((summary or {}).get('latest_case_date', '')).strip()}"
+                        if isinstance(summary, dict)
+                        else "case-study summary"
+                    ),
+                }
+            )
     return rows[: max(1, limit)]
 
 
@@ -2373,6 +2528,262 @@ def _top_unique_feature_movers(
         key=lambda row: float(row.get("delta_clicks_vs_previous", 0.0) or 0.0),
     )[: max(1, int(limit))]
     return gains, losses
+
+
+def _feature_mover_pairs(
+    rows: list[dict[str, object]],
+    *,
+    delta_key: str,
+    limit: int = 1,
+) -> tuple[list[str], list[str]]:
+    if not rows:
+        return [], []
+    gains = sorted(
+        [
+            row for row in rows
+            if isinstance(row, dict) and float(row.get(delta_key, 0.0) or 0.0) > 0.0
+        ],
+        key=lambda row: float(row.get(delta_key, 0.0) or 0.0),
+        reverse=True,
+    )[: max(1, int(limit))]
+    losses = sorted(
+        [
+            row for row in rows
+            if isinstance(row, dict) and float(row.get(delta_key, 0.0) or 0.0) < 0.0
+        ],
+        key=lambda row: float(row.get(delta_key, 0.0) or 0.0),
+    )[: max(1, int(limit))]
+    gain_text = [
+        f"{str(row.get('feature', '')).strip()} ({_fmt_signed_compact(row.get(delta_key, 0.0))})"
+        for row in gains
+        if str(row.get("feature", "")).strip()
+    ]
+    loss_text = [
+        f"{str(row.get('feature', '')).strip()} ({_fmt_signed_compact(row.get(delta_key, 0.0))})"
+        for row in losses
+        if str(row.get("feature", "")).strip()
+    ]
+    return gain_text, loss_text
+
+
+def _serp_appearance_summary_text(additional_context: dict[str, object] | None) -> str:
+    feature_split = (additional_context or {}).get("gsc_feature_split", {})
+    if not isinstance(feature_split, dict) or not feature_split.get("enabled"):
+        return ""
+    weekly_rows = feature_split.get("rows_weekly", feature_split.get("rows", []))
+    monthly_rows = feature_split.get("rows_mom", [])
+    overview_rows = feature_split.get("feature_overview", [])
+    if not isinstance(weekly_rows, list):
+        weekly_rows = []
+    if not isinstance(monthly_rows, list):
+        monthly_rows = []
+    if not isinstance(overview_rows, list):
+        overview_rows = []
+
+    wow_gain, wow_loss = _feature_mover_pairs(weekly_rows, delta_key="delta_clicks_vs_previous", limit=1)
+    mom_gain, mom_loss = _feature_mover_pairs(monthly_rows, delta_key="delta_clicks_vs_previous", limit=1)
+
+    yoy_reference_rows: list[dict[str, object]] = []
+    if overview_rows:
+        for row in overview_rows:
+            if not isinstance(row, dict):
+                continue
+            yoy_reference_rows.append(
+                {
+                    "feature": row.get("feature", ""),
+                    "delta_clicks_vs_previous": row.get("yoy_delta_clicks", 0.0),
+                }
+            )
+    else:
+        yoy_reference_rows = weekly_rows
+    yoy_gain, yoy_loss = _feature_mover_pairs(yoy_reference_rows, delta_key="delta_clicks_vs_previous", limit=1)
+
+    parts: list[str] = []
+    if wow_gain or wow_loss:
+        parts.append(
+            "WoW "
+            + (f"up: {wow_gain[0]}; " if wow_gain else "")
+            + (f"down: {wow_loss[0]}" if wow_loss else "")
+        )
+    if mom_gain or mom_loss:
+        parts.append(
+            "MoM "
+            + (f"up: {mom_gain[0]}; " if mom_gain else "")
+            + (f"down: {mom_loss[0]}" if mom_loss else "")
+        )
+    if yoy_gain or yoy_loss:
+        parts.append(
+            "YoY "
+            + (f"up: {yoy_gain[0]}; " if yoy_gain else "")
+            + (f"down: {yoy_loss[0]}" if yoy_loss else "")
+        )
+    if not parts:
+        return ""
+    return "SERP appearance split (GSC searchAppearance): " + " | ".join(parts) + "."
+
+
+def _serp_unified_feature_rows(
+    additional_context: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    feature_split = (additional_context or {}).get("gsc_feature_split", {})
+    if not isinstance(feature_split, dict) or not feature_split.get("enabled"):
+        return []
+    rows = feature_split.get("rows_unified", feature_split.get("feature_overview", []))
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        feature = str(row.get("feature", "")).strip()
+        if not feature:
+            continue
+        out.append(row)
+    return out
+
+
+def _serp_unified_compact_table_lines(
+    additional_context: dict[str, object] | None,
+    *,
+    limit: int = 4,
+) -> list[str]:
+    rows = _serp_unified_feature_rows(additional_context)
+    if not rows:
+        return []
+    ranked = sorted(
+        rows,
+        key=lambda row: max(
+            abs(float(row.get("wow_delta_clicks", 0.0) or 0.0)),
+            abs(float(row.get("mom_delta_clicks", 0.0) or 0.0)),
+            abs(float(row.get("yoy_delta_clicks", 0.0) or 0.0)),
+        ),
+        reverse=True,
+    )[: max(1, int(limit))]
+    lines = [
+        "SERP feature split table (aligned windows):",
+        "Feature | WoW | MoM | YoY",
+    ]
+    for row in ranked:
+        feature = str(row.get("feature", "")).strip()
+        wow = _fmt_signed_compact(row.get("wow_delta_clicks", 0.0))
+        mom = _fmt_signed_compact(row.get("mom_delta_clicks", 0.0))
+        yoy = _fmt_signed_compact(row.get("yoy_delta_clicks", 0.0))
+        lines.append(f"{feature} | {wow} | {mom} | {yoy}")
+    return lines
+
+
+def _daily_serp_feature_shift_line(additional_context: dict[str, object] | None) -> str:
+    context = (additional_context or {}).get("daily_serp_feature_shifts", {})
+    if not isinstance(context, dict) or not context.get("enabled"):
+        return ""
+    rows = context.get("anomalies", context.get("rows", []))
+    if not isinstance(rows, list) or not rows:
+        return ""
+    top = rows[:2]
+    snippets: list[str] = []
+    for row in top:
+        if not isinstance(row, dict):
+            continue
+        feature = str(row.get("feature", "")).strip()
+        day = str(row.get("date", "")).strip()
+        delta_pp = float(row.get("delta_share_pp_vs_previous_weekday", 0.0) or 0.0)
+        if feature and day:
+            snippets.append(f"{day}: {feature} ({delta_pp:+.2f} pp vs previous-weekday)")
+    if not snippets:
+        return ""
+    return (
+        "Daily SERP feature-share shifts: "
+        + "; ".join(snippets)
+        + ". This helps explain where clicks moved between result types."
+    )
+
+
+def _daily_anomaly_detector_line(additional_context: dict[str, object] | None) -> str:
+    context = (additional_context or {}).get("daily_gsc_anomalies", {})
+    if not isinstance(context, dict) or not context.get("enabled"):
+        return ""
+    rows = context.get("rows", [])
+    if not isinstance(rows, list) or not rows:
+        return ""
+    snippets: list[str] = []
+    for row in rows[:2]:
+        if not isinstance(row, dict):
+            continue
+        day = str(row.get("date", "")).strip()
+        delta_clicks = _fmt_signed_compact(row.get("delta_clicks_vs_previous_weekday", 0.0))
+        delta_ctr = float(row.get("delta_ctr_pp_vs_previous_weekday", 0.0) or 0.0)
+        markers = row.get("markers", [])
+        marker_text = ""
+        if isinstance(markers, list) and markers:
+            marker_text = str(markers[0]).strip()
+        if day:
+            snippets.append(
+                f"{day} ({delta_clicks}; CTR {delta_ctr:+.2f} pp)"
+                + (f" -> {marker_text}" if marker_text else "")
+            )
+    if not snippets:
+        return ""
+    return "Daily KPI anomaly detector: " + "; ".join(snippets) + "."
+
+
+def _google_updates_timeline_text(additional_context: dict[str, object] | None) -> str:
+    updates = (additional_context or {}).get("google_updates_timeline", {})
+    if not isinstance(updates, dict) or not updates.get("enabled"):
+        return ""
+    summary = updates.get("summary", {})
+    if not isinstance(summary, dict):
+        return ""
+    current_30d = int(summary.get("count_current_30d", 0) or 0)
+    previous_30d = int(summary.get("count_previous_30d", 0) or 0)
+    yoy_30d = int(summary.get("count_yoy_30d", 0) or 0)
+    latest_date = str(summary.get("latest_update_date", "")).strip()
+    latest_title = str(summary.get("latest_update_title", "")).strip()
+    total_count = int(summary.get("total_count_13m", 0) or 0)
+    return (
+        "Google update timeline (13M): "
+        f"{total_count} tracked updates/signals. "
+        f"Last 30d vs previous 30d: {current_30d} vs {previous_30d}; "
+        f"vs YoY 30d: {current_30d} vs {yoy_30d}. "
+        + (
+            f"Latest signal: {latest_date} (`{latest_title}`)."
+            if latest_date and latest_title
+            else ""
+        )
+    ).strip()
+
+
+def _serp_case_study_text(additional_context: dict[str, object] | None) -> str:
+    studies = (additional_context or {}).get("serp_case_studies", {})
+    if not isinstance(studies, dict) or not studies.get("enabled"):
+        return ""
+    summary = studies.get("summary", {})
+    if not isinstance(summary, dict):
+        return ""
+    topic_counts = summary.get("topic_counts_13m", {})
+    top_topics: list[str] = []
+    if isinstance(topic_counts, dict):
+        ranked = sorted(
+            [
+                (str(topic).strip(), int(count or 0))
+                for topic, count in topic_counts.items()
+                if str(topic).strip()
+            ],
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        top_topics = [f"{topic}" for topic, _ in ranked[:3]]
+    latest_date = str(summary.get("latest_case_date", "")).strip()
+    latest_title = str(summary.get("latest_case_title", "")).strip()
+    return (
+        "SERP case-study scanner (13M): recurring external patterns include "
+        + (", ".join(top_topics) if top_topics else "CTR and feature-layout shifts")
+        + ". "
+        + (
+            f"Latest relevant publication: {latest_date} (`{latest_title}`)."
+            if latest_date and latest_title
+            else ""
+        )
+    ).strip()
 
 
 def _brand_ads_hypothesis(
@@ -3159,6 +3570,24 @@ def _build_executive_summary_lines(
                 f"({first_day.isoformat()} to {last_day.isoformat()}) for {country_hint}."
             )
 
+    serp_split_line = _serp_appearance_summary_text(additional_context)
+    if serp_split_line:
+        lines.append("- **SERP appearance mix (WoW/MoM/YoY)**: " + serp_split_line.replace("SERP appearance split (GSC searchAppearance): ", ""))
+    daily_serp_line = _daily_serp_feature_shift_line(additional_context)
+    if daily_serp_line:
+        lines.append("- **Daily SERP feature shifts**: " + daily_serp_line.replace("Daily SERP feature-share shifts: ", ""))
+    daily_anomaly_line = _daily_anomaly_detector_line(additional_context)
+    if daily_anomaly_line:
+        lines.append("- **Daily KPI anomalies**: " + daily_anomaly_line.replace("Daily KPI anomaly detector: ", ""))
+
+    updates_timeline_line = _google_updates_timeline_text(additional_context)
+    if updates_timeline_line:
+        lines.append("- **Google updates timeline (13 months)**: " + updates_timeline_line.replace("Google update timeline (13M): ", ""))
+
+    case_study_line = _serp_case_study_text(additional_context)
+    if case_study_line:
+        lines.append("- **External case-study context (13 months)**: " + case_study_line.replace("SERP case-study scanner (13M): ", ""))
+
     daily_story = _build_daily_gsc_storyline(
         additional_context=additional_context,
         external_signals=external_signals,
@@ -3295,6 +3724,11 @@ def _build_executive_summary_lines(
         "- **Top signals**:",
         "- **Priority actions",
         "- **Marketplace timeline",
+        "- **SERP appearance mix (WoW/MoM/YoY)**:",
+        "- **Daily SERP feature shifts**:",
+        "- **Daily KPI anomalies**:",
+        "- **Google updates timeline (13 months)**:",
+        "- **External case-study context (13 months)**:",
         "- **Daily GSC pulse (day-by-day)**:",
         "- **Decision this week**:",
         "- **Data reliability & comparability**:",
@@ -3310,7 +3744,7 @@ def _build_executive_summary_lines(
             selected.append(row)
     if not selected:
         selected = lines
-    return selected[:10]
+    return selected[:14]
 
 
 def _build_leadership_snapshot_lines(
@@ -3552,6 +3986,12 @@ def _build_what_is_happening_lines(
             text = str(row).strip()
             if text:
                 lines.append(text)
+    serp_daily_line = _daily_serp_feature_shift_line(additional_context)
+    if serp_daily_line:
+        lines.append(serp_daily_line)
+    daily_anomaly_line = _daily_anomaly_detector_line(additional_context)
+    if daily_anomaly_line:
+        lines.append(daily_anomaly_line)
 
     yoy_line = (
         f"**YoY diagnosis**: **clicks are {_fmt_signed_compact(current.clicks - yoy.clicks)} ({yoy_pct})**. "
@@ -3837,27 +4277,77 @@ def _build_what_is_happening_lines(
 
     feature_split = (additional_context or {}).get("gsc_feature_split", {})
     if isinstance(feature_split, dict) and feature_split.get("enabled"):
-        rows = feature_split.get("rows", [])
-        if isinstance(rows, list) and rows:
-            movers = [row for row in rows if isinstance(row, dict)]
-            gains, losses = _top_unique_feature_movers(movers, limit=2)
-            if gains or losses:
-                gain_text = "; ".join(
-                    f"{str(row.get('feature', '')).strip()} ({_fmt_signed_compact(row.get('delta_clicks_vs_previous', 0.0))})"
-                    for row in gains
-                    if str(row.get("feature", "")).strip()
-                )
-                loss_text = "; ".join(
-                    f"{str(row.get('feature', '')).strip()} ({_fmt_signed_compact(row.get('delta_clicks_vs_previous', 0.0))})"
-                    for row in losses
-                    if str(row.get("feature", "")).strip()
-                )
-                lines.append(
-                    "GSC signals suggest visibility shifted across SERP result types rather than one uniform drop. "
-                    + (f"Strengthening signals: {gain_text}. " if gain_text else "")
-                    + (f"Weakening signals: {loss_text}. " if loss_text else "")
-                    + "Likely impact on traffic mix: medium."
-                )
+        rows_weekly = feature_split.get("rows_weekly", feature_split.get("rows", []))
+        rows_mom = feature_split.get("rows_mom", [])
+        feature_overview = feature_split.get("feature_overview", [])
+        if not isinstance(rows_weekly, list):
+            rows_weekly = []
+        if not isinstance(rows_mom, list):
+            rows_mom = []
+        if not isinstance(feature_overview, list):
+            feature_overview = []
+
+        wow_gains, wow_losses = _feature_mover_pairs(
+            [row for row in rows_weekly if isinstance(row, dict)],
+            delta_key="delta_clicks_vs_previous",
+            limit=1,
+        )
+        mom_gains, mom_losses = _feature_mover_pairs(
+            [row for row in rows_mom if isinstance(row, dict)],
+            delta_key="delta_clicks_vs_previous",
+            limit=1,
+        )
+        yoy_rows = []
+        for row in feature_overview:
+            if not isinstance(row, dict):
+                continue
+            yoy_rows.append(
+                {
+                    "feature": row.get("feature", ""),
+                    "delta_clicks_vs_previous": row.get("yoy_delta_clicks", 0.0),
+                }
+            )
+        yoy_gains, yoy_losses = _feature_mover_pairs(yoy_rows, delta_key="delta_clicks_vs_previous", limit=1)
+
+        serp_parts: list[str] = []
+        if wow_gains or wow_losses:
+            serp_parts.append(
+                "WoW "
+                + (f"up: {wow_gains[0]}; " if wow_gains else "")
+                + (f"down: {wow_losses[0]}" if wow_losses else "")
+            )
+        if mom_gains or mom_losses:
+            serp_parts.append(
+                "MoM "
+                + (f"up: {mom_gains[0]}; " if mom_gains else "")
+                + (f"down: {mom_losses[0]}" if mom_losses else "")
+            )
+        if yoy_gains or yoy_losses:
+            serp_parts.append(
+                "YoY "
+                + (f"up: {yoy_gains[0]}; " if yoy_gains else "")
+                + (f"down: {yoy_losses[0]}" if yoy_losses else "")
+            )
+        if serp_parts:
+            lines.append(
+                "SERP appearance deltas (GSC searchAppearance) indicate traffic moved between result types, "
+                "not one uniform decline. "
+                + " | ".join(serp_parts)
+                + "."
+            )
+        for row in _serp_unified_compact_table_lines(additional_context, limit=4):
+            lines.append(row)
+
+    updates_timeline = _google_updates_timeline_text(additional_context)
+    if updates_timeline:
+        lines.append(updates_timeline)
+
+    case_study_context = _serp_case_study_text(additional_context)
+    if case_study_context:
+        lines.append(
+            case_study_context
+            + " Use this as hypothesis support, not as standalone root cause."
+        )
 
     weekly_news = (additional_context or {}).get("weekly_news_digest", {})
     if isinstance(weekly_news, dict) and weekly_news.get("enabled"):
@@ -4559,6 +5049,93 @@ def _build_reasoning_hypotheses(
                         }
                     )
 
+        updates_timeline = additional_context.get("google_updates_timeline", {})
+        if isinstance(updates_timeline, dict) and updates_timeline.get("enabled"):
+            summary = updates_timeline.get("summary", {})
+            if isinstance(summary, dict):
+                current_30d = int(summary.get("count_current_30d", 0) or 0)
+                previous_30d = int(summary.get("count_previous_30d", 0) or 0)
+                yoy_30d = int(summary.get("count_yoy_30d", 0) or 0)
+                latest_date = str(summary.get("latest_update_date", "")).strip()
+                latest_title = str(summary.get("latest_update_title", "")).strip()
+                if current_30d > 0:
+                    delta_vs_previous = current_30d - previous_30d
+                    confidence = 62
+                    if abs(delta_vs_previous) >= 3:
+                        confidence += 8
+                    if yoy_30d > 0 and abs(current_30d - yoy_30d) >= 3:
+                        confidence += 4
+                    hypotheses.append(
+                        {
+                            "category": "Algorithm/SERP context",
+                            "confidence": min(82, confidence),
+                            "thesis": (
+                                "Google update cadence in recent weeks can influence SERP behavior and click allocation; "
+                                "treat update timing as a plausible context layer for weekly movement."
+                            ),
+                            "evidence": [
+                                f"Update timeline 30d: {current_30d} vs previous 30d {previous_30d}, vs YoY 30d {yoy_30d}.",
+                                (
+                                    f"Latest tracked update signal: {latest_date} ({latest_title})."
+                                    if latest_date and latest_title
+                                    else "Latest update signal date was not available in this run."
+                                ),
+                            ],
+                            "owner": "SEO",
+                        }
+                    )
+
+        case_studies = additional_context.get("serp_case_studies", {})
+        if isinstance(case_studies, dict) and case_studies.get("enabled"):
+            summary = case_studies.get("summary", {})
+            if isinstance(summary, dict):
+                topic_counts = summary.get("topic_counts_13m", {})
+                top_topics: list[str] = []
+                if isinstance(topic_counts, dict):
+                    ranked_topics = sorted(
+                        [
+                            (str(topic).strip(), int(count or 0))
+                            for topic, count in topic_counts.items()
+                            if str(topic).strip()
+                        ],
+                        key=lambda item: item[1],
+                        reverse=True,
+                    )
+                    top_topics = [topic for topic, _ in ranked_topics[:3]]
+                current_30d = int(summary.get("count_current_30d", 0) or 0)
+                previous_30d = int(summary.get("count_previous_30d", 0) or 0)
+                total_13m = int(summary.get("total_count_13m", 0) or 0)
+                latest_case_date = str(summary.get("latest_case_date", "")).strip()
+                latest_case_title = str(summary.get("latest_case_title", "")).strip()
+                if total_13m > 0:
+                    confidence = 60
+                    if current_30d >= previous_30d:
+                        confidence += 6
+                    if any("ctr" in _normalize_text(topic) or "serp" in _normalize_text(topic) for topic in top_topics):
+                        confidence += 8
+                    hypotheses.append(
+                        {
+                            "category": "SERP behavior context",
+                            "confidence": min(82, confidence),
+                            "thesis": (
+                                "External case studies repeatedly describe CTR and placement-mix shifts across SERP features, "
+                                "which supports a traffic-allocation interpretation before technical root-cause escalation."
+                            ),
+                            "evidence": [
+                                "Top recurring topics (13M): "
+                                + (", ".join(top_topics) if top_topics else "CTR and SERP feature changes")
+                                + ".",
+                                f"Case-study volume 30d: {current_30d} vs previous 30d {previous_30d}; total in 13M: {total_13m}.",
+                                (
+                                    f"Latest relevant case signal: {latest_case_date} ({latest_case_title})."
+                                    if latest_case_date and latest_case_title
+                                    else "Latest case-study title was not available in this run."
+                                ),
+                            ],
+                            "owner": "SEO + BI",
+                        }
+                    )
+
         seo_presentations = additional_context.get("seo_presentations", {})
         if isinstance(seo_presentations, dict) and seo_presentations.get("enabled"):
             highlights = seo_presentations.get("highlights", [])
@@ -4755,8 +5332,20 @@ def _build_reasoning_hypotheses(
             row.setdefault("falsifier", default_protocol["falsifier"])
             row.setdefault("validation_metric", default_protocol["validation_metric"])
         row.setdefault("validation_date", default_protocol["validation_date"])
+        if any(token in category for token in SUPPORTING_CONTEXT_CATEGORY_TOKENS):
+            row["supporting_context_only"] = True
+            row["confidence"] = min(63, int(row.get("confidence", 0) or 0))
+            row["thesis"] = (
+                str(row.get("thesis", "")).strip()
+                + " (supporting context only; not a primary fact)."
+            ).strip()
 
-    hypotheses.sort(key=lambda row: int(row.get("confidence", 0)), reverse=True)
+    hypotheses.sort(
+        key=lambda row: (
+            1 if bool(row.get("supporting_context_only")) else 0,
+            -int(row.get("confidence", 0) or 0),
+        )
+    )
     return hypotheses
 
 
@@ -4959,7 +5548,7 @@ def build_markdown_report(
         windows=windows,
         external_signals=external_signals,
         additional_context=additional_context,
-        limit=8,
+        limit=12,
     )
     if evidence_ledger:
         anchor_ids = ", ".join(f"[{row.get('id', '')}]" for row in evidence_ledger if row.get("id"))

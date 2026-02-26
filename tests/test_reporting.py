@@ -7,6 +7,8 @@ from docx import Document
 
 from weekly_seo_agent.models import AnalysisResult, DateWindow, ExternalSignal, KeyDelta, MetricSummary
 from weekly_seo_agent.reporting import (
+    _build_reasoning_hypotheses,
+    _marketplace_timeline_rows,
     build_markdown_report,
     enforce_manager_quality_guardrail,
     write_docx,
@@ -335,6 +337,58 @@ def test_write_docx_renders_markdown_bold(tmp_path):
     assert any(run.text == "Wazny punkt" and run.bold for run in first.runs)
 
 
+def test_marketplace_timeline_canonical_dedup_merges_same_event_same_day() -> None:
+    additional_context = {
+        "market_event_calendar": {
+            "enabled": True,
+            "country_code": "PL",
+            "events": [
+                {
+                    "date": "2026-02-22",
+                    "title": "Planned campaign: MegaRaty February",
+                    "source": "Trade plan sheet",
+                    "impact_level": "MEDIUM",
+                    "impact_direction": "Upside potential",
+                    "confidence": 62,
+                },
+                {
+                    "date": "2026-02-22",
+                    "title": "MegaRaty February - external mention",
+                    "source": "Market feed",
+                    "impact_level": "HIGH",
+                    "impact_direction": "Upside potential",
+                    "confidence": 78,
+                },
+            ],
+        }
+    }
+    campaign_context = {
+        "allegro_events": [
+            ExternalSignal(
+                source="Campaign tracker Allegro",
+                day=date(2026, 2, 22),
+                title="MegaRaty February campaign live",
+                details="Campaign mention",
+                severity="medium",
+            )
+        ],
+        "competitor_events": [],
+    }
+
+    rows = _marketplace_timeline_rows(
+        additional_context=additional_context,
+        campaign_context=campaign_context,
+        report_country_code="PL",
+        max_rows=20,
+    )
+
+    assert len(rows) == 1
+    first = rows[0]
+    assert first["country"] == "PL"
+    assert "MegaRaty" in str(first.get("event", ""))
+    assert "HIGH" in str(first.get("impact", "")).upper()
+
+
 def test_write_docx_supports_level4_markdown_heading(tmp_path):
     out_path = tmp_path / "report_h4.docx"
     markdown = "#### Seasonality and Winter Queries"
@@ -599,3 +653,253 @@ def test_quality_guardrail_enforces_markers_and_compacts_optional_lines():
     assert "validation metric" in lowered
     assert "validation date" in lowered
     assert len(re.findall(r"\b\w+\b", guarded, flags=re.UNICODE)) <= 160
+
+
+def test_report_surfaces_serp_appearance_and_13m_context_blocks():
+    run_date = date(2026, 2, 25)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=14_200_000, impressions=300_000_000, ctr=0.0472, position=6.27),
+        "previous_28d": MetricSummary(clicks=14_000_000, impressions=297_000_000, ctr=0.0470, position=6.29),
+        "yoy_52w": MetricSummary(clicks=15_900_000, impressions=315_000_000, ctr=0.0500, position=4.92),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    additional_context = {
+        "country_code": "PL",
+        "gsc_feature_split": {
+            "enabled": True,
+            "rows_weekly": [
+                {"feature": "MERCHANT_LISTINGS", "delta_clicks_vs_previous": 55800.0},
+                {"feature": "PRODUCT_SNIPPETS", "delta_clicks_vs_previous": -28750.0},
+            ],
+            "rows_mom": [
+                {"feature": "MERCHANT_LISTINGS", "delta_clicks_vs_previous": 121000.0},
+                {"feature": "REVIEW_SNIPPET", "delta_clicks_vs_previous": -8300.0},
+            ],
+            "feature_overview": [
+                {"feature": "MERCHANT_LISTINGS", "yoy_delta_clicks": 210000.0},
+                {"feature": "PRODUCT_SNIPPETS", "yoy_delta_clicks": -165000.0},
+            ],
+        },
+        "google_updates_timeline": {
+            "enabled": True,
+            "scan_start": "2025-01-25",
+            "scan_end": "2026-02-25",
+            "summary": {
+                "count_current_30d": 6,
+                "count_previous_30d": 4,
+                "count_yoy_30d": 5,
+                "total_count_13m": 72,
+                "latest_update_date": "2026-02-21",
+                "latest_update_title": "Search ranking volatility update",
+            },
+        },
+        "serp_case_studies": {
+            "enabled": True,
+            "scan_start": "2025-01-25",
+            "scan_end": "2026-02-25",
+            "summary": {
+                "topic_counts_13m": {
+                    "CTR and click distribution": 18,
+                    "SERP layout and features": 13,
+                    "Merchant and free listings": 9,
+                },
+                "count_current_30d": 5,
+                "count_previous_30d": 3,
+                "total_count_13m": 44,
+                "latest_case_date": "2026-02-20",
+                "latest_case_title": "Merchant listings CTR shift after SERP change",
+            },
+        },
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=[],
+        weather_summary={},
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "SERP appearance mix (WoW/MoM/YoY)" in report
+    assert "Google updates timeline (13 months)" in report
+    assert "External case-study context (13 months)" in report
+    assert "SERP appearance deltas (GSC searchAppearance)" in report
+    assert "Google update timeline (13M):" in report
+    assert "SERP case-study scanner (13M):" in report
+
+
+def test_report_surfaces_daily_serp_shifts_and_source_reliability():
+    run_date = date(2026, 2, 25)
+    windows = {
+        "current_28d": DateWindow("Current week (Mon-Sun)", date(2026, 2, 16), date(2026, 2, 22)),
+        "previous_28d": DateWindow("Previous week (Mon-Sun)", date(2026, 2, 9), date(2026, 2, 15)),
+        "yoy_52w": DateWindow("YoY aligned (52 weeks ago)", date(2025, 2, 17), date(2025, 2, 23)),
+    }
+    totals = {
+        "current_28d": MetricSummary(clicks=14_200_000, impressions=300_000_000, ctr=0.0472, position=6.27),
+        "previous_28d": MetricSummary(clicks=14_000_000, impressions=297_000_000, ctr=0.0470, position=6.29),
+        "yoy_52w": MetricSummary(clicks=15_900_000, impressions=315_000_000, ctr=0.0500, position=4.92),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    additional_context = {
+        "country_code": "PL",
+        "gsc_feature_split": {
+            "enabled": True,
+            "rows_weekly": [
+                {"feature": "MERCHANT_LISTINGS", "delta_clicks_vs_previous": 55800.0},
+                {"feature": "PRODUCT_SNIPPETS", "delta_clicks_vs_previous": -28750.0},
+            ],
+            "rows_mom": [
+                {"feature": "MERCHANT_LISTINGS", "delta_clicks_vs_previous": 121000.0},
+                {"feature": "REVIEW_SNIPPET", "delta_clicks_vs_previous": -8300.0},
+            ],
+            "rows_unified": [
+                {
+                    "feature": "MERCHANT_LISTINGS",
+                    "wow_delta_clicks": 55800.0,
+                    "mom_delta_clicks": 121000.0,
+                    "yoy_delta_clicks": 210000.0,
+                },
+                {
+                    "feature": "PRODUCT_SNIPPETS",
+                    "wow_delta_clicks": -28750.0,
+                    "mom_delta_clicks": -10300.0,
+                    "yoy_delta_clicks": -165000.0,
+                },
+            ],
+        },
+        "daily_serp_feature_shifts": {
+            "enabled": True,
+            "anomalies": [
+                {
+                    "date": "2026-02-20",
+                    "feature": "MERCHANT_LISTINGS",
+                    "delta_share_pp_vs_previous_weekday": 2.1,
+                }
+            ],
+        },
+        "daily_gsc_anomalies": {
+            "enabled": True,
+            "rows": [
+                {
+                    "date": "2026-02-20",
+                    "delta_clicks_vs_previous_weekday": -26200.0,
+                    "delta_ctr_pp_vs_previous_weekday": -0.31,
+                    "markers": ["campaign/news marker: MegaRaty February"],
+                }
+            ],
+        },
+        "external_source_reliability": {
+            "enabled": True,
+            "summary": {
+                "weighted_score": 83.4,
+                "sources_count": 9,
+                "tier_counts": {"official": 3, "public-institution": 1, "high-quality media": 4},
+            },
+        },
+    }
+
+    report = build_markdown_report(
+        run_date=run_date,
+        report_country_code="PL",
+        windows=windows,
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=[],
+        weather_summary={},
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    assert "Daily SERP feature shifts" in report
+    assert "Daily KPI anomalies" in report
+    assert "SERP feature split table (aligned windows):" in report
+    assert "Source reliability score" in report
+
+
+def test_external_source_hypotheses_are_supporting_only():
+    totals = {
+        "current_28d": MetricSummary(clicks=1000, impressions=10000, ctr=0.1, position=3.2),
+        "previous_28d": MetricSummary(clicks=1000, impressions=10000, ctr=0.1, position=3.2),
+        "yoy_52w": MetricSummary(clicks=1000, impressions=10000, ctr=0.1, position=3.2),
+    }
+    query_analysis = AnalysisResult(
+        summary_current=totals["current_28d"],
+        summary_previous=totals["previous_28d"],
+        summary_yoy=totals["yoy_52w"],
+        top_losers=[],
+        top_winners=[],
+        findings=[],
+    )
+    additional_context = {
+        "google_updates_timeline": {
+            "enabled": True,
+            "summary": {
+                "count_current_30d": 5,
+                "count_previous_30d": 1,
+                "count_yoy_30d": 2,
+                "latest_update_date": "2026-02-20",
+                "latest_update_title": "Search volatility update",
+            },
+        },
+        "serp_case_studies": {
+            "enabled": True,
+            "summary": {
+                "topic_counts_13m": {"CTR and click distribution": 7},
+                "count_current_30d": 3,
+                "count_previous_30d": 1,
+                "total_count_13m": 18,
+                "latest_case_date": "2026-02-18",
+                "latest_case_title": "SERP layout and CTR",
+            },
+        },
+    }
+    ferie_context = {"yoy_comparison": {"avg_daily_delta_pp": 0.0, "rows": []}}
+
+    hypotheses = _build_reasoning_hypotheses(
+        totals=totals,
+        scope_results=[("query", query_analysis)],
+        external_signals=[],
+        weather_summary={},
+        ferie_context=ferie_context,
+        segment_diagnostics=None,
+        additional_context=additional_context,
+        senuto_summary=None,
+        senuto_error=None,
+    )
+
+    external_rows = [
+        row
+        for row in hypotheses
+        if isinstance(row, dict)
+        and str(row.get("category", "")).strip().lower() in {"algorithm/serp context", "serp behavior context"}
+    ]
+    assert external_rows
+    for row in external_rows:
+        assert bool(row.get("supporting_context_only"))
+        assert int(row.get("confidence", 0)) <= 63

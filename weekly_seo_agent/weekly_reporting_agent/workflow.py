@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import TypedDict
+from typing import Any, TypedDict
 from urllib.parse import urlparse
 
 from langchain_core.output_parsers import StrOutputParser
@@ -261,12 +261,45 @@ def _build_source_freshness_rows(
     additional_context: dict[str, object],
     external_signals: list[ExternalSignal],
     weather_summary: dict[str, float],
+    gsc_data_coverage: dict[str, object] | None,
     external_cache_mode: str,
     additional_cache_mode: str,
+    external_cache_saved_at: float | None = None,
+    additional_cache_saved_at: float | None = None,
     source_ttl_weather_sec: int,
     source_ttl_news_sec: int,
     source_ttl_market_events_sec: int,
 ) -> list[dict[str, object]]:
+    def _to_day(value: object) -> date | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            return None
+
+    def _max_day(rows: object, field: str) -> date | None:
+        if not isinstance(rows, list):
+            return None
+        out: date | None = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            day = _to_day(row.get(field))
+            if day is None:
+                continue
+            out = day if out is None else max(out, day)
+        return out
+
+    def _cache_saved_day(value: float | None) -> date | None:
+        if not isinstance(value, (int, float)):
+            return None
+        try:
+            return date.fromtimestamp(float(value))
+        except Exception:
+            return None
+
     def status_from_mode(mode: str) -> str:
         lowered = mode.strip().lower()
         if "stale" in lowered:
@@ -275,22 +308,40 @@ def _build_source_freshness_rows(
             return "degraded"
         return "fresh"
 
-    def with_ttl(source: str, last_day: date | None, ttl_sec: int, mode: str, note: str) -> dict[str, object]:
+    def with_ttl(
+        source: str,
+        source_group: str,
+        last_day: date | None,
+        ttl_sec: int,
+        mode: str,
+        note: str,
+        cache_saved_day: date | None = None,
+    ) -> dict[str, object]:
         status = status_from_mode(mode)
         age_days: float | None = None
         if last_day is not None:
             age_days = float((run_date - last_day).days)
             if age_days * 24 * 3600 > max(0, ttl_sec) and status == "fresh":
                 status = "stale"
+        elif cache_saved_day is not None:
+            age_days = float((run_date - cache_saved_day).days)
+            if age_days * 24 * 3600 > max(0, ttl_sec) and status == "fresh":
+                status = "stale"
         return {
+            "source_group": source_group,
             "source": source,
             "status": status,
             "last_day": last_day.isoformat() if last_day else "",
             "ttl_hours": round(max(0, ttl_sec) / 3600.0, 1),
             "age_days": age_days,
             "cache_mode": mode,
+            "cache_saved_day": cache_saved_day.isoformat() if cache_saved_day else "",
             "note": note,
         }
+
+    gsc_last_day = _to_day((gsc_data_coverage or {}).get("end")) if isinstance(gsc_data_coverage, dict) else None
+    gsc_days_with_data = int((gsc_data_coverage or {}).get("days_with_data", 0) or 0) if isinstance(gsc_data_coverage, dict) else 0
+    gsc_days_total = int((gsc_data_coverage or {}).get("days_total", 0) or 0) if isinstance(gsc_data_coverage, dict) else 0
 
     weather_last_day = current_window.end if weather_summary_present(external_signals, weather_summary) else None
     news_last_day = _latest_signal_day(
@@ -318,32 +369,147 @@ def _build_source_freshness_rows(
         if isinstance(market_errors, list) and market_errors:
             market_note = str(market_errors[0]).strip()
 
+    status_log = additional_context.get("status_log", {})
+    status_last_day = _max_day(
+        (status_log or {}).get("entries", []) if isinstance(status_log, dict) else [],
+        "date",
+    )
+    product_trends = additional_context.get("product_trends", {})
+    product_rows: list[dict[str, object]] = []
+    if isinstance(product_trends, dict):
+        for key in ("top_yoy_non_brand", "upcoming_31d", "current_non_brand"):
+            rows = product_trends.get(key, [])
+            if isinstance(rows, list):
+                product_rows.extend([row for row in rows if isinstance(row, dict)])
+    product_last_day = _max_day(product_rows, "date")
+
+    trade_plan = additional_context.get("trade_plan", {})
+    trade_last_day = _max_day(
+        (trade_plan or {}).get("rows", []) if isinstance(trade_plan, dict) else [],
+        "date",
+    )
+
+    weekly_news = additional_context.get("weekly_news_digest", {})
+    weekly_news_last_day = _max_day(
+        (weekly_news or {}).get("rows", []) if isinstance(weekly_news, dict) else [],
+        "published",
+    )
+
+    google_updates = additional_context.get("google_updates_timeline", {})
+    google_updates_last_day = _max_day(
+        (google_updates or {}).get("rows", []) if isinstance(google_updates, dict) else [],
+        "date",
+    )
+    serp_case_studies = additional_context.get("serp_case_studies", {})
+    serp_case_last_day = _max_day(
+        (serp_case_studies or {}).get("rows", []) if isinstance(serp_case_studies, dict) else [],
+        "date",
+    )
+
+    external_saved_day = _cache_saved_day(external_cache_saved_at)
+    additional_saved_day = _cache_saved_day(additional_cache_saved_at)
+
     rows: list[dict[str, object]] = [
         with_ttl(
+            "GSC API",
+            "gsc",
+            gsc_last_day,
+            max(60, int(source_ttl_news_sec)),
+            "live",
+            (
+                f"Daily coverage {gsc_days_with_data}/{gsc_days_total} days in current window."
+                if gsc_days_total > 0
+                else "Primary performance source."
+            ),
+        ),
+        with_ttl(
             "Weather",
+            "weather",
             weather_last_day,
             source_ttl_weather_sec,
             external_cache_mode,
             "Historical weather + forecast context.",
+            cache_saved_day=external_saved_day,
         ),
         with_ttl(
             "News/Campaign feeds",
+            "news",
             news_last_day,
             source_ttl_news_sec,
             external_cache_mode,
             "RSS/HTML news and campaign tracker signals.",
+            cache_saved_day=external_saved_day,
         ),
         with_ttl(
             "Market-event API",
+            "events",
             market_last_day,
             source_ttl_market_events_sec,
             additional_cache_mode,
             market_note or "GDELT market-event calendar.",
+            cache_saved_day=additional_saved_day,
+        ),
+        with_ttl(
+            "Status log (Google Sheets)",
+            "sheets",
+            status_last_day,
+            max(60, int(source_ttl_news_sec)),
+            additional_cache_mode,
+            "People/status updates used as supporting managerial context.",
+            cache_saved_day=additional_saved_day,
+        ),
+        with_ttl(
+            "Product trends (Google Sheets)",
+            "sheets",
+            product_last_day,
+            max(60, int(source_ttl_news_sec)),
+            additional_cache_mode,
+            "Non-brand trend trackers (current/upcoming/comparison sheets).",
+            cache_saved_day=additional_saved_day,
+        ),
+        with_ttl(
+            "Trade plan (Google Sheets)",
+            "sheets",
+            trade_last_day,
+            max(60, int(source_ttl_news_sec)),
+            additional_cache_mode,
+            "Campaign/media plan context with WoW/YoY overlays.",
+            cache_saved_day=additional_saved_day,
+        ),
+        with_ttl(
+            "Weekly SEO/GEO digest",
+            "news",
+            weekly_news_last_day,
+            max(60, int(source_ttl_news_sec)),
+            additional_cache_mode,
+            "Weekly publication summary used in supporting hypothesis context.",
+            cache_saved_day=additional_saved_day,
+        ),
+        with_ttl(
+            "Google updates timeline (13M)",
+            "news",
+            google_updates_last_day,
+            max(60, int(source_ttl_news_sec)),
+            additional_cache_mode,
+            "Google status/blog/trusted RSS timeline.",
+            cache_saved_day=additional_saved_day,
+        ),
+        with_ttl(
+            "SERP case studies (13M)",
+            "news",
+            serp_case_last_day,
+            max(60, int(source_ttl_news_sec)),
+            additional_cache_mode,
+            "External SERP/CTR case-study scanner context.",
+            cache_saved_day=additional_saved_day,
         ),
     ]
 
     if market_last_day is None and market_note:
-        rows[-1]["status"] = "degraded"
+        for row in rows:
+            if row.get("source") == "Market-event API":
+                row["status"] = "degraded"
+                break
     return rows
 
 
@@ -355,6 +521,442 @@ def weather_summary_present(
     # Weather can be present without explicit signals if summary values were collected.
     required = ("avg_temp_current_c", "avg_temp_previous_c", "precip_current_mm", "precip_previous_mm")
     return any(float(weather_summary.get(key, 0.0) or 0.0) != 0.0 for key in required)
+
+
+def _window_to_dict(window: DateWindow) -> dict[str, object]:
+    return {
+        "start": window.start.isoformat(),
+        "end": window.end.isoformat(),
+        "days": int(window.days),
+    }
+
+
+def _build_metric_window_availability(
+    *,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    yoy_window: DateWindow,
+    gsc_data_coverage: dict[str, object],
+    gsc_daily_rows: dict[str, object],
+    gsc_feature_split: dict[str, object],
+    daily_serp_feature_shifts: dict[str, object],
+    daily_gsc_anomalies: dict[str, object],
+    weather_summary: dict[str, float],
+    additional_context: dict[str, object],
+) -> dict[str, object]:
+    def has_rows(payload: object, key: str) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        rows = payload.get(key, [])
+        return isinstance(rows, list) and bool(rows)
+
+    daily_rows = gsc_daily_rows if isinstance(gsc_daily_rows, dict) else {}
+    feature_rows = gsc_feature_split if isinstance(gsc_feature_split, dict) else {}
+    daily_serp_rows = (
+        daily_serp_feature_shifts if isinstance(daily_serp_feature_shifts, dict) else {}
+    )
+    daily_anomaly_rows = (
+        daily_gsc_anomalies if isinstance(daily_gsc_anomalies, dict) else {}
+    )
+    trade_plan = additional_context.get("trade_plan", {})
+    market_events = additional_context.get("market_event_calendar", {})
+    weekly_news = additional_context.get("weekly_news_digest", {})
+
+    gsc_days_total = int(gsc_data_coverage.get("days_total", 0) or 0)
+    gsc_days_with_data = int(gsc_data_coverage.get("days_with_data", 0) or 0)
+    gsc_yoy_days = int(gsc_data_coverage.get("p52w_days_used", 0) or 0)
+    daily_prev_days = int(daily_rows.get("days_with_previous_weekday_data", 0) or 0)
+    daily_yoy_days = int(daily_rows.get("days_with_yoy_day_data", 0) or 0)
+    serp_daily_rows = (
+        daily_serp_rows.get("rows", []) if isinstance(daily_serp_rows, dict) else []
+    )
+    serp_daily_rows = serp_daily_rows if isinstance(serp_daily_rows, list) else []
+    serp_daily_yoy_days = sum(
+        1
+        for row in serp_daily_rows
+        if isinstance(row, dict) and float(row.get("clicks_yoy_day", 0.0) or 0.0) > 0.0
+    )
+    anomaly_rows = (
+        daily_anomaly_rows.get("rows", []) if isinstance(daily_anomaly_rows, dict) else []
+    )
+    anomaly_rows = anomaly_rows if isinstance(anomaly_rows, list) else []
+
+    trade_rows = trade_plan.get("rows", []) if isinstance(trade_plan, dict) else []
+    trade_rows_current = 0
+    trade_rows_previous = 0
+    trade_rows_yoy = 0
+    if isinstance(trade_rows, list):
+        for row in trade_rows:
+            if not isinstance(row, dict):
+                continue
+            bucket = str(row.get("bucket", "")).strip().lower()
+            if bucket == "current":
+                trade_rows_current += 1
+            elif bucket == "previous":
+                trade_rows_previous += 1
+            elif bucket == "yoy":
+                trade_rows_yoy += 1
+
+    weather_daily_current = weather_summary.get("daily_current", [])
+    weather_daily_previous = weather_summary.get("daily_previous", [])
+    weather_daily_yoy = weather_summary.get("daily_yoy", [])
+    weather_current_ok = isinstance(weather_daily_current, list) and bool(weather_daily_current)
+    weather_previous_ok = isinstance(weather_daily_previous, list) and bool(weather_daily_previous)
+    weather_yoy_ok = isinstance(weather_daily_yoy, list) and bool(weather_daily_yoy)
+
+    market_current = has_rows(market_events, "events")
+    market_yoy = has_rows(market_events, "events_yoy")
+    weekly_current = int((weekly_news or {}).get("total_count", 0) or 0) > 0 if isinstance(weekly_news, dict) else False
+    weekly_yoy = int((weekly_news or {}).get("total_count_yoy", 0) or 0) > 0 if isinstance(weekly_news, dict) else False
+
+    rows: list[dict[str, object]] = [
+        {
+            "source": "GSC totals",
+            "window_type": "weekly",
+            "current_available": gsc_days_with_data > 0,
+            "previous_available": daily_prev_days > 0,
+            "yoy_available": gsc_yoy_days > 0,
+            "coverage_note": f"{gsc_days_with_data}/{gsc_days_total} current days; YoY aligned days: {gsc_yoy_days}.",
+        },
+        {
+            "source": "GSC daily rows",
+            "window_type": "daily",
+            "current_available": int(daily_rows.get("days_with_data", 0) or 0) > 0,
+            "previous_available": daily_prev_days > 0,
+            "yoy_available": daily_yoy_days > 0,
+            "coverage_note": (
+                f"Current daily rows: {int(daily_rows.get('days_with_data', 0) or 0)}; "
+                f"previous-day links: {daily_prev_days}; YoY-day links: {daily_yoy_days}."
+            ),
+        },
+        {
+            "source": "GSC feature split",
+            "window_type": "weekly+monthly",
+            "current_available": has_rows(feature_rows, "rows_weekly"),
+            "previous_available": has_rows(feature_rows, "rows_weekly"),
+            "yoy_available": any(
+                isinstance(row, dict) and ("yoy_delta_clicks" in row or "delta_clicks_vs_yoy" in row)
+                for row in (feature_rows.get("rows_weekly", []) if isinstance(feature_rows, dict) else [])
+            ),
+            "coverage_note": (
+                f"Weekly rows: {len(feature_rows.get('rows_weekly', [])) if isinstance(feature_rows.get('rows_weekly', []), list) else 0}; "
+                f"monthly rows: {len(feature_rows.get('rows_mom', [])) if isinstance(feature_rows.get('rows_mom', []), list) else 0}."
+            ),
+        },
+        {
+            "source": "GSC daily SERP feature shifts",
+            "window_type": "daily",
+            "current_available": bool(serp_daily_rows),
+            "previous_available": bool(serp_daily_rows),
+            "yoy_available": serp_daily_yoy_days > 0,
+            "coverage_note": (
+                f"Days with dominant feature-shift rows: {len(serp_daily_rows)}; "
+                f"YoY-linked days: {serp_daily_yoy_days}."
+            ),
+        },
+        {
+            "source": "GSC daily anomaly detector",
+            "window_type": "daily",
+            "current_available": bool(anomaly_rows),
+            "previous_available": daily_prev_days > 0,
+            "yoy_available": daily_yoy_days > 0,
+            "coverage_note": (
+                f"Detected anomalies: {len(anomaly_rows)} "
+                "(based on clicks/CTR/position shifts vs previous-weekday)."
+            ),
+        },
+        {
+            "source": "Trade plan",
+            "window_type": "weekly",
+            "current_available": trade_rows_current > 0,
+            "previous_available": trade_rows_previous > 0,
+            "yoy_available": trade_rows_yoy > 0
+            or bool(str((trade_plan or {}).get("yoy_sheet", {}).get("id", "")).strip())
+            if isinstance(trade_plan, dict)
+            else False,
+            "coverage_note": (
+                f"Rows by bucket current/previous/yoy: "
+                f"{trade_rows_current}/{trade_rows_previous}/{trade_rows_yoy}."
+            ),
+        },
+        {
+            "source": "Weather context",
+            "window_type": "daily",
+            "current_available": weather_current_ok,
+            "previous_available": weather_previous_ok,
+            "yoy_available": weather_yoy_ok,
+            "coverage_note": "Daily weather arrays for current/previous/YoY windows.",
+        },
+        {
+            "source": "Market events",
+            "window_type": "weekly",
+            "current_available": market_current,
+            "previous_available": False,
+            "yoy_available": market_yoy,
+            "coverage_note": "Event timeline supports current week and optional YoY mirror.",
+        },
+        {
+            "source": "Weekly SEO/GEO digest",
+            "window_type": "weekly",
+            "current_available": weekly_current,
+            "previous_available": False,
+            "yoy_available": weekly_yoy,
+            "coverage_note": "Current-week and aligned YoY publication counts.",
+        },
+    ]
+
+    return {
+        "enabled": True,
+        "source": "Ingestion window alignment registry",
+        "windows": {
+            "current": _window_to_dict(current_window),
+            "previous": _window_to_dict(previous_window),
+            "yoy": _window_to_dict(yoy_window),
+        },
+        "rows": rows,
+    }
+
+
+def _build_missing_data_policy() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "source": "Weekly ingestion fallback policy",
+        "policy_rows": [
+            {
+                "source": "GSC",
+                "severity": "blocker",
+                "fallback": "Stop run (no substitute for core KPI source).",
+            },
+            {
+                "source": "Google Drive publish",
+                "severity": "blocker",
+                "fallback": "Keep local DOCX only and raise explicit delivery error.",
+            },
+            {
+                "source": "Trade plan",
+                "severity": "warning",
+                "fallback": "Keep campaign hypothesis as low-confidence and use market/event timeline context.",
+            },
+            {
+                "source": "Status log / trend sheets",
+                "severity": "warning",
+                "fallback": "Use GSC and external context only; flag people/business context as incomplete.",
+            },
+            {
+                "source": "Weather/news/events",
+                "severity": "warning",
+                "fallback": "Use stale cache if available, else continue without these supporting signals.",
+            },
+            {
+                "source": "Weekly SEO/GEO digest",
+                "severity": "warning",
+                "fallback": "Keep publication context out of root-cause narrative for this run.",
+            },
+        ],
+    }
+
+
+def _build_country_normalization_context(
+    *,
+    config: AgentConfig,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    yoy_window: DateWindow,
+) -> dict[str, object]:
+    country = str(config.report_country_code or "PL").strip().upper() or "PL"
+    return {
+        "enabled": True,
+        "country_code": country,
+        "timezone": str(config.timezone or "Europe/Warsaw").strip() or "Europe/Warsaw",
+        "date_format": "YYYY-MM-DD",
+        "week_definition": "Mon-Sun",
+        "numeric_format": {
+            "decimal_separator": ".",
+            "thousands_separator": " ",
+            "percentage_unit": "%",
+            "pp_unit": "pp",
+        },
+        "boundaries": {
+            "current": _window_to_dict(current_window),
+            "previous": _window_to_dict(previous_window),
+            "yoy": _window_to_dict(yoy_window),
+        },
+        "gsc": {
+            "site_url": str(config.gsc_site_url or "").strip(),
+            "country_filter": str(config.gsc_country_filter or "").strip(),
+        },
+    }
+
+
+def _build_standardized_gsc_ingestion_schema(
+    *,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    yoy_window: DateWindow,
+    query_current: list[MetricRow],
+    query_previous: list[MetricRow],
+    query_yoy: list[MetricRow],
+    page_current: list[MetricRow],
+    page_previous: list[MetricRow],
+    page_yoy: list[MetricRow],
+    device_current: list[MetricRow],
+    device_previous: list[MetricRow],
+    device_yoy: list[MetricRow],
+    gsc_daily_rows: dict[str, object],
+    gsc_feature_split: dict[str, object],
+) -> dict[str, object]:
+    def to_rows(rows: list[MetricRow], limit: int = 120) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        for row in rows[: max(1, limit)]:
+            out.append(
+                {
+                    "key": str(row.key or "").strip(),
+                    "clicks": float(row.clicks or 0.0),
+                    "impressions": float(row.impressions or 0.0),
+                    "ctr": float(row.ctr or 0.0),
+                    "position": float(row.position or 0.0),
+                }
+            )
+        return out
+
+    daily_rows = (
+        gsc_daily_rows.get("rows", []) if isinstance(gsc_daily_rows, dict) else []
+    )
+    feature_weekly_rows = (
+        gsc_feature_split.get("rows_weekly", [])
+        if isinstance(gsc_feature_split, dict)
+        else []
+    )
+    feature_monthly_rows = (
+        gsc_feature_split.get("rows_mom", [])
+        if isinstance(gsc_feature_split, dict)
+        else []
+    )
+
+    return {
+        "enabled": True,
+        "schema_version": "gsc_ingestion_v1",
+        "windows": {
+            "current": _window_to_dict(current_window),
+            "previous": _window_to_dict(previous_window),
+            "yoy": _window_to_dict(yoy_window),
+        },
+        "dimensions": {
+            "query": {
+                "current": to_rows(query_current, limit=160),
+                "previous": to_rows(query_previous, limit=160),
+                "yoy": to_rows(query_yoy, limit=160),
+            },
+            "page": {
+                "current": to_rows(page_current, limit=160),
+                "previous": to_rows(page_previous, limit=160),
+                "yoy": to_rows(page_yoy, limit=160),
+            },
+            "device": {
+                "current": to_rows(device_current, limit=40),
+                "previous": to_rows(device_previous, limit=40),
+                "yoy": to_rows(device_yoy, limit=40),
+            },
+            "feature": {
+                "weekly": feature_weekly_rows[:80] if isinstance(feature_weekly_rows, list) else [],
+                "monthly": feature_monthly_rows[:80] if isinstance(feature_monthly_rows, list) else [],
+            },
+            "daily": {
+                "rows": daily_rows[:120] if isinstance(daily_rows, list) else [],
+            },
+        },
+    }
+
+
+def _sanitize_for_snapshot(value: Any, max_items: int = 80) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            out[str(key)] = _sanitize_for_snapshot(item, max_items=max_items)
+        return out
+    if isinstance(value, list):
+        rows = value[: max(1, int(max_items))]
+        return [_sanitize_for_snapshot(item, max_items=max_items) for item in rows]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str) and len(value) > 1800:
+            return value[:1800].rstrip() + "...<trimmed>"
+        return value
+    return str(value)
+
+
+def _persist_ingestion_snapshot(
+    *,
+    config: AgentConfig,
+    run_date: date,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    yoy_window: DateWindow,
+    totals: dict[str, MetricSummary],
+    additional_context: dict[str, object],
+    gsc_data_coverage: dict[str, object],
+) -> dict[str, object]:
+    if not bool(config.ingestion_snapshot_enabled):
+        return {"enabled": False, "path": "", "retention_days": int(config.ingestion_snapshot_retention_days)}
+
+    out_dir = Path(config.output_dir) / "_telemetry" / "raw_sources"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    retention_days = max(1, int(config.ingestion_snapshot_retention_days))
+    cutoff_ts = time.time() - float(retention_days * 24 * 3600)
+    removed = 0
+    for path in out_dir.glob("*.json"):
+        try:
+            if path.stat().st_mtime < cutoff_ts:
+                path.unlink()
+                removed += 1
+        except Exception:
+            continue
+
+    totals_export = {
+        key: {
+            "clicks": float(value.clicks or 0.0),
+            "impressions": float(value.impressions or 0.0),
+            "ctr": float(value.ctr or 0.0),
+            "position": float(value.position or 0.0),
+        }
+        for key, value in totals.items()
+        if isinstance(value, MetricSummary)
+    }
+    snapshot = {
+        "schema_version": "weekly_ingestion_snapshot_v1",
+        "saved_at": time.time(),
+        "run_date": run_date.isoformat(),
+        "country_code": str(config.report_country_code or "").strip().upper(),
+        "timezone": str(config.timezone or "Europe/Warsaw").strip(),
+        "windows": {
+            "current": _window_to_dict(current_window),
+            "previous": _window_to_dict(previous_window),
+            "yoy": _window_to_dict(yoy_window),
+        },
+        "totals": totals_export,
+        "gsc_data_coverage": _sanitize_for_snapshot(gsc_data_coverage, max_items=400),
+        "source_freshness": _sanitize_for_snapshot(additional_context.get("source_freshness", []), max_items=120),
+        "metric_window_availability": _sanitize_for_snapshot(
+            additional_context.get("metric_window_availability", {}), max_items=180
+        ),
+        "ingestion_missing_data_policy": _sanitize_for_snapshot(
+            additional_context.get("missing_data_policy", {}), max_items=80
+        ),
+        "ingestion_schema": _sanitize_for_snapshot(
+            additional_context.get("ingestion_schema", {}), max_items=120
+        ),
+    }
+    stem = f"{run_date.strftime('%Y_%m_%d')}_{str(config.report_country_code or '').strip().lower()}_ingestion_snapshot.json"
+    path = out_dir / stem
+    try:
+        path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        return {"enabled": False, "path": "", "retention_days": retention_days, "removed_old_files": removed}
+    return {
+        "enabled": True,
+        "path": str(path),
+        "retention_days": retention_days,
+        "removed_old_files": removed,
+    }
 
 
 def _hypothesis_tracker_path(country_code: str) -> Path:
@@ -1298,6 +1900,18 @@ def _extract_key_data_packets(
                 additional_context.get("gsc_daily_rows", {}) if isinstance(additional_context, dict) else {},
                 top_n=12,
             ),
+            "daily_serp_feature_shifts": _compact_ctx_rows(
+                additional_context.get("daily_serp_feature_shifts", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
+            ),
+            "daily_gsc_anomalies": _compact_ctx_rows(
+                additional_context.get("daily_gsc_anomalies", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
+            ),
+            "external_source_reliability": _compact_ctx_rows(
+                additional_context.get("external_source_reliability", {}) if isinstance(additional_context, dict) else {},
+                top_n=10,
+            ),
             "macro_backdrop": _compact_ctx_rows(
                 additional_context.get("macro_backdrop", {}) if isinstance(additional_context, dict) else {},
                 top_n=4,
@@ -1317,6 +1931,14 @@ def _extract_key_data_packets(
             "weekly_news_digest": _compact_ctx_rows(
                 additional_context.get("weekly_news_digest", {}) if isinstance(additional_context, dict) else {},
                 top_n=8,
+            ),
+            "google_updates_timeline": _compact_ctx_rows(
+                additional_context.get("google_updates_timeline", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
+            ),
+            "serp_case_studies": _compact_ctx_rows(
+                additional_context.get("serp_case_studies", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
             ),
         }
         payload = json.dumps(data, ensure_ascii=False)
@@ -2183,6 +2805,141 @@ def _summary_for_days(
     return MetricSummary.from_rows(rows)
 
 
+def _feature_rows_from_analysis(
+    analysis: AnalysisResult,
+    *,
+    limit: int = 15,
+) -> list[dict[str, object]]:
+    movers = analysis.top_winners + analysis.top_losers
+    unique_by_feature: dict[str, KeyDelta] = {}
+    for row in movers:
+        key = str(row.key).strip().lower()
+        if not key:
+            continue
+        prev = unique_by_feature.get(key)
+        if prev is None or abs(row.click_delta_vs_previous) > abs(prev.click_delta_vs_previous):
+            unique_by_feature[key] = row
+
+    rows: list[dict[str, object]] = []
+    for row in sorted(
+        unique_by_feature.values(),
+        key=lambda item: abs(item.click_delta_vs_previous),
+        reverse=True,
+    )[: max(1, int(limit))]:
+        rows.append(
+            {
+                "feature": row.key,
+                "clicks_current": row.current_clicks,
+                "clicks_previous": row.previous_clicks,
+                "clicks_yoy": row.yoy_clicks,
+                "delta_clicks_vs_previous": row.click_delta_vs_previous,
+                "delta_clicks_pct_vs_previous": row.click_delta_pct_vs_previous,
+                "delta_clicks_vs_yoy": row.click_delta_vs_yoy,
+                "delta_clicks_pct_vs_yoy": row.click_delta_pct_vs_yoy,
+                "ctr_current": row.current_ctr,
+                "ctr_previous": row.previous_ctr,
+                "ctr_yoy": row.yoy_ctr,
+                "position_current": row.current_position,
+                "position_previous": row.previous_position,
+                "position_yoy": row.yoy_position,
+            }
+        )
+    return rows
+
+
+def _feature_split_summary(rows: list[dict[str, object]]) -> dict[str, object]:
+    gains = [
+        row for row in rows
+        if isinstance(row, dict) and float(row.get("delta_clicks_vs_previous", 0.0) or 0.0) > 0.0
+    ]
+    losses = [
+        row for row in rows
+        if isinstance(row, dict) and float(row.get("delta_clicks_vs_previous", 0.0) or 0.0) < 0.0
+    ]
+    top_gain = gains[0] if gains else {}
+    top_loss = losses[0] if losses else {}
+    return {
+        "features_count": len(rows),
+        "gains_count": len(gains),
+        "losses_count": len(losses),
+        "top_gain_feature": str(top_gain.get("feature", "")).strip(),
+        "top_gain_delta_clicks": float(top_gain.get("delta_clicks_vs_previous", 0.0) or 0.0),
+        "top_loss_feature": str(top_loss.get("feature", "")).strip(),
+        "top_loss_delta_clicks": float(top_loss.get("delta_clicks_vs_previous", 0.0) or 0.0),
+    }
+
+
+def _feature_overview_rows(
+    weekly_rows: list[dict[str, object]],
+    monthly_rows: list[dict[str, object]],
+    *,
+    limit: int = 12,
+) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for row in weekly_rows:
+        if not isinstance(row, dict):
+            continue
+        feature = str(row.get("feature", "")).strip()
+        key = feature.lower()
+        if not feature or not key:
+            continue
+        payload = merged.setdefault(
+            key,
+            {
+                "feature": feature,
+                "wow_delta_clicks": 0.0,
+                "wow_delta_pct": 0.0,
+                "yoy_delta_clicks": 0.0,
+                "yoy_delta_pct": 0.0,
+                "mom_delta_clicks": 0.0,
+                "mom_delta_pct": 0.0,
+                "mom_yoy_delta_clicks": 0.0,
+                "mom_yoy_delta_pct": 0.0,
+            },
+        )
+        payload["wow_delta_clicks"] = float(row.get("delta_clicks_vs_previous", 0.0) or 0.0)
+        payload["wow_delta_pct"] = float(row.get("delta_clicks_pct_vs_previous", 0.0) or 0.0)
+        payload["yoy_delta_clicks"] = float(row.get("delta_clicks_vs_yoy", 0.0) or 0.0)
+        payload["yoy_delta_pct"] = float(row.get("delta_clicks_pct_vs_yoy", 0.0) or 0.0)
+
+    for row in monthly_rows:
+        if not isinstance(row, dict):
+            continue
+        feature = str(row.get("feature", "")).strip()
+        key = feature.lower()
+        if not feature or not key:
+            continue
+        payload = merged.setdefault(
+            key,
+            {
+                "feature": feature,
+                "wow_delta_clicks": 0.0,
+                "wow_delta_pct": 0.0,
+                "yoy_delta_clicks": 0.0,
+                "yoy_delta_pct": 0.0,
+                "mom_delta_clicks": 0.0,
+                "mom_delta_pct": 0.0,
+                "mom_yoy_delta_clicks": 0.0,
+                "mom_yoy_delta_pct": 0.0,
+            },
+        )
+        payload["mom_delta_clicks"] = float(row.get("delta_clicks_vs_previous", 0.0) or 0.0)
+        payload["mom_delta_pct"] = float(row.get("delta_clicks_pct_vs_previous", 0.0) or 0.0)
+        payload["mom_yoy_delta_clicks"] = float(row.get("delta_clicks_vs_yoy", 0.0) or 0.0)
+        payload["mom_yoy_delta_pct"] = float(row.get("delta_clicks_pct_vs_yoy", 0.0) or 0.0)
+
+    ranked = sorted(
+        merged.values(),
+        key=lambda row: max(
+            abs(float(row.get("wow_delta_clicks", 0.0) or 0.0)),
+            abs(float(row.get("mom_delta_clicks", 0.0) or 0.0)),
+            abs(float(row.get("yoy_delta_clicks", 0.0) or 0.0)),
+        ),
+        reverse=True,
+    )
+    return ranked[: max(1, int(limit))]
+
+
 def _build_gsc_daily_rows_context(
     *,
     current_window: DateWindow,
@@ -2195,37 +2952,50 @@ def _build_gsc_daily_rows_context(
     rows: list[dict[str, object]] = []
     total_days = max(0, int(current_window.days))
     days_missing = 0
+    missing_days: list[str] = []
+    previous_missing_days: list[str] = []
+    yoy_missing_days: list[str] = []
 
     for offset in range(total_days):
         day = current_window.start + timedelta(days=offset)
         current_row = current_daily_map.get(day)
         if current_row is None:
             days_missing += 1
+            missing_days.append(day.isoformat())
             continue
 
         clicks = float(current_row.clicks or 0.0)
         impressions = float(current_row.impressions or 0.0)
         if clicks <= 0.0 and impressions <= 0.0:
             days_missing += 1
+            missing_days.append(day.isoformat())
             continue
 
         previous_day = day - timedelta(days=7)
         previous_row = previous_daily_map.get(previous_day)
         previous_clicks = float(previous_row.clicks or 0.0) if previous_row else 0.0
         previous_impressions = float(previous_row.impressions or 0.0) if previous_row else 0.0
+        previous_ctr = float(previous_row.ctr or 0.0) if previous_row else 0.0
+        previous_position = float(previous_row.position or 0.0) if previous_row else 0.0
         previous_has_data = bool(
             previous_row is not None
             and (previous_clicks > 0.0 or previous_impressions > 0.0)
         )
+        if not previous_has_data:
+            previous_missing_days.append(previous_day.isoformat())
 
         yoy_day = yoy_window.start + timedelta(days=offset)
         yoy_row = yoy_daily_map.get(yoy_day)
         yoy_clicks = float(yoy_row.clicks or 0.0) if yoy_row else 0.0
         yoy_impressions = float(yoy_row.impressions or 0.0) if yoy_row else 0.0
+        yoy_ctr = float(yoy_row.ctr or 0.0) if yoy_row else 0.0
+        yoy_position = float(yoy_row.position or 0.0) if yoy_row else 0.0
         yoy_has_data = bool(
             yoy_row is not None
             and (yoy_clicks > 0.0 or yoy_impressions > 0.0)
         )
+        if not yoy_has_data:
+            yoy_missing_days.append(yoy_day.isoformat())
 
         delta_prev = clicks - previous_clicks if previous_has_data else 0.0
         delta_prev_pct = (
@@ -2239,24 +3009,38 @@ def _build_gsc_daily_rows_context(
             if yoy_has_data and yoy_clicks > 0.0
             else 0.0
         )
+        ctr = float(current_row.ctr or 0.0)
+        position = float(current_row.position or 0.0)
+        delta_ctr_prev_pp = ((ctr - previous_ctr) * 100.0) if previous_has_data else 0.0
+        delta_pos_prev = (position - previous_position) if previous_has_data else 0.0
+        delta_ctr_yoy_pp = ((ctr - yoy_ctr) * 100.0) if yoy_has_data else 0.0
+        delta_pos_yoy = (position - yoy_position) if yoy_has_data else 0.0
 
         rows.append(
             {
                 "date": day.isoformat(),
                 "clicks": clicks,
                 "impressions": impressions,
-                "ctr": float(current_row.ctr or 0.0),
-                "position": float(current_row.position or 0.0),
+                "ctr": ctr,
+                "position": position,
                 "previous_weekday_date": previous_day.isoformat(),
                 "previous_weekday_has_data": previous_has_data,
                 "previous_weekday_clicks": previous_clicks if previous_has_data else 0.0,
+                "previous_weekday_ctr": previous_ctr if previous_has_data else 0.0,
+                "previous_weekday_position": previous_position if previous_has_data else 0.0,
                 "delta_clicks_vs_previous_weekday": delta_prev,
                 "delta_pct_vs_previous_weekday": delta_prev_pct,
+                "delta_ctr_pp_vs_previous_weekday": delta_ctr_prev_pp,
+                "delta_position_vs_previous_weekday": delta_pos_prev,
                 "yoy_date": yoy_day.isoformat(),
                 "yoy_day_has_data": yoy_has_data,
                 "yoy_clicks": yoy_clicks if yoy_has_data else 0.0,
+                "yoy_ctr": yoy_ctr if yoy_has_data else 0.0,
+                "yoy_position": yoy_position if yoy_has_data else 0.0,
                 "delta_clicks_vs_yoy_day": delta_yoy,
                 "delta_pct_vs_yoy_day": delta_yoy_pct,
+                "delta_ctr_pp_vs_yoy_day": delta_ctr_yoy_pp,
+                "delta_position_vs_yoy_day": delta_pos_yoy,
             }
         )
 
@@ -2282,10 +3066,129 @@ def _build_gsc_daily_rows_context(
         "days_total": total_days,
         "days_with_data": len(rows),
         "days_missing": days_missing,
+        "days_missing_list": missing_days,
+        "days_missing_mask": {day: True for day in missing_days},
+        "days_coverage_ratio": (float(len(rows)) / float(total_days)) if total_days > 0 else 0.0,
         "days_with_previous_weekday_data": days_with_prev,
+        "days_missing_previous_weekday": max(0, total_days - days_with_prev),
+        "days_missing_previous_weekday_list": sorted(set(previous_missing_days)),
         "days_with_yoy_day_data": days_with_yoy,
+        "days_missing_yoy_day": max(0, total_days - days_with_yoy),
+        "days_missing_yoy_day_list": sorted(set(yoy_missing_days)),
         "weekly_clicks_sum": weekly_clicks,
         "rows": rows,
+    }
+
+
+def _parse_feature_daily_clicks_map(rows: list[MetricRow]) -> dict[date, dict[str, float]]:
+    out: dict[date, dict[str, float]] = {}
+    for row in rows:
+        parts = [part.strip() for part in str(row.key or "").split("|", 1)]
+        if len(parts) != 2:
+            continue
+        try:
+            day = date.fromisoformat(parts[0][:10])
+        except ValueError:
+            continue
+        feature = parts[1] or "UNKNOWN"
+        day_rows = out.setdefault(day, {})
+        day_rows[feature] = float(day_rows.get(feature, 0.0) or 0.0) + float(row.clicks or 0.0)
+    return out
+
+
+def _build_daily_serp_feature_shifts_context(
+    *,
+    current_window: DateWindow,
+    yoy_window: DateWindow,
+    current_rows: list[MetricRow],
+    previous_rows: list[MetricRow],
+    yoy_rows: list[MetricRow],
+) -> dict[str, object]:
+    current_map = _parse_feature_daily_clicks_map(current_rows)
+    previous_map = _parse_feature_daily_clicks_map(previous_rows)
+    yoy_map = _parse_feature_daily_clicks_map(yoy_rows)
+    out_rows: list[dict[str, object]] = []
+    anomalies: list[dict[str, object]] = []
+
+    for offset in range(max(0, int(current_window.days))):
+        day = current_window.start + timedelta(days=offset)
+        current_features = current_map.get(day, {})
+        if not current_features:
+            continue
+        previous_day = day - timedelta(days=7)
+        previous_features = previous_map.get(previous_day, {})
+        yoy_day = yoy_window.start + timedelta(days=offset)
+        yoy_features = yoy_map.get(yoy_day, {})
+
+        total_current = float(sum(current_features.values()) or 0.0)
+        if total_current <= 0.0:
+            continue
+        total_previous = float(sum(previous_features.values()) or 0.0)
+        total_yoy = float(sum(yoy_features.values()) or 0.0)
+
+        best_feature = ""
+        best_delta_pp = 0.0
+        best_share_current = 0.0
+        best_share_previous = 0.0
+        best_share_yoy = 0.0
+        best_clicks_current = 0.0
+        best_clicks_previous = 0.0
+        best_clicks_yoy = 0.0
+
+        for feature in sorted(set(current_features) | set(previous_features) | set(yoy_features)):
+            clicks_current = float(current_features.get(feature, 0.0) or 0.0)
+            clicks_previous = float(previous_features.get(feature, 0.0) or 0.0)
+            clicks_yoy = float(yoy_features.get(feature, 0.0) or 0.0)
+            share_current = (clicks_current / total_current * 100.0) if total_current > 0.0 else 0.0
+            share_previous = (clicks_previous / total_previous * 100.0) if total_previous > 0.0 else 0.0
+            share_yoy = (clicks_yoy / total_yoy * 100.0) if total_yoy > 0.0 else 0.0
+            delta_pp = share_current - share_previous
+            if abs(delta_pp) > abs(best_delta_pp):
+                best_feature = feature
+                best_delta_pp = delta_pp
+                best_share_current = share_current
+                best_share_previous = share_previous
+                best_share_yoy = share_yoy
+                best_clicks_current = clicks_current
+                best_clicks_previous = clicks_previous
+                best_clicks_yoy = clicks_yoy
+
+        if not best_feature:
+            continue
+        row = {
+            "date": day.isoformat(),
+            "previous_weekday_date": previous_day.isoformat(),
+            "yoy_day_date": yoy_day.isoformat(),
+            "feature": best_feature,
+            "share_current_pct": best_share_current,
+            "share_previous_weekday_pct": best_share_previous,
+            "share_yoy_day_pct": best_share_yoy,
+            "delta_share_pp_vs_previous_weekday": best_delta_pp,
+            "delta_share_pp_vs_yoy_day": best_share_current - best_share_yoy,
+            "clicks_current": best_clicks_current,
+            "clicks_previous_weekday": best_clicks_previous,
+            "clicks_yoy_day": best_clicks_yoy,
+            "delta_clicks_vs_previous_weekday": best_clicks_current - best_clicks_previous,
+            "delta_clicks_vs_yoy_day": best_clicks_current - best_clicks_yoy,
+        }
+        out_rows.append(row)
+        if abs(best_delta_pp) >= 1.0:
+            anomalies.append(row)
+
+    ranked_anomalies = sorted(
+        anomalies,
+        key=lambda row: (
+            abs(float(row.get("delta_share_pp_vs_previous_weekday", 0.0) or 0.0)),
+            abs(float(row.get("delta_clicks_vs_previous_weekday", 0.0) or 0.0)),
+        ),
+        reverse=True,
+    )
+    return {
+        "enabled": bool(out_rows),
+        "source": "GSC API (date + searchAppearance)",
+        "rows": out_rows,
+        "anomalies": ranked_anomalies[:12],
+        "days_with_data": len(out_rows),
     }
 
 
@@ -2400,6 +3303,318 @@ def _collect_weekly_news_digest(
     return context, signals
 
 
+def _weather_daily_map_for_anomalies(
+    weather_summary: dict[str, float],
+    key: str,
+) -> dict[date, tuple[float, float]]:
+    payload = weather_summary.get(key, [])
+    if not isinstance(payload, list):
+        return {}
+    out: dict[date, tuple[float, float]] = {}
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        try:
+            day = date.fromisoformat(str(row.get("date", "")).strip()[:10])
+        except ValueError:
+            continue
+        try:
+            temp = float(row.get("temp_c", 0.0) or 0.0)
+            precip = float(row.get("precip_mm", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        out[day] = (temp, precip)
+    return out
+
+
+def _signal_marker_text(signal: ExternalSignal) -> str:
+    blob = re.sub(r"\s+", " ", f"{signal.source} {signal.title} {signal.details}").strip().lower()
+    if "source degraded" in blob:
+        return ""
+    if any(token in blob for token in ("campaign tracker", "planned campaign", "allegro days", "smart week", "megaraty", "black friday", "cyber monday")):
+        return f"campaign/news marker: {signal.title}"
+    if any(token in blob for token in ("market events api", "public holidays", "regulatory", "platform pulse", "vat", "tax", "tariff", "strike")):
+        return f"event marker: {signal.title}"
+    if any(token in blob for token in ("search status", "search central blog", "weekly seo digest", "searchenginejournal", "seroundtable")):
+        return f"search-news marker: {signal.title}"
+    if "weather" in blob:
+        return f"weather marker: {signal.title}"
+    return ""
+
+
+def _trade_plan_markers_for_day(
+    *,
+    additional_context: dict[str, object],
+    day: date,
+    limit: int = 2,
+) -> list[str]:
+    trade_plan = additional_context.get("trade_plan", {})
+    if not isinstance(trade_plan, dict) or not trade_plan.get("enabled"):
+        return []
+    campaign_rows = trade_plan.get("campaign_rows", [])
+    if not isinstance(campaign_rows, list):
+        return []
+    out: list[str] = []
+    for row in campaign_rows:
+        if not isinstance(row, dict):
+            continue
+        campaign = str(row.get("campaign", "")).strip()
+        if not campaign:
+            continue
+        first_text = str(row.get("first_date", "")).strip()
+        last_text = str(row.get("last_date", "")).strip()
+        try:
+            first_day = date.fromisoformat(first_text[:10])
+            last_day = date.fromisoformat(last_text[:10])
+        except ValueError:
+            continue
+        if first_day <= day <= last_day:
+            out.append(f"trade-plan active: {campaign}")
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _daily_markers_for_day(
+    *,
+    day: date,
+    external_signals: list[ExternalSignal],
+    additional_context: dict[str, object],
+    weather_summary: dict[str, float],
+    limit: int = 3,
+) -> list[str]:
+    scored: list[tuple[float, str]] = []
+    for signal in external_signals:
+        lag_days = abs((signal.day - day).days)
+        if lag_days > 1:
+            continue
+        marker = _signal_marker_text(signal)
+        if not marker:
+            continue
+        severity_bonus = {"high": 2.0, "medium": 1.0, "info": 0.5}.get(str(signal.severity or "info").lower(), 0.5)
+        category_bonus = 4.0 if marker.startswith("campaign") else (3.0 if marker.startswith("event") else 2.0)
+        score = (category_bonus * 10.0) + (severity_bonus * 2.0) - float(lag_days)
+        scored.append((score, marker))
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for _, marker in sorted(scored, key=lambda item: item[0], reverse=True):
+        key = re.sub(r"\s+", " ", marker.strip().lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        selected.append(marker)
+        if len(selected) >= max(1, int(limit)):
+            break
+
+    for row in _trade_plan_markers_for_day(additional_context=additional_context, day=day, limit=2):
+        key = re.sub(r"\s+", " ", row.strip().lower())
+        if key and key not in seen:
+            seen.add(key)
+            selected.append(row)
+        if len(selected) >= max(1, int(limit)):
+            break
+
+    current_weather = _weather_daily_map_for_anomalies(weather_summary, "daily_current")
+    previous_weather = _weather_daily_map_for_anomalies(weather_summary, "daily_previous")
+    current_row = current_weather.get(day)
+    previous_row = previous_weather.get(day - timedelta(days=7))
+    if current_row and previous_row:
+        temp_diff = float(current_row[0] - previous_row[0])
+        precip_diff = float(current_row[1] - previous_row[1])
+        if abs(temp_diff) >= 2.0 or abs(precip_diff) >= 4.0:
+            weather_marker = (
+                "weather shift marker: "
+                f"temp {temp_diff:+.1f}C, precipitation {precip_diff:+.1f}mm vs previous-weekday"
+            )
+            key = re.sub(r"\s+", " ", weather_marker.strip().lower())
+            if key and key not in seen:
+                selected.append(weather_marker)
+
+    return selected[: max(1, int(limit))]
+
+
+def _build_daily_gsc_anomalies_context(
+    *,
+    gsc_daily_rows: dict[str, object],
+    external_signals: list[ExternalSignal],
+    additional_context: dict[str, object],
+    weather_summary: dict[str, float],
+) -> dict[str, object]:
+    rows = gsc_daily_rows.get("rows", []) if isinstance(gsc_daily_rows, dict) else []
+    if not isinstance(rows, list) or not rows:
+        return {"enabled": False, "rows": [], "summary": {}}
+
+    weekly_clicks = float(gsc_daily_rows.get("weekly_clicks_sum", 0.0) or 0.0)
+    click_threshold = max(2000.0, weekly_clicks * 0.04) if weekly_clicks > 0.0 else 2000.0
+    anomalies: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not bool(row.get("previous_weekday_has_data")):
+            continue
+        day_text = str(row.get("date", "")).strip()
+        try:
+            day = date.fromisoformat(day_text[:10])
+        except ValueError:
+            continue
+
+        delta_clicks = float(row.get("delta_clicks_vs_previous_weekday", 0.0) or 0.0)
+        delta_pct = float(row.get("delta_pct_vs_previous_weekday", 0.0) or 0.0)
+        delta_ctr_pp = float(row.get("delta_ctr_pp_vs_previous_weekday", 0.0) or 0.0)
+        delta_position = float(row.get("delta_position_vs_previous_weekday", 0.0) or 0.0)
+
+        severity = 0
+        if abs(delta_clicks) >= click_threshold:
+            severity += 2
+        if abs(delta_pct) >= 12.0:
+            severity += 2
+        if abs(delta_ctr_pp) >= 0.25:
+            severity += 1
+        if abs(delta_position) >= 0.35:
+            severity += 1
+        if severity <= 0:
+            continue
+
+        anomalies.append(
+            {
+                "date": day.isoformat(),
+                "severity_score": severity,
+                "clicks": float(row.get("clicks", 0.0) or 0.0),
+                "impressions": float(row.get("impressions", 0.0) or 0.0),
+                "ctr": float(row.get("ctr", 0.0) or 0.0),
+                "position": float(row.get("position", 0.0) or 0.0),
+                "delta_clicks_vs_previous_weekday": delta_clicks,
+                "delta_pct_vs_previous_weekday": delta_pct,
+                "delta_ctr_pp_vs_previous_weekday": delta_ctr_pp,
+                "delta_position_vs_previous_weekday": delta_position,
+                "markers": _daily_markers_for_day(
+                    day=day,
+                    external_signals=external_signals,
+                    additional_context=additional_context,
+                    weather_summary=weather_summary,
+                    limit=3,
+                ),
+            }
+        )
+
+    anomalies.sort(
+        key=lambda row: (
+            int(row.get("severity_score", 0) or 0),
+            abs(float(row.get("delta_clicks_vs_previous_weekday", 0.0) or 0.0)),
+            abs(float(row.get("delta_ctr_pp_vs_previous_weekday", 0.0) or 0.0)),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "enabled": bool(anomalies),
+        "source": "GSC daily anomaly detector",
+        "rows": anomalies[:12],
+        "summary": {
+            "count": len(anomalies),
+            "high_severity_count": len([row for row in anomalies if int(row.get("severity_score", 0) or 0) >= 4]),
+            "medium_severity_count": len([row for row in anomalies if int(row.get("severity_score", 0) or 0) == 3]),
+        },
+    }
+
+
+def _source_reliability_tier_and_score(source: str, url: str = "") -> tuple[str, int]:
+    blob = (str(source or "") + " " + str(url or "")).lower()
+    host = ""
+    parsed = urlparse(str(url or "").strip()) if str(url or "").strip() else None
+    if parsed:
+        host = str(parsed.netloc or parsed.path).strip().lower()
+    if any(token in blob for token in ("google search central", "google search status", "developers.google.com", "status.search.google.com", "blog.google")):
+        return ("official", 95)
+    if any(token in blob for token in ("ec.europa.eu", "oecd.org", "worldbank.org", "api.nbp.pl", "imgw.pl")):
+        return ("public-institution", 88)
+    if any(token in blob for token in ("searchenginejournal", "searchengineland", "seroundtable", "reuters", "ft.com")):
+        return ("high-quality media", 76)
+    if host:
+        return ("other media", 62)
+    return ("other", 58)
+
+
+def _build_external_source_reliability_context(
+    *,
+    additional_context: dict[str, object],
+    external_signals: list[ExternalSignal],
+) -> dict[str, object]:
+    source_rows: list[tuple[str, str]] = []
+    for signal in external_signals:
+        source_rows.append((str(signal.source or "").strip(), str(signal.url or "").strip()))
+
+    updates = additional_context.get("google_updates_timeline", {})
+    if isinstance(updates, dict):
+        rows = updates.get("rows", [])
+        if isinstance(rows, list):
+            for row in rows[:120]:
+                if isinstance(row, dict):
+                    source_rows.append((str(row.get("source", "")).strip(), str(row.get("url", "")).strip()))
+
+    case_studies = additional_context.get("serp_case_studies", {})
+    if isinstance(case_studies, dict):
+        rows = case_studies.get("rows", [])
+        if isinstance(rows, list):
+            for row in rows[:120]:
+                if isinstance(row, dict):
+                    source_rows.append((str(row.get("source", "")).strip(), str(row.get("url", "")).strip()))
+
+    weekly_news = additional_context.get("weekly_news_digest", {})
+    if isinstance(weekly_news, dict):
+        rows = weekly_news.get("rows", [])
+        if isinstance(rows, list):
+            for row in rows[:120]:
+                if isinstance(row, dict):
+                    source_rows.append((str(row.get("source", "")).strip(), str(row.get("url", "")).strip()))
+
+    aggregated: dict[str, dict[str, object]] = {}
+    for source, url in source_rows:
+        key = re.sub(r"\s+", " ", source.strip().lower())
+        if not key:
+            continue
+        tier, score = _source_reliability_tier_and_score(source, url)
+        payload = aggregated.setdefault(
+            key,
+            {
+                "source": source,
+                "tier": tier,
+                "score": score,
+                "rows": 0,
+            },
+        )
+        payload["rows"] = int(payload.get("rows", 0) or 0) + 1
+        payload["score"] = max(int(payload.get("score", 0) or 0), int(score))
+
+    rows = sorted(
+        aggregated.values(),
+        key=lambda row: (int(row.get("score", 0) or 0), int(row.get("rows", 0) or 0)),
+        reverse=True,
+    )
+    if not rows:
+        return {"enabled": False, "rows": [], "summary": {}}
+
+    weighted_sum = sum(int(row.get("score", 0) or 0) * int(row.get("rows", 0) or 0) for row in rows)
+    weighted_den = sum(int(row.get("rows", 0) or 0) for row in rows) or 1
+    weighted_score = float(weighted_sum) / float(weighted_den)
+    tier_counts: dict[str, int] = {}
+    for row in rows:
+        tier = str(row.get("tier", "other")).strip()
+        tier_counts[tier] = int(tier_counts.get(tier, 0) or 0) + 1
+
+    return {
+        "enabled": True,
+        "source": "External source reliability scoring",
+        "rows": rows[:18],
+        "summary": {
+            "weighted_score": weighted_score,
+            "sources_count": len(rows),
+            "tier_counts": tier_counts,
+        },
+    }
+
+
 def _normalize_domain_candidate(raw: str) -> str:
     value = raw.strip()
     if not value:
@@ -2492,12 +3707,13 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         for day, row in current_daily_map.items()
         if float(row.impressions or 0.0) > 0.0 or float(row.clicks or 0.0) > 0.0
     }
+    current_days_all = {
+        current_window.start + timedelta(days=offset)
+        for offset in range(max(0, current_window.days))
+    }
     # Fallback: if day-level endpoint returns no rows, keep full-window baseline.
     if not current_days_with_data:
-        current_days_with_data = {
-            current_window.start + timedelta(days=offset)
-            for offset in range(max(0, current_window.days))
-        }
+        current_days_with_data = set(current_days_all)
     yoy_days_aligned = {
         yoy_window.start + timedelta(days=(day - current_window.start).days)
         for day in current_days_with_data
@@ -2533,9 +3749,21 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         "days_with_data": len(current_days_with_data),
         "days_total": int(current_window.days),
         "days_with_data_list": sorted(day.isoformat() for day in current_days_with_data),
+        "days_missing_list": sorted(
+            day.isoformat() for day in (current_days_all - current_days_with_data)
+        ),
+        "days_missing_mask": {
+            day.isoformat(): True for day in sorted(current_days_all - current_days_with_data)
+        },
         "p52w_mode": "masked_to_days_with_data",
         "p52w_days_used": len(yoy_days_with_data),
         "p52w_days_used_list": sorted(day.isoformat() for day in yoy_days_with_data),
+        "p52w_days_missing_list": sorted(
+            day.isoformat() for day in (yoy_days_aligned - yoy_days_with_data)
+        ),
+        "p52w_days_missing_mask": {
+            day.isoformat(): True for day in sorted(yoy_days_aligned - yoy_days_with_data)
+        },
     }
 
     scope_results: list[tuple[str, AnalysisResult]] = []
@@ -2575,13 +3803,41 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     gsc_feature_split: dict[str, object] = {
         "enabled": False,
         "rows": [],
+        "rows_weekly": [],
+        "rows_mom": [],
+        "rows_unified": [],
+        "feature_overview": [],
+        "summary": {},
         "errors": [],
+    }
+    daily_serp_feature_shifts: dict[str, object] = {
+        "enabled": False,
+        "source": "GSC API (date + searchAppearance)",
+        "rows": [],
+        "anomalies": [],
+        "days_with_data": 0,
     }
     try:
         feature_current = gsc.fetch_rows(current_window, dimensions=("searchAppearance",))
         feature_previous = gsc.fetch_rows(previous_window, dimensions=("searchAppearance",))
         feature_yoy = gsc.fetch_rows(yoy_window, dimensions=("searchAppearance",))
-        feature_analysis = analyze_rows(
+        feature_current_28d = gsc.fetch_rows(context_28d_current, dimensions=("searchAppearance",))
+        feature_previous_28d = gsc.fetch_rows(context_28d_previous, dimensions=("searchAppearance",))
+        feature_yoy_28d = gsc.fetch_rows(context_28d_yoy, dimensions=("searchAppearance",))
+        feature_daily_current = gsc.fetch_rows(
+            current_window,
+            dimensions=("date", "searchAppearance"),
+        )
+        feature_daily_previous = gsc.fetch_rows(
+            previous_window,
+            dimensions=("date", "searchAppearance"),
+        )
+        feature_daily_yoy = gsc.fetch_rows(
+            yoy_window,
+            dimensions=("date", "searchAppearance"),
+        )
+
+        weekly_analysis = analyze_rows(
             current_rows=feature_current,
             previous_rows=feature_previous,
             yoy_rows=feature_yoy,
@@ -2589,49 +3845,70 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
             min_click_loss_absolute=config.min_click_loss_absolute,
             min_click_loss_pct=config.min_click_loss_pct,
         )
-        movers = feature_analysis.top_winners + feature_analysis.top_losers
-        unique_by_feature: dict[str, KeyDelta] = {}
-        for row in movers:
-            key = str(row.key).strip().lower()
-            if not key:
-                continue
-            prev = unique_by_feature.get(key)
-            if prev is None or abs(row.click_delta_vs_previous) > abs(prev.click_delta_vs_previous):
-                unique_by_feature[key] = row
-        rows: list[dict[str, object]] = []
-        for row in sorted(
-            unique_by_feature.values(),
-            key=lambda item: abs(item.click_delta_vs_previous),
-            reverse=True,
-        )[:15]:
-            rows.append(
-                {
-                    "feature": row.key,
-                    "clicks_current": row.current_clicks,
-                    "clicks_previous": row.previous_clicks,
-                    "clicks_yoy": row.yoy_clicks,
-                    "delta_clicks_vs_previous": row.click_delta_vs_previous,
-                    "delta_clicks_pct_vs_previous": row.click_delta_pct_vs_previous,
-                    "delta_clicks_vs_yoy": row.click_delta_vs_yoy,
-                    "delta_clicks_pct_vs_yoy": row.click_delta_pct_vs_yoy,
-                    "ctr_current": row.current_ctr,
-                    "ctr_previous": row.previous_ctr,
-                    "ctr_yoy": row.yoy_ctr,
-                    "position_current": row.current_position,
-                    "position_previous": row.previous_position,
-                    "position_yoy": row.yoy_position,
-                }
-            )
+        mom_analysis = analyze_rows(
+            current_rows=feature_current_28d,
+            previous_rows=feature_previous_28d,
+            yoy_rows=feature_yoy_28d,
+            top_n=max(5, min(config.top_n, 15)),
+            min_click_loss_absolute=config.min_click_loss_absolute,
+            min_click_loss_pct=config.min_click_loss_pct,
+        )
+
+        rows_weekly = _feature_rows_from_analysis(
+            weekly_analysis,
+            limit=max(5, min(config.top_n, 15)),
+        )
+        rows_mom = _feature_rows_from_analysis(
+            mom_analysis,
+            limit=max(5, min(config.top_n, 15)),
+        )
+        feature_overview = _feature_overview_rows(rows_weekly, rows_mom, limit=12)
+        daily_serp_feature_shifts = _build_daily_serp_feature_shifts_context(
+            current_window=current_window,
+            yoy_window=yoy_window,
+            current_rows=feature_daily_current,
+            previous_rows=feature_daily_previous,
+            yoy_rows=feature_daily_yoy,
+        )
         gsc_feature_split = {
-            "enabled": bool(rows),
+            "enabled": bool(rows_weekly or rows_mom),
             "source": "Google Search Console API (searchAppearance)",
-            "rows": rows,
+            "rows": rows_weekly,
+            "rows_weekly": rows_weekly,
+            "rows_mom": rows_mom,
+            "rows_unified": feature_overview,
+            "feature_overview": feature_overview,
+            "summary": {
+                "weekly": _feature_split_summary(rows_weekly),
+                "month": _feature_split_summary(rows_mom),
+            },
+            "windows": {
+                "weekly_current": {"start": current_window.start.isoformat(), "end": current_window.end.isoformat()},
+                "weekly_previous": {"start": previous_window.start.isoformat(), "end": previous_window.end.isoformat()},
+                "weekly_yoy": {"start": yoy_window.start.isoformat(), "end": yoy_window.end.isoformat()},
+                "month_current": {"start": context_28d_current.start.isoformat(), "end": context_28d_current.end.isoformat()},
+                "month_previous": {"start": context_28d_previous.start.isoformat(), "end": context_28d_previous.end.isoformat()},
+                "month_yoy": {"start": context_28d_yoy.start.isoformat(), "end": context_28d_yoy.end.isoformat()},
+            },
             "errors": [],
         }
     except Exception as exc:
         gsc_feature_split = {
             "enabled": False,
             "rows": [],
+            "rows_weekly": [],
+            "rows_mom": [],
+            "rows_unified": [],
+            "feature_overview": [],
+            "summary": {},
+            "errors": [str(exc)],
+        }
+        daily_serp_feature_shifts = {
+            "enabled": False,
+            "source": "GSC API (date + searchAppearance)",
+            "rows": [],
+            "anomalies": [],
+            "days_with_data": 0,
             "errors": [str(exc)],
         }
 
@@ -2720,6 +3997,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         latitude=config.weather_latitude,
         longitude=config.weather_longitude,
         weather_label=config.weather_label,
+        weather_context_enabled=config.weather_context_enabled,
         market_country_code=config.report_country_code,
         status_endpoint=config.google_status_endpoint,
         blog_rss_url=config.google_blog_rss,
@@ -2766,6 +4044,8 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         cache_parts,
         max_age_sec=max(3600, int(config.cache_ttl_stale_fallback_sec)),
     )
+    external_cache_saved_at = _cache_saved_at(cached_external) if isinstance(cached_external, dict) else None
+    additional_cache_saved_at = _cache_saved_at(cached_context) if isinstance(cached_context, dict) else None
     external_cache_mode = "live"
     additional_cache_mode = "live"
 
@@ -2836,6 +4116,10 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 market_events_enabled=config.market_events_enabled,
                 market_events_api_base_url=config.market_events_api_base_url,
                 market_events_top_rows=config.market_events_top_rows,
+                google_status_endpoint=config.google_status_endpoint,
+                google_blog_rss=config.google_blog_rss,
+                google_updates_scan_months=13,
+                serp_case_study_scan_months=13,
                 free_public_sources_enabled=config.free_public_sources_enabled,
                 free_public_sources_top_rows=config.free_public_sources_top_rows,
                 nager_holidays_country_code=config.nager_holidays_country_code,
@@ -2846,6 +4130,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                     timeout=EXTERNAL_SIGNALS_TIMEOUT_SEC
                 )
                 external_cache_mode = "live"
+                external_cache_saved_at = time.time()
             except FutureTimeoutError:
                 future_external.cancel()
                 external_signals = []
@@ -2853,6 +4138,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 if stale_external:
                     external_signals, weather_summary = _deserialize_external_cache(stale_external)
                     external_cache_mode = "stale_fallback"
+                    external_cache_saved_at = _cache_saved_at(stale_external)
                 else:
                     external_cache_mode = "degraded_no_cache"
                 external_signals.append(
@@ -2873,6 +4159,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 if stale_external:
                     external_signals, weather_summary = _deserialize_external_cache(stale_external)
                     external_cache_mode = "stale_fallback"
+                    external_cache_saved_at = _cache_saved_at(stale_external)
                 else:
                     external_cache_mode = "degraded_no_cache"
                 external_signals.append(
@@ -2889,6 +4176,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                     timeout=ADDITIONAL_CONTEXT_TIMEOUT_SEC
                 )
                 additional_cache_mode = "live"
+                additional_cache_saved_at = time.time()
             except FutureTimeoutError:
                 future_context.cancel()
                 additional_context = {}
@@ -2896,6 +4184,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 if stale_context:
                     additional_context, extra_signals = _deserialize_additional_cache(stale_context)
                     additional_cache_mode = "stale_fallback"
+                    additional_cache_saved_at = _cache_saved_at(stale_context)
                 else:
                     additional_cache_mode = "degraded_no_cache"
                 additional_context.setdefault("errors", [])
@@ -2924,6 +4213,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 if stale_context:
                     additional_context, extra_signals = _deserialize_additional_cache(stale_context)
                     additional_cache_mode = "stale_fallback"
+                    additional_cache_saved_at = _cache_saved_at(stale_context)
                 else:
                     additional_cache_mode = "degraded_no_cache"
                 additional_context.setdefault("errors", [])
@@ -2946,6 +4236,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         if not external_signals and stale_external:
             external_signals, weather_summary = _deserialize_external_cache(stale_external)
             external_cache_mode = "stale_fallback"
+            external_cache_saved_at = _cache_saved_at(stale_external)
             external_signals.append(
                 ExternalSignal(
                     source="External signals",
@@ -2958,6 +4249,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         if not additional_context and stale_context:
             additional_context, extra_signals = _deserialize_additional_cache(stale_context)
             additional_cache_mode = "stale_fallback"
+            additional_cache_saved_at = _cache_saved_at(stale_context)
             additional_context.setdefault("errors", [])
             if isinstance(additional_context.get("errors"), list):
                 additional_context["errors"].append(
@@ -3007,19 +4299,6 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
             }
         )
     external_signals.sort(key=lambda item: (item.day, item.source), reverse=True)
-    source_freshness = _build_source_freshness_rows(
-        run_date=run_date,
-        current_window=current_window,
-        additional_context=additional_context,
-        external_signals=external_signals,
-        weather_summary=weather_summary,
-        external_cache_mode=external_cache_mode,
-        additional_cache_mode=additional_cache_mode,
-        source_ttl_weather_sec=max(60, int(config.source_ttl_weather_sec)),
-        source_ttl_news_sec=max(60, int(config.source_ttl_news_sec)),
-        source_ttl_market_events_sec=max(60, int(config.source_ttl_market_events_sec)),
-    )
-    additional_context["source_freshness"] = source_freshness
     additional_context["gsc_data_coverage"] = gsc_data_coverage
     additional_context["gsc_daily_rows"] = _build_gsc_daily_rows_context(
         current_window=current_window,
@@ -3039,6 +4318,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         )
     additional_context["long_window_context"] = long_window_context
     additional_context["gsc_feature_split"] = gsc_feature_split
+    additional_context["daily_serp_feature_shifts"] = daily_serp_feature_shifts
 
     if config.weekly_news_summary_enabled:
         weekly_news_digest, weekly_news_signals = _collect_weekly_news_digest(
@@ -3341,6 +4621,77 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         except Exception as exc:
             senuto_error = str(exc)
     additional_context["senuto_intelligence"] = senuto_intelligence
+    external_signals.sort(key=lambda item: (item.day, item.source), reverse=True)
+    additional_context["daily_gsc_anomalies"] = _build_daily_gsc_anomalies_context(
+        gsc_daily_rows=additional_context.get("gsc_daily_rows", {}),
+        external_signals=external_signals,
+        additional_context=additional_context,
+        weather_summary=weather_summary,
+    )
+    additional_context["external_source_reliability"] = _build_external_source_reliability_context(
+        additional_context=additional_context,
+        external_signals=external_signals,
+    )
+    additional_context["country_normalization"] = _build_country_normalization_context(
+        config=config,
+        current_window=current_window,
+        previous_window=previous_window,
+        yoy_window=yoy_window,
+    )
+    additional_context["missing_data_policy"] = _build_missing_data_policy()
+    additional_context["ingestion_schema"] = _build_standardized_gsc_ingestion_schema(
+        current_window=current_window,
+        previous_window=previous_window,
+        yoy_window=yoy_window,
+        query_current=query_current,
+        query_previous=query_previous,
+        query_yoy=query_yoy,
+        page_current=page_current,
+        page_previous=page_previous,
+        page_yoy=page_yoy,
+        device_current=device_current,
+        device_previous=device_previous,
+        device_yoy=device_yoy,
+        gsc_daily_rows=additional_context.get("gsc_daily_rows", {}),
+        gsc_feature_split=gsc_feature_split,
+    )
+    additional_context["metric_window_availability"] = _build_metric_window_availability(
+        current_window=current_window,
+        previous_window=previous_window,
+        yoy_window=yoy_window,
+        gsc_data_coverage=gsc_data_coverage,
+        gsc_daily_rows=additional_context.get("gsc_daily_rows", {}),
+        gsc_feature_split=gsc_feature_split,
+        daily_serp_feature_shifts=additional_context.get("daily_serp_feature_shifts", {}),
+        daily_gsc_anomalies=additional_context.get("daily_gsc_anomalies", {}),
+        weather_summary=weather_summary,
+        additional_context=additional_context,
+    )
+    additional_context["source_freshness"] = _build_source_freshness_rows(
+        run_date=run_date,
+        current_window=current_window,
+        additional_context=additional_context,
+        external_signals=external_signals,
+        weather_summary=weather_summary,
+        gsc_data_coverage=gsc_data_coverage,
+        external_cache_mode=external_cache_mode,
+        additional_cache_mode=additional_cache_mode,
+        external_cache_saved_at=external_cache_saved_at,
+        additional_cache_saved_at=additional_cache_saved_at,
+        source_ttl_weather_sec=max(60, int(config.source_ttl_weather_sec)),
+        source_ttl_news_sec=max(60, int(config.source_ttl_news_sec)),
+        source_ttl_market_events_sec=max(60, int(config.source_ttl_market_events_sec)),
+    )
+    additional_context["ingestion_snapshot"] = _persist_ingestion_snapshot(
+        config=config,
+        run_date=run_date,
+        current_window=current_window,
+        previous_window=previous_window,
+        yoy_window=yoy_window,
+        totals=totals,
+        additional_context=additional_context,
+        gsc_data_coverage=gsc_data_coverage,
+    )
     additional_context["gaia_model"] = config.gaia_model
     additional_context["governance_human_reviewer"] = config.governance_human_reviewer
     additional_context["observability"] = {

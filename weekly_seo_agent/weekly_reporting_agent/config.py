@@ -158,6 +158,10 @@ class AgentConfig:
     product_trends_current_sheet_reference: str
     product_trends_top_rows: int
     product_trends_horizon_days: int
+    merchant_center_enabled: bool
+    merchant_center_credentials_path: str
+    merchant_center_mca_id: str
+    merchant_center_account_id_map: dict[str, str]
     trade_plan_enabled: bool
     trade_plan_sheet_reference: str
     trade_plan_yoy_sheet_reference: str
@@ -172,6 +176,11 @@ class AgentConfig:
     eval_gate_enabled: bool
     eval_gate_min_score: int
     eval_gate_block_drive_upload: bool
+    strict_llm_profile_enabled: bool
+    startup_preflight_enabled: bool
+    startup_preflight_blocking_sources: tuple[str, ...]
+    ingestion_snapshot_enabled: bool
+    ingestion_snapshot_retention_days: int
     telemetry_enabled: bool
     security_source_allowlist_domains: tuple[str, ...]
 
@@ -224,6 +233,7 @@ class AgentConfig:
     weather_latitude: float
     weather_longitude: float
     weather_label: str
+    weather_context_enabled: bool
     weather_latitude_map: dict[str, float]
     weather_longitude_map: dict[str, float]
     weather_label_map: dict[str, str]
@@ -450,6 +460,12 @@ class AgentConfig:
             ),
             product_trends_top_rows=_env_int("PRODUCT_TRENDS_TOP_ROWS", 12),
             product_trends_horizon_days=_env_int("PRODUCT_TRENDS_HORIZON_DAYS", 31),
+            merchant_center_enabled=_env_bool("MERCHANT_CENTER_ENABLED", False),
+            merchant_center_credentials_path=_env("MERCHANT_CENTER_CREDENTIALS_PATH"),
+            merchant_center_mca_id=_env("MERCHANT_CENTER_MCA_ID"),
+            merchant_center_account_id_map=_env_map_str(
+                "MERCHANT_CENTER_ACCOUNT_ID_MAP"
+            ),
             trade_plan_enabled=_env_bool("TRADE_PLAN_ENABLED", True),
             trade_plan_sheet_reference=_env("TRADE_PLAN_SHEET_REFERENCE"),
             trade_plan_yoy_sheet_reference=_env("TRADE_PLAN_YOY_SHEET_REFERENCE"),
@@ -466,6 +482,22 @@ class AgentConfig:
             eval_gate_enabled=_env_bool("EVAL_GATE_ENABLED", True),
             eval_gate_min_score=_env_int("EVAL_GATE_MIN_SCORE", 75),
             eval_gate_block_drive_upload=_env_bool("EVAL_GATE_BLOCK_DRIVE_UPLOAD", True),
+            strict_llm_profile_enabled=_env_bool(
+                "WEEKLY_STRICT_LLM_PROFILE_ENABLED", True
+            ),
+            startup_preflight_enabled=_env_bool("STARTUP_PREFLIGHT_ENABLED", True),
+            startup_preflight_blocking_sources=tuple(
+                token.strip().lower()
+                for token in _env_csv(
+                    "STARTUP_PREFLIGHT_BLOCKING_SOURCES",
+                    "gsc,drive",
+                )
+                if token.strip()
+            ),
+            ingestion_snapshot_enabled=_env_bool("INGESTION_SNAPSHOT_ENABLED", True),
+            ingestion_snapshot_retention_days=max(
+                1, _env_int("INGESTION_SNAPSHOT_RETENTION_DAYS", 45)
+            ),
             telemetry_enabled=_env_bool("TELEMETRY_ENABLED", True),
             security_source_allowlist_domains=_env_csv(
                 "SECURITY_SOURCE_ALLOWLIST_DOMAINS", default_source_allowlist
@@ -545,6 +577,7 @@ class AgentConfig:
             weather_latitude=_env_float("WEATHER_LATITUDE", 52.2297),
             weather_longitude=_env_float("WEATHER_LONGITUDE", 21.0122),
             weather_label=_env("WEATHER_LABEL", "PL-central"),
+            weather_context_enabled=_env_bool("WEATHER_CONTEXT_ENABLED", True),
             weather_latitude_map=_env_map_float(
                 "WEATHER_LATITUDE_MAP", default_weather_lat_map
             ),
@@ -697,6 +730,13 @@ class AgentConfig:
             and self.gaia_api_key
             and self.gaia_api_version
             and self.gaia_model
+        )
+
+    @property
+    def merchant_center_api_enabled(self) -> bool:
+        return bool(
+            self.merchant_center_enabled
+            and self.merchant_center_credentials_path
         )
 
     @property

@@ -182,11 +182,89 @@ NEGATIVE_EVENT_TOKENS = (
     "recession",
 )
 
+GOOGLE_UPDATE_TIMELINE_RSS_SOURCES: tuple[tuple[str, str, str], ...] = (
+    ("Google Search Central Blog", "https://developers.google.com/search/blog/rss.xml", "official"),
+    ("Search Engine Roundtable", "https://www.seroundtable.com/index.xml", "industry"),
+    ("Search Engine Land", "https://searchengineland.com/feed", "industry"),
+    ("Search Engine Journal", "https://www.searchenginejournal.com/feed/", "industry"),
+)
+
+GOOGLE_UPDATE_TIMELINE_KEYWORDS = (
+    "update",
+    "core update",
+    "spam update",
+    "ranking volatility",
+    "algorithm",
+    "search console",
+    "discover",
+    "ai overview",
+    "merchant listings",
+    "product snippets",
+)
+
+SERP_CASE_STUDY_RSS_SOURCES: tuple[tuple[str, str], ...] = (
+    ("Google Search Central Blog", "https://developers.google.com/search/blog/rss.xml"),
+    ("Search Engine Roundtable", "https://www.seroundtable.com/index.xml"),
+    ("Search Engine Land", "https://searchengineland.com/feed"),
+    ("Search Engine Journal", "https://www.searchenginejournal.com/feed/"),
+)
+
+SERP_CASE_STUDY_INTENT_TOKENS = (
+    "case study",
+    "study",
+    "analysis",
+    "test",
+    "experiment",
+    "data",
+)
+
+SERP_CASE_STUDY_SIGNAL_TOKENS = (
+    "ctr",
+    "click-through",
+    "click share",
+    "search appearance",
+    "serp feature",
+    "merchant listings",
+    "product snippets",
+    "free listings",
+    "shopping graph",
+    "organic clicks",
+    "ai overview",
+    "ai mode",
+    "rich result",
+    "featured snippet",
+)
+
+SERP_CASE_TOPIC_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "CTR and click distribution",
+        ("ctr", "click-through", "click share", "traffic share", "organic clicks"),
+    ),
+    (
+        "SERP layout and features",
+        ("search appearance", "serp feature", "rich result", "featured snippet", "carousel", "ai overview", "ai mode"),
+    ),
+    (
+        "Merchant and free listings",
+        ("merchant listings", "product snippets", "free listings", "shopping graph", "merchant center"),
+    ),
+    (
+        "Algorithm/update impact",
+        ("core update", "spam update", "ranking volatility", "algorithm update", "search update"),
+    ),
+)
+
 
 def _safe_pct(current: float, baseline: float) -> float:
     if baseline == 0:
         return 1.0 if current > 0 else 0.0
     return (current - baseline) / baseline
+
+
+def _normalize_text(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _parse_float(value: object) -> float | None:
@@ -1362,6 +1440,350 @@ def _overall_cwv_category(lcp_ms: float, inp_ms: float, cls: float) -> str:
     return max(buckets, key=lambda item: bucket_rank[item])
 
 
+def _normalize_title_token(value: str) -> str:
+    text = _normalize_text(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _classify_google_update_kind(text: str) -> str:
+    lowered = text.lower()
+    if any(token in lowered for token in ("core update", "spam update", "algorithm update")):
+        return "Algorithm update"
+    if any(token in lowered for token in ("ai overview", "ai mode", "serp feature", "search appearance")):
+        return "SERP layout change"
+    if any(token in lowered for token in ("merchant listings", "product snippets", "free listings", "shopping graph")):
+        return "Commerce SERP/feed"
+    if any(token in lowered for token in ("outage", "incident", "error")):
+        return "Operational incident"
+    return "Search guidance"
+
+
+def _classify_serp_case_topic(text: str) -> str:
+    lowered = text.lower()
+    for label, tokens in SERP_CASE_TOPIC_RULES:
+        if any(token in lowered for token in tokens):
+            return label
+    return "General SERP observations"
+
+
+def _is_serp_case_candidate(text: str) -> bool:
+    lowered = text.lower()
+    intent_hits = sum(1 for token in SERP_CASE_STUDY_INTENT_TOKENS if token in lowered)
+    signal_hits = sum(1 for token in SERP_CASE_STUDY_SIGNAL_TOKENS if token in lowered)
+    if signal_hits <= 0:
+        return False
+    if intent_hits > 0:
+        return True
+    # Keep data-rich posts even when explicit "case study" wording is missing.
+    return signal_hits >= 2
+
+
+def _collect_google_updates_timeline(
+    *,
+    run_date: date,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    yoy_window: DateWindow,
+    status_endpoint: str,
+    blog_rss_url: str,
+    scan_months: int = 13,
+) -> dict[str, Any]:
+    scan_days = max(390, int(scan_months) * 30)
+    since_day = run_date - timedelta(days=scan_days)
+    current_month_end = current_window.end
+    current_month_start = current_month_end - timedelta(days=29)
+    previous_month_end = current_month_start - timedelta(days=1)
+    previous_month_start = previous_month_end - timedelta(days=29)
+    yoy_month_start = current_month_start - timedelta(weeks=52)
+    yoy_month_end = current_month_end - timedelta(weeks=52)
+
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    try:
+        payload = _safe_get_json(url=status_endpoint, timeout=30)
+        if isinstance(payload, list):
+            for incident in payload:
+                if not isinstance(incident, dict):
+                    continue
+                begin = _parse_datetime(incident.get("begin"))
+                day = begin.date() if begin else None
+                if not isinstance(day, date) or day < since_day:
+                    continue
+                title = str(incident.get("external_desc") or incident.get("id") or "Google Search incident").strip()
+                if not title:
+                    continue
+                updates = incident.get("updates") or []
+                latest_update = updates[-1] if isinstance(updates, list) and updates and isinstance(updates[-1], dict) else {}
+                details = html.unescape(str(latest_update.get("text", ""))).strip()
+                details = re.sub(r"\s+", " ", details)
+                if len(details) > 240:
+                    details = details[:237] + "..."
+                text_blob = f"{title} {details}".lower()
+                if "search" not in text_blob and "google" not in text_blob:
+                    continue
+                rows.append(
+                    {
+                        "date": day.isoformat(),
+                        "title": title[:180],
+                        "source": "Google Search Status",
+                        "source_type": "official",
+                        "kind": _classify_google_update_kind(text_blob),
+                        "url": f"https://status.search.google.com/incidents/{incident.get('id', '')}",
+                        "details": details,
+                    }
+                )
+    except Exception as exc:
+        errors.append(f"status_endpoint: {exc}")
+
+    rss_sources = list(GOOGLE_UPDATE_TIMELINE_RSS_SOURCES)
+    if blog_rss_url.strip():
+        rss_sources[0] = ("Google Search Central Blog", blog_rss_url.strip(), "official")
+    for label, url, source_type in rss_sources:
+        try:
+            items = _fetch_generic_rss_signals(
+                url=url,
+                source_label=label,
+                since=since_day,
+                max_rows=220,
+                severity="info",
+            )
+            for item in items:
+                text_blob = f"{item.title} {item.details}".lower()
+                if not any(token in text_blob for token in GOOGLE_UPDATE_TIMELINE_KEYWORDS):
+                    continue
+                rows.append(
+                    {
+                        "date": item.day.isoformat(),
+                        "title": str(item.title).strip()[:180],
+                        "source": label,
+                        "source_type": source_type,
+                        "kind": _classify_google_update_kind(text_blob),
+                        "url": item.url or "",
+                        "details": str(item.details).strip()[:240],
+                    }
+                )
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in sorted(rows, key=lambda item: str(item.get("date", "")), reverse=True):
+        title_key = _normalize_title_token(str(row.get("title", "")))
+        date_key = str(row.get("date", "")).strip()[:10]
+        if not title_key or not date_key:
+            continue
+        key = (date_key, title_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    def _count_in_range(start_day: date, end_day: date) -> int:
+        count = 0
+        for row in deduped:
+            day = _parse_date(row.get("date"))
+            if not isinstance(day, date):
+                continue
+            if start_day <= day <= end_day:
+                count += 1
+        return count
+
+    count_current_week = _count_in_range(current_window.start, current_window.end)
+    count_previous_week = _count_in_range(previous_window.start, previous_window.end)
+    count_current_month = _count_in_range(current_month_start, current_month_end)
+    count_previous_month = _count_in_range(previous_month_start, previous_month_end)
+    count_yoy_month = _count_in_range(yoy_month_start, yoy_month_end)
+
+    topic_counts: dict[str, int] = {}
+    for row in deduped:
+        kind = str(row.get("kind", "")).strip() or "Search guidance"
+        topic_counts[kind] = int(topic_counts.get(kind, 0) or 0) + 1
+
+    latest = deduped[0] if deduped else {}
+    return {
+        "enabled": bool(deduped),
+        "source": "Google update timeline (status + blog + trusted industry RSS)",
+        "scan_months": max(13, int(scan_months)),
+        "scan_start": since_day.isoformat(),
+        "scan_end": run_date.isoformat(),
+        "windows": {
+            "current_week": {"start": current_window.start.isoformat(), "end": current_window.end.isoformat()},
+            "previous_week": {"start": previous_window.start.isoformat(), "end": previous_window.end.isoformat()},
+            "current_30d": {"start": current_month_start.isoformat(), "end": current_month_end.isoformat()},
+            "previous_30d": {"start": previous_month_start.isoformat(), "end": previous_month_end.isoformat()},
+            "yoy_30d": {"start": yoy_month_start.isoformat(), "end": yoy_month_end.isoformat()},
+        },
+        "summary": {
+            "count_current_week": count_current_week,
+            "count_previous_week": count_previous_week,
+            "delta_week_vs_previous": count_current_week - count_previous_week,
+            "delta_week_pct_vs_previous": (_safe_pct(count_current_week, count_previous_week) * 100.0) if count_previous_week else 0.0,
+            "count_current_30d": count_current_month,
+            "count_previous_30d": count_previous_month,
+            "count_yoy_30d": count_yoy_month,
+            "delta_30d_vs_previous": count_current_month - count_previous_month,
+            "delta_30d_pct_vs_previous": (_safe_pct(count_current_month, count_previous_month) * 100.0) if count_previous_month else 0.0,
+            "delta_30d_vs_yoy": count_current_month - count_yoy_month,
+            "delta_30d_pct_vs_yoy": (_safe_pct(count_current_month, count_yoy_month) * 100.0) if count_yoy_month else 0.0,
+            "total_count_13m": len(deduped),
+            "topic_counts_13m": topic_counts,
+            "latest_update_date": str(latest.get("date", "")).strip(),
+            "latest_update_title": str(latest.get("title", "")).strip(),
+        },
+        "rows": deduped[:120],
+        "errors": errors,
+    }
+
+
+def _collect_serp_case_studies_context(
+    *,
+    run_date: date,
+    current_window: DateWindow,
+    previous_window: DateWindow,
+    yoy_window: DateWindow,
+    scan_months: int = 13,
+) -> tuple[dict[str, Any], list[ExternalSignal]]:
+    scan_days = max(390, int(scan_months) * 30)
+    since_day = run_date - timedelta(days=scan_days)
+    current_month_end = current_window.end
+    current_month_start = current_month_end - timedelta(days=29)
+    previous_month_end = current_month_start - timedelta(days=1)
+    previous_month_start = previous_month_end - timedelta(days=29)
+    yoy_month_start = current_month_start - timedelta(weeks=52)
+    yoy_month_end = current_month_end - timedelta(weeks=52)
+
+    rows: list[dict[str, Any]] = []
+    signals: list[ExternalSignal] = []
+    errors: list[str] = []
+
+    for label, url in SERP_CASE_STUDY_RSS_SOURCES:
+        try:
+            items = _fetch_generic_rss_signals(
+                url=url,
+                source_label=label,
+                since=since_day,
+                max_rows=240,
+                severity="info",
+            )
+            for item in items:
+                text_blob = f"{item.title} {item.details}".lower()
+                if not _is_serp_case_candidate(text_blob):
+                    continue
+                intent_hits = sum(1 for token in SERP_CASE_STUDY_INTENT_TOKENS if token in text_blob)
+                signal_hits = sum(1 for token in SERP_CASE_STUDY_SIGNAL_TOKENS if token in text_blob)
+                score = min(100, 35 + (intent_hits * 15) + (signal_hits * 10))
+                topic = _classify_serp_case_topic(text_blob)
+                rows.append(
+                    {
+                        "date": item.day.isoformat(),
+                        "title": str(item.title).strip()[:180],
+                        "source": label,
+                        "topic": topic,
+                        "relevance_score": score,
+                        "url": item.url or "",
+                        "summary": str(item.details).strip()[:240],
+                    }
+                )
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            int(item.get("relevance_score", 0) or 0),
+            str(item.get("date", "")),
+        ),
+        reverse=True,
+    ):
+        key = (
+            str(row.get("date", "")).strip()[:10],
+            _normalize_title_token(str(row.get("title", ""))),
+        )
+        if not key[0] or not key[1]:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    def _count_in_range(start_day: date, end_day: date) -> int:
+        count = 0
+        for row in deduped:
+            day = _parse_date(row.get("date"))
+            if not isinstance(day, date):
+                continue
+            if start_day <= day <= end_day:
+                count += 1
+        return count
+
+    topic_counts_13m: dict[str, int] = {}
+    for row in deduped:
+        topic = str(row.get("topic", "")).strip() or "General SERP observations"
+        topic_counts_13m[topic] = int(topic_counts_13m.get(topic, 0) or 0) + 1
+
+    count_current_week = _count_in_range(current_window.start, current_window.end)
+    count_previous_week = _count_in_range(previous_window.start, previous_window.end)
+    count_current_month = _count_in_range(current_month_start, current_month_end)
+    count_previous_month = _count_in_range(previous_month_start, previous_month_end)
+    count_yoy_month = _count_in_range(yoy_month_start, yoy_month_end)
+
+    latest = deduped[0] if deduped else {}
+    for row in deduped[:3]:
+        day = _parse_date(row.get("date")) or run_date
+        signals.append(
+            ExternalSignal(
+                source="SERP case studies (13M scan)",
+                day=day,
+                title=str(row.get("title", "")).strip()[:180] or "SERP case study signal",
+                details=(
+                    f"Topic: {str(row.get('topic', '')).strip() or 'General SERP observations'}; "
+                    f"relevance {int(row.get('relevance_score', 0) or 0)}/100. "
+                    f"{str(row.get('summary', '')).strip()[:180]}"
+                ).strip(),
+                severity="info",
+                url=str(row.get("url", "")).strip() or None,
+            )
+        )
+
+    return {
+        "enabled": bool(deduped),
+        "source": "SERP case-study scanner (trusted SEO RSS)",
+        "scan_months": max(13, int(scan_months)),
+        "scan_start": since_day.isoformat(),
+        "scan_end": run_date.isoformat(),
+        "windows": {
+            "current_week": {"start": current_window.start.isoformat(), "end": current_window.end.isoformat()},
+            "previous_week": {"start": previous_window.start.isoformat(), "end": previous_window.end.isoformat()},
+            "current_30d": {"start": current_month_start.isoformat(), "end": current_month_end.isoformat()},
+            "previous_30d": {"start": previous_month_start.isoformat(), "end": previous_month_end.isoformat()},
+            "yoy_30d": {"start": yoy_month_start.isoformat(), "end": yoy_month_end.isoformat()},
+        },
+        "summary": {
+            "count_current_week": count_current_week,
+            "count_previous_week": count_previous_week,
+            "delta_week_vs_previous": count_current_week - count_previous_week,
+            "delta_week_pct_vs_previous": (_safe_pct(count_current_week, count_previous_week) * 100.0) if count_previous_week else 0.0,
+            "count_current_30d": count_current_month,
+            "count_previous_30d": count_previous_month,
+            "count_yoy_30d": count_yoy_month,
+            "delta_30d_vs_previous": count_current_month - count_previous_month,
+            "delta_30d_pct_vs_previous": (_safe_pct(count_current_month, count_previous_month) * 100.0) if count_previous_month else 0.0,
+            "delta_30d_vs_yoy": count_current_month - count_yoy_month,
+            "delta_30d_pct_vs_yoy": (_safe_pct(count_current_month, count_yoy_month) * 100.0) if count_yoy_month else 0.0,
+            "total_count_13m": len(deduped),
+            "topic_counts_13m": topic_counts_13m,
+            "latest_case_date": str(latest.get("date", "")).strip(),
+            "latest_case_title": str(latest.get("title", "")).strip(),
+        },
+        "rows": deduped[:120],
+        "errors": errors,
+    }, signals
+
+
 def collect_additional_context(
     target_site_url: str,
     target_domain: str,
@@ -1405,6 +1827,10 @@ def collect_additional_context(
     market_events_enabled: bool = True,
     market_events_api_base_url: str = "https://api.gdeltproject.org/api/v2/doc/doc",
     market_events_top_rows: int = 12,
+    google_status_endpoint: str = "https://status.search.google.com/incidents.json",
+    google_blog_rss: str = "https://developers.google.com/search/blog/rss.xml",
+    google_updates_scan_months: int = 13,
+    serp_case_study_scan_months: int = 13,
     free_public_sources_enabled: bool = True,
     free_public_sources_top_rows: int = 3,
     nager_holidays_country_code: str = "PL",
@@ -1434,6 +1860,8 @@ def collect_additional_context(
         "product_trends": {},
         "trade_plan": {},
         "platform_regulatory_pulse": {},
+        "google_updates_timeline": {},
+        "serp_case_studies": {},
         "free_public_source_hub": {},
         "errors": [],
     }
@@ -1796,6 +2224,33 @@ def collect_additional_context(
                 "errors": [str(exc)],
             }
             context["errors"].append(f"Platform/regulatory pulse fetch failed: {exc}")
+
+    try:
+        updates_context = _collect_google_updates_timeline(
+            run_date=run_date,
+            current_window=current_window,
+            previous_window=previous_window,
+            yoy_window=yoy_window,
+            status_endpoint=google_status_endpoint,
+            blog_rss_url=google_blog_rss,
+            scan_months=max(13, int(google_updates_scan_months)),
+        )
+        context["google_updates_timeline"] = updates_context
+    except Exception as exc:
+        context["errors"].append(f"Google updates timeline fetch failed: {exc}")
+
+    try:
+        case_studies_context, case_study_signals = _collect_serp_case_studies_context(
+            run_date=run_date,
+            current_window=current_window,
+            previous_window=previous_window,
+            yoy_window=yoy_window,
+            scan_months=max(13, int(serp_case_study_scan_months)),
+        )
+        context["serp_case_studies"] = case_studies_context
+        signals.extend(case_study_signals)
+    except Exception as exc:
+        context["errors"].append(f"SERP case-study scanner failed: {exc}")
 
     try:
         free_public_ctx, free_public_signals = _collect_free_public_source_hub(

@@ -68,6 +68,24 @@ def test_parse_numeric_cell_handles_k_and_decimal_formats() -> None:
     assert ContinuityClient._parse_numeric_cell("n/a") is None
 
 
+def test_fill_down_sparse_rows_handles_merged_cells() -> None:
+    rows = [
+        ["2026-02-17", "Campaign Alpha", "Paid Search", "Brand", "1200"],
+        ["", "", "", "Brand", "600"],
+        ["", "", "Display", "", "300"],
+    ]
+    filled = ContinuityClient._fill_down_sparse_rows(
+        rows,
+        filldown_indices=(0, 1, 2, 3),
+    )
+    assert filled[1][0] == "2026-02-17"
+    assert filled[1][1] == "Campaign Alpha"
+    assert filled[1][2] == "Paid Search"
+    assert filled[2][0] == "2026-02-17"
+    assert filled[2][1] == "Campaign Alpha"
+    assert filled[2][2] == "Display"
+
+
 def test_extract_non_brand_yoy_rows_filters_brand_terms() -> None:
     client = _client()
     tables = [

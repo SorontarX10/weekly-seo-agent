@@ -99,6 +99,7 @@ class ExternalSignalsClient:
         latitude: float,
         longitude: float,
         weather_label: str,
+        weather_context_enabled: bool,
         market_country_code: str,
         status_endpoint: str,
         blog_rss_url: str,
@@ -116,6 +117,7 @@ class ExternalSignalsClient:
         self.latitude = latitude
         self.longitude = longitude
         self.weather_label = weather_label
+        self.weather_context_enabled = bool(weather_context_enabled)
         self.market_country_code = market_country_code.strip().upper() or "PL"
         self.status_endpoint = status_endpoint
         self.blog_rss_url = blog_rss_url
@@ -189,25 +191,26 @@ class ExternalSignalsClient:
     ) -> tuple[list[ExternalSignal], dict[str, float]]:
         signals: list[ExternalSignal] = []
         weather_summary: dict[str, float] = {}
-        try:
-            weather_summary = self._weather_summary(
-                current_window=current_window,
-                previous_window=previous_window,
-                yoy_window=yoy_window,
-            )
-            weather_summary.update(
-                self._weather_forecast_summary(reference_day=current_window.end, days=7)
-            )
-        except Exception as exc:
-            signals.append(
-                ExternalSignal(
-                    source="Weather",
-                    day=current_window.end,
-                    title="Weather source degraded",
-                    details=f"Weather source failed, using partial context only: {exc}",
-                    severity="medium",
+        if self.weather_context_enabled:
+            try:
+                weather_summary = self._weather_summary(
+                    current_window=current_window,
+                    previous_window=previous_window,
+                    yoy_window=yoy_window,
                 )
-            )
+                weather_summary.update(
+                    self._weather_forecast_summary(reference_day=current_window.end, days=7)
+                )
+            except Exception as exc:
+                signals.append(
+                    ExternalSignal(
+                        source="Weather",
+                        day=current_window.end,
+                        title="Weather source degraded",
+                        details=f"Weather source failed, using partial context only: {exc}",
+                        severity="medium",
+                    )
+                )
 
         for fetch_name, fetch_fn in (
             ("Google Search Status", lambda: self._google_status_signals(previous_window.start)),
@@ -248,53 +251,54 @@ class ExternalSignalsClient:
                     )
                 )
 
-        temp_diff = weather_summary.get("avg_temp_diff_c", 0.0)
-        precip_change_pct = weather_summary.get("precip_change_pct", 0.0)
-        if abs(temp_diff) >= 3.0:
-            direction = "higher" if temp_diff > 0 else "lower"
-            signals.append(
-                ExternalSignal(
-                    source="Weather",
-                    day=current_window.end,
-                    title=f"Temperature anomaly in {self.weather_label}",
-                    details=(
-                        f"Average temperature was {abs(temp_diff):.1f}C {direction} vs previous 28 days."
-                    ),
-                    severity="medium",
-                )
-            )
-
-        if abs(precip_change_pct) >= 40.0:
-            direction = "up" if precip_change_pct > 0 else "down"
-            signals.append(
-                ExternalSignal(
-                    source="Weather",
-                    day=current_window.end,
-                    title=f"Precipitation change in {self.weather_label}",
-                    details=(
-                        f"Total precipitation is {direction} {abs(precip_change_pct):.1f}% vs previous 28 days."
-                    ),
-                    severity="medium",
-                )
-            )
-
-        forecast_avg = float(weather_summary.get("forecast_avg_temp_c", 0.0))
-        forecast_precip = float(weather_summary.get("forecast_precip_mm", 0.0))
-        forecast_start = str(weather_summary.get("forecast_start", "")).strip()
-        forecast_end = str(weather_summary.get("forecast_end", "")).strip()
-        if forecast_start and forecast_end:
-            if abs(forecast_avg - weather_summary.get("avg_temp_current_c", 0.0)) >= 2.5:
+        if self.weather_context_enabled:
+            temp_diff = weather_summary.get("avg_temp_diff_c", 0.0)
+            precip_change_pct = weather_summary.get("precip_change_pct", 0.0)
+            if abs(temp_diff) >= 3.0:
+                direction = "higher" if temp_diff > 0 else "lower"
                 signals.append(
                     ExternalSignal(
-                        source="Weather forecast",
-                        day=current_window.end + timedelta(days=1),
-                        title=f"7-day weather outlook ({forecast_start} to {forecast_end})",
+                        source="Weather",
+                        day=current_window.end,
+                        title=f"Temperature anomaly in {self.weather_label}",
                         details=(
-                            f"Forecast avg temp {forecast_avg:+.1f}C, total precipitation {forecast_precip:.1f}mm."
+                            f"Average temperature was {abs(temp_diff):.1f}C {direction} vs previous 28 days."
                         ),
                         severity="medium",
                     )
                 )
+
+            if abs(precip_change_pct) >= 40.0:
+                direction = "up" if precip_change_pct > 0 else "down"
+                signals.append(
+                    ExternalSignal(
+                        source="Weather",
+                        day=current_window.end,
+                        title=f"Precipitation change in {self.weather_label}",
+                        details=(
+                            f"Total precipitation is {direction} {abs(precip_change_pct):.1f}% vs previous 28 days."
+                        ),
+                        severity="medium",
+                    )
+                )
+
+            forecast_avg = float(weather_summary.get("forecast_avg_temp_c", 0.0))
+            forecast_precip = float(weather_summary.get("forecast_precip_mm", 0.0))
+            forecast_start = str(weather_summary.get("forecast_start", "")).strip()
+            forecast_end = str(weather_summary.get("forecast_end", "")).strip()
+            if forecast_start and forecast_end:
+                if abs(forecast_avg - weather_summary.get("avg_temp_current_c", 0.0)) >= 2.5:
+                    signals.append(
+                        ExternalSignal(
+                            source="Weather forecast",
+                            day=current_window.end + timedelta(days=1),
+                            title=f"7-day weather outlook ({forecast_start} to {forecast_end})",
+                            details=(
+                                f"Forecast avg temp {forecast_avg:+.1f}C, total precipitation {forecast_precip:.1f}mm."
+                            ),
+                            severity="medium",
+                        )
+                    )
 
         signals.sort(key=lambda item: (item.day, item.source), reverse=True)
         return signals, weather_summary

@@ -40,6 +40,25 @@ Z datą ręczną:
 ./scripts/run_report.sh --run-date 2026-02-17
 ```
 
+Runtime flags (single run override):
+
+```bash
+# Run startup checks only (no workflow execution)
+./scripts/run_report.sh --preflight-only
+
+# Disable Merchant Center preflight/enrichment for this run
+./scripts/run_report.sh --no-merchant-center
+
+# Disable strict quality-max LLM profile for this run
+./scripts/run_report.sh --no-strict-llm-profile
+
+# Disable selected sources for controlled diagnostics
+./scripts/run_report.sh --disable-source news --disable-source events
+
+# Re-enable one source explicitly (if disabled in .env)
+./scripts/run_report.sh --enable-source weather
+```
+
 ## 4) Co musi być w `.env`
 
 Minimum dla działania raportu:
@@ -47,6 +66,10 @@ Minimum dla działania raportu:
 - model LLM (`OPENAI_API_KEY` / GAIA config zależnie od środowiska),
 - `REPORT_COUNTRIES=PL,CZ,SK,HU` (lub inny zestaw),
 - `GSC_SITE_URL_MAP=PL:https://allegro.pl,CZ:https://allegro.cz,SK:https://allegro.sk,HU:https://allegro.hu`.
+- `STARTUP_PREFLIGHT_ENABLED=true` (domyślnie, readiness checks przed runem),
+- `STARTUP_PREFLIGHT_BLOCKING_SOURCES=gsc,drive` (które źródła blokują run na błędzie).
+- `INGESTION_SNAPSHOT_ENABLED=true` (zapis sanitizowanego snapshotu danych wejściowych do debugowania),
+- `INGESTION_SNAPSHOT_RETENTION_DAYS=45` (retencja snapshotów w dniach).
 
 Dla publikacji do Google Docs:
 - `GOOGLE_DRIVE_ENABLED=true`
@@ -54,6 +77,12 @@ Dla publikacji do Google Docs:
 - `GOOGLE_DRIVE_TOKEN_PATH=.google_drive_token.json`
 - `GOOGLE_DRIVE_FOLDER_NAME=SEO Weekly Reports`
 - opcjonalnie: `GOOGLE_DRIVE_FOLDER_ID=...` (jeśli chcesz pisać do konkretnego folderu)
+
+Dla Merchant Center (opcjonalny preflight + enrichment):
+- `MERCHANT_CENTER_ENABLED=true`
+- `MERCHANT_CENTER_CREDENTIALS_PATH=...` (service account JSON)
+- `MERCHANT_CENTER_ACCOUNT_ID_MAP=PL:...,CZ:...,SK:...,HU:...`
+- opcjonalnie: `MERCHANT_CENTER_MCA_ID=...` (jeśli konta krajowe są sub-accountami pod MCA)
 
 ## 5) Jak dokładnie działa zapis do Google Docs
 
@@ -79,6 +108,8 @@ Przepływ jest deterministyczny i wygląda tak:
 ### Ważne zachowanie
 - Lokalny `.docx` **zostaje** w `output_dir`.
 - Na Drive agent utrzymuje **1 dokument na nazwę** (czyli nadpisuje logicznie przez delete+create dla tej samej nazwy).
+- Sanitizowany snapshot źródeł wejściowych zapisuje się lokalnie do:
+  - `output/_telemetry/raw_sources/YYYY_MM_DD_<country>_ingestion_snapshot.json`
 
 ## 6) Jakie funkcje są "w tym agencie"
 
@@ -100,6 +131,12 @@ Najważniejsze capability:
   - albo użyj OAuth user credentials.
 - GSC nie zwraca danych per rynek:
   - sprawdź `GSC_SITE_URL_MAP` i uprawnienia konta technicznego do każdej właściwości.
+- Merchant Center preflight kończy się `accessNotConfigured`:
+  - włącz API `merchantapi.googleapis.com` w projekcie GCP przypiętym do service account,
+  - odczekaj kilka minut na propagację uprawnień i ponów run.
+- Merchant Center preflight kończy się `GCP_NOT_REGISTERED` / `UNAUTHENTICATED`:
+  - zarejestruj projekt GCP jako developer dla Merchant API w Merchant Center (konto techniczne + projekt),
+  - po rejestracji odczekaj kilka minut i ponów run.
 
 ## 8) Zakres folderu
 

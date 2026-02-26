@@ -56,6 +56,7 @@ def test_holiday_signals_are_parsed_from_openholidays(monkeypatch) -> None:
         latitude=52.2297,
         longitude=21.0122,
         weather_label="PL-central",
+        weather_context_enabled=True,
         market_country_code="PL",
         status_endpoint="https://status.search.google.com/incidents.json",
         blog_rss_url="https://feeds.feedburner.com/blogspot/amDG",
