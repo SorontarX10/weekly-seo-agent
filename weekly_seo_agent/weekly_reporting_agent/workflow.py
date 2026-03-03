@@ -4342,6 +4342,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     run_date = state["run_date"]
     config = state["config"]
 
+    _stage_log(state, "collect_and_analyze", "STEP", extra="compute_windows")
     windows = compute_windows(run_date)
     current_window = windows["current_28d"]
     previous_window = windows["previous_28d"]
@@ -4360,6 +4361,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         row_limit=config.gsc_row_limit,
     )
 
+    _stage_log(state, "collect_and_analyze", "STEP", extra="gsc_daily_maps")
     current_daily_map = _daily_metric_map(gsc, current_window)
     previous_daily_map = _daily_metric_map(gsc, previous_window)
     yoy_daily_map = _daily_metric_map(gsc, yoy_window)
@@ -4393,6 +4395,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     if float(yoy_total_masked.impressions) <= 0.0:
         yoy_total_masked = gsc.fetch_totals(yoy_window)
 
+    _stage_log(state, "collect_and_analyze", "STEP", extra="gsc_totals_windows")
     current_week_total = gsc.fetch_totals(current_window)
 
     totals = {
@@ -4429,6 +4432,12 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
 
     scope_results: list[tuple[str, AnalysisResult]] = []
     query_filter_stats: dict[str, dict[str, int]] = {}
+    _stage_log(
+        state,
+        "collect_and_analyze",
+        "STEP",
+        extra=f"gsc_dimension_scopes count={len(config.gsc_dimension_sets)}",
+    )
     for dimension_set in config.gsc_dimension_sets:
         scope_name = "+".join(dimension_set)
         current_rows = gsc.fetch_rows(current_window, dimensions=dimension_set)
@@ -4478,6 +4487,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         "anomalies": [],
         "days_with_data": 0,
     }
+    _stage_log(state, "collect_and_analyze", "STEP", extra="gsc_search_appearance_split")
     try:
         feature_current = gsc.fetch_rows(current_window, dimensions=("searchAppearance",))
         feature_previous = gsc.fetch_rows(previous_window, dimensions=("searchAppearance",))
@@ -4556,6 +4566,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
 
     # GSC Search Analytics does not allow combining `searchAppearance` with another dimension
     # on many properties. Treat daily SERP shifts as optional and do not block feature split.
+    _stage_log(state, "collect_and_analyze", "STEP", extra="gsc_daily_search_appearance")
     try:
         feature_daily_current = gsc.fetch_rows(
             current_window,
@@ -4606,6 +4617,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         "query_movers": {"winners": [], "losers": []},
         "errors": [],
     }
+    _stage_log(state, "collect_and_analyze", "STEP", extra="long_window_context")
     try:
         long_window_context["kpi"] = {
             "clicks_delta_vs_previous": totals["current_28d_context"].clicks - totals["previous_28d_context"].clicks,
@@ -4723,6 +4735,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     external_cache_mode = "live"
     additional_cache_mode = "live"
 
+    _stage_log(state, "collect_and_analyze", "STEP", extra="external_context_cache_check")
     if cached_external and cached_context:
         external_signals, weather_summary = _deserialize_external_cache(cached_external)
         additional_context, extra_signals = _deserialize_additional_cache(cached_context)
@@ -4737,6 +4750,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 }
             )
     else:
+        _stage_log(state, "collect_and_analyze", "STEP", extra="external_context_live_fetch_start")
         # Parallel I/O on daemon threads: timed-out calls cannot block process shutdown.
         external_handle = _start_daemon_task(
             external_client.collect,
@@ -4939,6 +4953,12 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                     "additional_context": "live_or_stale_fallback",
                 }
             )
+        _stage_log(
+            state,
+            "collect_and_analyze",
+            "STEP",
+            extra=f"external_context_ready external_mode={external_cache_mode} additional_mode={additional_cache_mode}",
+        )
         # Avoid poisoning cache with degraded timeout fallbacks.
         if external_cache_mode == "live":
             _cache_save_json(
@@ -5043,6 +5063,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     additional_context["daily_serp_feature_shifts"] = daily_serp_feature_shifts
 
     if config.weekly_news_summary_enabled:
+        _stage_log(state, "collect_and_analyze", "STEP", extra="weekly_news_digest")
         weekly_news_digest, weekly_news_signals = _collect_weekly_news_digest(
             config=config,
             current_window=current_window,
@@ -5052,6 +5073,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
 
     allegro_trends_context: dict[str, object] = {"enabled": False, "errors": []}
     if config.allegro_trends_api_enabled:
+        _stage_log(state, "collect_and_analyze", "STEP", extra="allegro_trends_api")
         try:
             trends_client = AllegroTrendsClient(
                 basic_auth_login=config.allegro_trends_basic_auth_login,
@@ -5121,6 +5143,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
 
     # GA4 integration removed from weekly reporting workflow.
 
+    _stage_log(state, "collect_and_analyze", "STEP", extra="gsc_query_page_device_fetch")
     query_current = gsc.fetch_rows(current_window, dimensions=("query",))
     query_previous = gsc.fetch_rows(previous_window, dimensions=("query",))
     query_yoy = gsc.fetch_rows(yoy_window, dimensions=("query",))
@@ -5167,6 +5190,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
     senuto_error: str | None = None
     senuto_intelligence: dict[str, object] = {"enabled": False, "errors": []}
     if config.senuto_enabled:
+        _stage_log(state, "collect_and_analyze", "STEP", extra="senuto_fetch_and_enrichment")
         try:
             senuto = SenutoClient(
                 token=config.senuto_token,
@@ -5442,6 +5466,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         hypotheses=precomputed_hypotheses,
     )
 
+    _stage_log(state, "collect_and_analyze", "STEP", extra="build_markdown_report")
     markdown_report = build_markdown_report(
         run_date=run_date,
         report_country_code=config.report_country_code,
