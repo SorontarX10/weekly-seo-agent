@@ -431,8 +431,12 @@ def _build_source_freshness_rows(
     ) -> dict[str, object]:
         status = status_from_mode(mode)
         age_days: float | None = None
+        effective_last_day = last_day
+        # Sources such as trade plan can contain future campaign dates; freshness must not use future dates.
+        if isinstance(effective_last_day, date) and effective_last_day > run_date:
+            effective_last_day = run_date
         if last_day is not None:
-            age_days = float((run_date - last_day).days)
+            age_days = float((run_date - effective_last_day).days)
             if age_days * 24 * 3600 > max(0, ttl_sec) and status == "fresh":
                 status = "stale"
         elif cache_saved_day is not None:
@@ -443,7 +447,7 @@ def _build_source_freshness_rows(
             "source_group": source_group,
             "source": source,
             "status": status,
-            "last_day": last_day.isoformat() if last_day else "",
+            "last_day": effective_last_day.isoformat() if effective_last_day else "",
             "ttl_hours": round(max(0, ttl_sec) / 3600.0, 1),
             "age_days": age_days,
             "cache_mode": mode,
@@ -1216,7 +1220,7 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
                 return "SEO/GEO news pulse"
             if any(token in combined for token in ("trend", "seasonality", "demand")):
                 return "Demand trends"
-            return "KPI packet"
+            return "KPI and segment data"
         return value or "Source evidence"
 
     def _dedupe_bullets(rows: list[str]) -> list[str]:
@@ -1248,6 +1252,9 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
 
     def _ensure_action_deliverable(payload: str) -> str:
         out = payload.strip().rstrip(".")
+        lowered = out.lower()
+        # Normalize malformed placeholder fragments like "KPI." or "KPI:" without payload.
+        out = re.sub(r"\|\s*kpi\s*[:.]?\s*(\|\s*)?$", "", out, flags=re.IGNORECASE).strip()
         lowered = out.lower()
         if "kpi:" not in lowered:
             if any(token in lowered for token in ("uokik", "regulatory", "legal", "compliance", "investigation")):
@@ -1569,6 +1576,7 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
         if not payload:
             continue
         if _is_context_only_claim(payload):
+            payload = re.sub(r"^\s*context signal:\s*", "", payload, flags=re.IGNORECASE)
             payload = (
                 f"Context signal: {payload.rstrip('.')} Treat this as supporting context only, not a standalone root cause."
             )
@@ -2521,6 +2529,32 @@ def _extract_serp_listing_impact_lines(
     commentary: str = "",
     limit: int = 4,
 ) -> list[str]:
+    def _is_weak_line(text: str) -> bool:
+        lowered = text.lower()
+        weak_tokens = (
+            "search-results appearance mix changed",
+            "listing-surface shifts can reallocate impressions",
+            "supports weekly prioritization",
+        )
+        quant_tokens = (
+            "wow",
+            "mom",
+            "yoy",
+            "ctr",
+            "position",
+            "impressions",
+            "merchant_listings",
+            "product_snippets",
+            "review_snippet",
+            "%",
+            "pp",
+        )
+        if any(token in lowered for token in weak_tokens) and not any(
+            token in lowered for token in quant_tokens
+        ):
+            return True
+        return False
+
     candidates: list[tuple[int, int, str]] = []
     sections = (
         _extract_markdown_section(markdown_report, "Context snapshot"),
@@ -2575,6 +2609,8 @@ def _extract_serp_listing_impact_lines(
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
+            if _is_weak_line(payload):
+                continue
             lowered_payload = payload.lower()
             priority = 1
             if any(token in lowered_payload for token in high_priority_tokens):
@@ -2595,6 +2631,18 @@ def _extract_serp_listing_impact_lines(
             selected.append(payload)
             if len(selected) >= max(1, limit):
                 break
+        # Keep only quant-backed lines when available.
+        strong = [
+            row
+            for row in selected
+            if re.search(
+                r"WoW|MoM|YoY|CTR|position|impressions|MERCHANT_LISTINGS|PRODUCT_SNIPPETS|REVIEW_SNIPPET|pp|%",
+                row,
+                flags=re.IGNORECASE,
+            )
+        ]
+        if strong:
+            return strong[: max(1, limit)]
         return selected[: max(1, limit)]
     return []
 
@@ -2976,6 +3024,27 @@ def _compose_final_report(markdown_report: str, commentary: str) -> str:
         for row in (governance or "").splitlines()
         if row.strip().startswith("- ")
     ]
+    if not governance_lines:
+        country_match = re.search(r"\|\s*([A-Z]{2})\s*\)", report_title_line)
+        country = country_match.group(1) if country_match else "PL"
+        windows_line = ""
+        window_match = re.search(
+            r"Data windows:\s*current\s*([0-9\-\.]+)\.\.([0-9\-\.]+),\s*previous\s*([0-9\-\.]+)\.\.([0-9\-\.]+),\s*YoY\s*([0-9\-\.]+)\.\.([0-9\-\.]+)",
+            markdown_report,
+            flags=re.IGNORECASE,
+        )
+        if window_match:
+            windows_line = (
+                f"- Data windows: current {window_match.group(1)}..{window_match.group(2)}, "
+                f"previous {window_match.group(3)}..{window_match.group(4)}, "
+                f"YoY {window_match.group(5)}..{window_match.group(6)}."
+            )
+        governance_lines = [
+            f"- Country: {country}.",
+            "- Human reviewer: not assigned.",
+            windows_line or "- Data windows: available in Evidence ledger.",
+            "- Known limitations: external signals can be delayed/noisy; causal claims are probabilistic and require next-run validation.",
+        ]
     output_lines.append("## Governance and provenance")
     if governance_lines:
         output_lines.extend(governance_lines[:4])
@@ -3423,6 +3492,28 @@ def _run_rule_based_report_checks(report_text: str) -> list[str]:
     # Numeric formatting check: prefer grouped integers with spaces over comma format.
     if re.search(r"\b\d{1,3}(?:,\d{3})+\b", report_text):
         issues.append("[medium] Found comma-separated large integers; should use spaces.")
+
+    # Anti-placeholder / anti-filler checks.
+    if re.search(r"\bContext signal:\s*Context signal:", report_text, flags=re.IGNORECASE):
+        issues.append("[high] Duplicate 'Context signal' prefix indicates filler output.")
+    if re.search(r"\|\s*KPI\s*[:.]?\s*(\||$)", report_text, flags=re.IGNORECASE):
+        issues.append("[high] Priority action contains malformed KPI placeholder.")
+    if re.search(r"\bKPI packet\b", report_text, flags=re.IGNORECASE):
+        issues.append("[medium] Generic evidence source label detected (`KPI packet`).")
+    if re.search(
+        r"\b(Current clicks and impressions|The evidence signals from various sources)\b",
+        report_text,
+        flags=re.IGNORECASE,
+    ):
+        issues.append("[medium] Generic non-decision wording detected in narrative/evidence.")
+
+    serp_section = _extract_markdown_section(report_text, "SERP and listings impact (WoW/MoM/YoY)")
+    if serp_section:
+        has_quant = bool(
+            re.search(r"WoW|MoM|YoY|CTR|position|impressions|MERCHANT_LISTINGS|PRODUCT_SNIPPETS", serp_section, re.IGNORECASE)
+        )
+        if not has_quant:
+            issues.append("[high] SERP/listings section lacks quantified WoW/MoM/YoY evidence.")
 
     return issues[:20]
 

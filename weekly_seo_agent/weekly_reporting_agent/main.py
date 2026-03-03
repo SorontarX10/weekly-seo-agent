@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import platform
+import queue as queue_module
 import shutil
 import subprocess
 import threading
@@ -932,21 +933,40 @@ def _run_country_report_with_watchdog(
         daemon=False,
     )
     process.start()
-    process.join(timeout=timeout)
+    payload: dict[str, Any] | None = None
+    deadline = time.monotonic() + float(timeout)
+    timed_out = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            payload = queue.get(timeout=min(1.0, max(0.1, remaining)))
+            break
+        except queue_module.Empty:
+            if not process.is_alive():
+                break
+            continue
 
     if process.is_alive():
-        process.terminate()
+        if timed_out:
+            process.terminate()
+            process.join(timeout=5)
+            raise TimeoutError(
+                f"Country run timed out after {timeout}s "
+                f"(country={country_code}, date={run_date.isoformat()})."
+            )
         process.join(timeout=5)
-        raise TimeoutError(
-            f"Country run timed out after {timeout}s "
-            f"(country={country_code}, date={run_date.isoformat()})."
-        )
-
-    payload: dict[str, Any] | None = None
-    try:
-        payload = queue.get_nowait()
-    except Exception:
-        payload = None
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            raise RuntimeError(
+                f"Country worker did not exit cleanly after payload "
+                f"(country={country_code}, date={run_date.isoformat()})."
+            )
+    else:
+        process.join(timeout=1)
 
     if not payload:
         exit_code = process.exitcode

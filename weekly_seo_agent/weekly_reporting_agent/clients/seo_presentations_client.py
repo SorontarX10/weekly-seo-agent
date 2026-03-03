@@ -4,6 +4,7 @@ import json
 from io import BytesIO
 import re
 import unicodedata
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,63 @@ class SEOPresentationsClient:
         "ferie",
         "season",
     )
+    THEME_TOKEN_MAP: dict[str, tuple[str, ...]] = {
+        "SERP layout and appearance": (
+            "searchappearance",
+            "search appearance",
+            "serp",
+            "feature",
+            "merchant listing",
+            "product snippet",
+            "review snippet",
+            "shopping",
+            "carousel",
+        ),
+        "CTR and click efficiency": (
+            "ctr",
+            "click through",
+            "click share",
+            "clicks",
+            "impression",
+            "position",
+            "ranking",
+            "visibility",
+        ),
+        "Demand and seasonality": (
+            "trend",
+            "season",
+            "ferie",
+            "wosp",
+            "walent",
+            "wielkan",
+            "brand",
+            "non-brand",
+            "demand",
+        ),
+        "Technical SEO and indexing": (
+            "index",
+            "crawl",
+            "canonical",
+            "template",
+            "internal link",
+            "schema",
+            "discover",
+            "core web vitals",
+            "lcp",
+            "inp",
+            "cls",
+        ),
+        "Execution and experiments": (
+            "test",
+            "a/b",
+            "experiment",
+            "rollout",
+            "plan",
+            "roadmap",
+            "backlog",
+            "monitoring",
+        ),
+    }
     HTTP_TIMEOUT_SEC = 45
 
     def __init__(
@@ -723,6 +781,115 @@ class SEOPresentationsClient:
             return modified_dt.year
         return None
 
+    @classmethod
+    def _theme_counts_from_highlights(cls, highlights: list[dict[str, str]]) -> Counter[str]:
+        counts: Counter[str] = Counter()
+        for row in highlights:
+            if not isinstance(row, dict):
+                continue
+            note = str(row.get("note", "")).strip()
+            normalized = cls._normalize_for_match(note)
+            if not normalized:
+                continue
+            matched = False
+            for theme, tokens in cls.THEME_TOKEN_MAP.items():
+                if any(token in normalized for token in tokens):
+                    counts[theme] += 1
+                    matched = True
+            if not matched:
+                counts["Other"] += 1
+        return counts
+
+    @classmethod
+    def _extract_highlight_day(cls, row: dict[str, str]) -> date | None:
+        raw = str(row.get("date", "")).strip()
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw[:10])
+        except ValueError:
+            return None
+
+    @classmethod
+    def _build_insight_summary(cls, *, highlights: list[dict[str, str]], run_date: date) -> dict[str, Any]:
+        metric_count = 0
+        action_count = 0
+        rows_recent_90d: list[dict[str, str]] = []
+        by_year: dict[int, list[dict[str, str]]] = {}
+        for row in highlights:
+            if not isinstance(row, dict):
+                continue
+            note = str(row.get("note", "")).strip()
+            normalized = cls._normalize_for_match(note)
+            if not normalized:
+                continue
+            if cls.METRIC_HINT_RE.search(normalized):
+                metric_count += 1
+            if any(token in normalized for token in cls.ACTION_HINT_TOKENS):
+                action_count += 1
+            day = cls._extract_highlight_day(row)
+            if day and day >= (run_date - timedelta(days=90)):
+                rows_recent_90d.append(row)
+            year_raw = str(row.get("year", "")).strip()
+            if year_raw.isdigit():
+                by_year.setdefault(int(year_raw), []).append(row)
+
+        theme_counts_13m = cls._theme_counts_from_highlights(highlights)
+        theme_counts_90d = cls._theme_counts_from_highlights(rows_recent_90d)
+        top_themes_13m = [
+            {"theme": theme, "count": int(count)}
+            for theme, count in theme_counts_13m.most_common(5)
+        ]
+        top_themes_90d = [
+            {"theme": theme, "count": int(count)}
+            for theme, count in theme_counts_90d.most_common(4)
+        ]
+
+        year_keys = sorted(by_year.keys(), reverse=True)
+        yoy_theme_deltas: list[dict[str, Any]] = []
+        if len(year_keys) >= 2:
+            current_year = year_keys[0]
+            previous_year = year_keys[1]
+            current_counts = cls._theme_counts_from_highlights(by_year.get(current_year, []))
+            previous_counts = cls._theme_counts_from_highlights(by_year.get(previous_year, []))
+            theme_pool = sorted(set(current_counts.keys()) | set(previous_counts.keys()))
+            for theme in theme_pool:
+                cur = int(current_counts.get(theme, 0))
+                prev = int(previous_counts.get(theme, 0))
+                delta = cur - prev
+                direction = "stable"
+                if delta > 0:
+                    direction = "up"
+                elif delta < 0:
+                    direction = "down"
+                yoy_theme_deltas.append(
+                    {
+                        "theme": theme,
+                        "current_year": current_year,
+                        "previous_year": previous_year,
+                        "current_count": cur,
+                        "previous_count": prev,
+                        "delta": delta,
+                        "direction": direction,
+                    }
+                )
+            yoy_theme_deltas.sort(key=lambda row: abs(int(row.get("delta", 0))), reverse=True)
+
+        return {
+            "total_highlights": len(highlights),
+            "recent_90d_highlights": len(rows_recent_90d),
+            "metric_highlights": metric_count,
+            "action_highlights": action_count,
+            "top_themes_13m": top_themes_13m,
+            "top_themes_recent_90d": top_themes_90d,
+            "yoy_theme_deltas": yoy_theme_deltas[:6],
+            "recent_examples": [
+                str(row.get("note", "")).strip()
+                for row in rows_recent_90d[:3]
+                if isinstance(row, dict) and str(row.get("note", "")).strip()
+            ],
+        }
+
     def _attach_highlights(
         self,
         year: int,
@@ -878,5 +1045,9 @@ class SEOPresentationsClient:
             "lookback_start": lookback_start.isoformat(),
             "years": year_rows,
             "highlights": highlights[:30],
+            "insight_summary": self._build_insight_summary(
+                highlights=highlights[:30],
+                run_date=run_date,
+            ),
             "errors": errors,
         }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import re
 import time
@@ -2072,22 +2073,27 @@ def collect_additional_context(
             f"(({country_terms}) AND (payments OR payment gateway OR BLIK OR Przelewy24 OR PayU OR Visa OR Mastercard OR bank) "
             "AND (outage OR awaria OR disruption OR downtime))"
         )
-        logistics_signals = _fetch_google_news_query_signals(
-            country_code=country_code,
-            query=logistics_query,
-            source_label=f"Operational risk logistics ({country_code})",
-            since=previous_window.start,
-            max_rows=10,
-            severity="medium",
-        )
-        payment_signals = _fetch_google_news_query_signals(
-            country_code=country_code,
-            query=payments_query,
-            source_label=f"Operational risk payments ({country_code})",
-            since=previous_window.start,
-            max_rows=10,
-            severity="medium",
-        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            logistics_future = pool.submit(
+                _fetch_google_news_query_signals,
+                country_code=country_code,
+                query=logistics_query,
+                source_label=f"Operational risk logistics ({country_code})",
+                since=previous_window.start,
+                max_rows=10,
+                severity="medium",
+            )
+            payment_future = pool.submit(
+                _fetch_google_news_query_signals,
+                country_code=country_code,
+                query=payments_query,
+                source_label=f"Operational risk payments ({country_code})",
+                since=previous_window.start,
+                max_rows=10,
+                severity="medium",
+            )
+            logistics_signals = logistics_future.result()
+            payment_signals = payment_future.result()
         context["operational_risks"] = {
             "enabled": True,
             "source": "Google News RSS query",
@@ -2187,20 +2193,25 @@ def collect_additional_context(
             "errors": [],
         }
         try:
-            market_rows = _fetch_market_event_calendar(
-                country_code=country_code,
-                since=previous_window.start,
-                until=current_window.end + timedelta(days=31),
-                top_rows=max(1, market_events_top_rows),
-                api_base_url=market_events_api_base_url,
-            )
-            market_rows_yoy = _fetch_market_event_calendar(
-                country_code=country_code,
-                since=yoy_window.start - timedelta(days=28),
-                until=yoy_window.end + timedelta(days=31),
-                top_rows=max(1, market_events_top_rows),
-                api_base_url=market_events_api_base_url,
-            )
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                market_rows_future = pool.submit(
+                    _fetch_market_event_calendar,
+                    country_code=country_code,
+                    since=previous_window.start,
+                    until=current_window.end + timedelta(days=31),
+                    top_rows=max(1, market_events_top_rows),
+                    api_base_url=market_events_api_base_url,
+                )
+                market_rows_yoy_future = pool.submit(
+                    _fetch_market_event_calendar,
+                    country_code=country_code,
+                    since=yoy_window.start - timedelta(days=28),
+                    until=yoy_window.end + timedelta(days=31),
+                    top_rows=max(1, market_events_top_rows),
+                    api_base_url=market_events_api_base_url,
+                )
+                market_rows = market_rows_future.result()
+                market_rows_yoy = market_rows_yoy_future.result()
             market_context["events"] = market_rows
             market_context["events_yoy"] = market_rows_yoy
             market_context["counts"] = {
@@ -2279,49 +2290,66 @@ def collect_additional_context(
             }
             context["errors"].append(f"Platform/regulatory pulse fetch failed: {exc}")
 
-    try:
-        updates_context = _collect_google_updates_timeline(
-            run_date=run_date,
-            current_window=current_window,
-            previous_window=previous_window,
-            yoy_window=yoy_window,
-            status_endpoint=google_status_endpoint,
-            blog_rss_url=google_blog_rss,
-            scan_months=max(13, int(google_updates_scan_months)),
-        )
-        context["google_updates_timeline"] = updates_context
-    except Exception as exc:
-        context["errors"].append(f"Google updates timeline fetch failed: {exc}")
+    parallel_context_tasks: dict[Any, str] = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        parallel_context_tasks[
+            pool.submit(
+                _collect_google_updates_timeline,
+                run_date=run_date,
+                current_window=current_window,
+                previous_window=previous_window,
+                yoy_window=yoy_window,
+                status_endpoint=google_status_endpoint,
+                blog_rss_url=google_blog_rss,
+                scan_months=max(13, int(google_updates_scan_months)),
+            )
+        ] = "google_updates_timeline"
+        parallel_context_tasks[
+            pool.submit(
+                _collect_serp_case_studies_context,
+                run_date=run_date,
+                current_window=current_window,
+                previous_window=previous_window,
+                yoy_window=yoy_window,
+                scan_months=max(13, int(serp_case_study_scan_months)),
+            )
+        ] = "serp_case_studies"
+        parallel_context_tasks[
+            pool.submit(
+                _collect_free_public_source_hub,
+                country_code=country_code,
+                run_date=run_date,
+                current_window=current_window,
+                previous_window=previous_window,
+                target_domain=target_domain,
+                enabled=free_public_sources_enabled,
+                top_rows_per_source=max(1, int(free_public_sources_top_rows)),
+                nager_country_code=(nager_holidays_country_code or country_code).strip().upper() or country_code,
+                eia_api_key=eia_api_key,
+            )
+        ] = "free_public_source_hub"
 
-    try:
-        case_studies_context, case_study_signals = _collect_serp_case_studies_context(
-            run_date=run_date,
-            current_window=current_window,
-            previous_window=previous_window,
-            yoy_window=yoy_window,
-            scan_months=max(13, int(serp_case_study_scan_months)),
-        )
-        context["serp_case_studies"] = case_studies_context
-        signals.extend(case_study_signals)
-    except Exception as exc:
-        context["errors"].append(f"SERP case-study scanner failed: {exc}")
-
-    try:
-        free_public_ctx, free_public_signals = _collect_free_public_source_hub(
-            country_code=country_code,
-            run_date=run_date,
-            current_window=current_window,
-            previous_window=previous_window,
-            target_domain=target_domain,
-            enabled=free_public_sources_enabled,
-            top_rows_per_source=max(1, int(free_public_sources_top_rows)),
-            nager_country_code=(nager_holidays_country_code or country_code).strip().upper() or country_code,
-            eia_api_key=eia_api_key,
-        )
-        context["free_public_source_hub"] = free_public_ctx
-        signals.extend(free_public_signals)
-    except Exception as exc:
-        context["errors"].append(f"Free public source hub fetch failed: {exc}")
+        for future in as_completed(parallel_context_tasks):
+            task_name = parallel_context_tasks.get(future, "unknown")
+            try:
+                payload = future.result()
+                if task_name == "google_updates_timeline":
+                    context["google_updates_timeline"] = payload
+                elif task_name == "serp_case_studies":
+                    case_studies_context, case_study_signals = payload
+                    context["serp_case_studies"] = case_studies_context
+                    signals.extend(case_study_signals)
+                elif task_name == "free_public_source_hub":
+                    free_public_ctx, free_public_signals = payload
+                    context["free_public_source_hub"] = free_public_ctx
+                    signals.extend(free_public_signals)
+            except Exception as exc:
+                if task_name == "google_updates_timeline":
+                    context["errors"].append(f"Google updates timeline fetch failed: {exc}")
+                elif task_name == "serp_case_studies":
+                    context["errors"].append(f"SERP case-study scanner failed: {exc}")
+                elif task_name == "free_public_source_hub":
+                    context["errors"].append(f"Free public source hub fetch failed: {exc}")
 
     # DuckDuckGo as fallback-only context source: run only when stronger sources are sparse.
     stronger_signal_count = sum(

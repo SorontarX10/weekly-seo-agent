@@ -1072,6 +1072,34 @@ def _serp_listing_impact_lines(
             f"({_fmt_signed_compact(yoy_row.get('yoy_delta_clicks', 0.0))})."
         )
 
+    total_wow_delta_clicks = float(current.clicks - previous.clicks)
+    listing_wow_delta_clicks = float(
+        sum(float(row.get("delta_clicks_vs_previous", 0.0) or 0.0) for row in listing_rows_weekly)
+    )
+    listing_wow_share = (
+        (listing_wow_delta_clicks / total_wow_delta_clicks) * 100.0
+        if abs(total_wow_delta_clicks) > 0.0
+        else 0.0
+    )
+
+    total_yoy_delta_clicks = float(current.clicks - yoy.clicks)
+    listing_yoy_delta_clicks = float(
+        sum(float(row.get("yoy_delta_clicks", 0.0) or 0.0) for row in listing_rows_yoy)
+    )
+    listing_yoy_share = (
+        (listing_yoy_delta_clicks / total_yoy_delta_clicks) * 100.0
+        if abs(total_yoy_delta_clicks) > 0.0
+        else 0.0
+    )
+
+    attribution_line = (
+        "Listing-surface attribution: weekly listing features moved "
+        f"{_fmt_signed_compact(listing_wow_delta_clicks)} clicks WoW "
+        f"(~{listing_wow_share:+.1f}% of total WoW click delta), and "
+        f"{_fmt_signed_compact(listing_yoy_delta_clicks)} clicks YoY "
+        f"(~{listing_yoy_share:+.1f}% of total YoY click delta)."
+    )
+
     wow_detail = _feature_ctr_position_detail(
         listing_rows_weekly[0] if listing_rows_weekly else None,
         delta_key="delta_clicks_vs_previous",
@@ -1105,6 +1133,17 @@ def _serp_listing_impact_lines(
     impressions_wow_pct = _signed_pct(_ratio_delta(float(current.impressions), float(previous.impressions)))
     impressions_yoy_pct = _signed_pct(_ratio_delta(float(current.impressions), float(yoy.impressions)))
 
+    impact_direction = "neutral"
+    if listing_wow_delta_clicks > 0 and ctr_wow_pp >= 0:
+        impact_direction = "positive"
+    elif listing_wow_delta_clicks < 0 and ctr_wow_pp <= 0:
+        impact_direction = "negative"
+    interpretation_line = (
+        "SERP interpretation: impact is currently "
+        f"{impact_direction}; visibility appears reallocated between feature types "
+        "rather than explained by one uniform ranking drop."
+    )
+
     lines: list[str] = []
     if summary_line:
         lines.append(
@@ -1120,6 +1159,8 @@ def _serp_listing_impact_lines(
             + "; ".join(ctr_bridge_bits[:2])
             + "."
         )
+    lines.append(attribution_line)
+    lines.append(interpretation_line)
     lines.append(
         "Impact chain on organic KPIs: listing-surface shifts can reallocate impressions between result types and then move organic CTR/position "
         f"(impressions {impressions_wow_pct} WoW, {impressions_yoy_pct} YoY; CTR {ctr_wow_pp:+.2f} pp WoW, {ctr_yoy_pp:+.2f} pp YoY; "
@@ -1128,7 +1169,7 @@ def _serp_listing_impact_lines(
     case_study_line = _serp_case_study_compact_text(additional_context)
     if case_study_line:
         lines.append(case_study_line)
-    return lines[:5]
+    return lines[:6]
 
 
 def _dedupe_report_lines(lines: list[str]) -> list[str]:
@@ -3169,6 +3210,7 @@ def _build_evidence_ledger(
     limit: int = 12,
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
+    supplemental_rows: list[dict[str, str]] = []
     current = windows.get("current_28d")
     previous = windows.get("previous_28d")
     if isinstance(current, DateWindow):
@@ -3190,24 +3232,11 @@ def _build_evidence_ledger(
         if isinstance(forward_end, date) and signal.day > forward_end:
             continue
         filtered_signals.append(signal)
-    for signal in filtered_signals[: max(1, limit - len(rows))]:
-        note = str(signal.title).strip()[:140]
-        if isinstance(analysis_end, date) and signal.day > analysis_end:
-            note = f"Forward context: {note}"
-        rows.append(
-            {
-                "id": f"E{len(rows) + 1}",
-                "source": str(signal.source).strip(),
-                "date": signal.day.isoformat(),
-                "note": note,
-            }
-        )
     if isinstance(additional_context, dict):
         trade_plan = additional_context.get("trade_plan", {})
         if isinstance(trade_plan, dict) and trade_plan.get("enabled"):
-            rows.append(
+            supplemental_rows.append(
                 {
-                    "id": f"E{len(rows) + 1}",
                     "source": "Trade plan sheet",
                     "date": str(((trade_plan.get("windows", {}) or {}).get("current", {}) or {}).get("start", "")).strip(),
                     "note": str(((trade_plan.get("sheet", {}) or {}).get("tab", "")).strip() or "trade-plan context"),
@@ -3215,9 +3244,8 @@ def _build_evidence_ledger(
             )
         weekly_news = additional_context.get("weekly_news_digest", {})
         if isinstance(weekly_news, dict) and weekly_news.get("enabled"):
-            rows.append(
+            supplemental_rows.append(
                 {
-                    "id": f"E{len(rows) + 1}",
                     "source": "Weekly SEO/GEO digest",
                     "date": f"{weekly_news.get('window_start','')}..{weekly_news.get('window_end','')}",
                     "note": f"rows={len(weekly_news.get('rows', []) if isinstance(weekly_news.get('rows', []), list) else [])}",
@@ -3226,9 +3254,8 @@ def _build_evidence_ledger(
         updates_timeline = additional_context.get("google_updates_timeline", {})
         if isinstance(updates_timeline, dict) and updates_timeline.get("enabled"):
             summary = updates_timeline.get("summary", {})
-            rows.append(
+            supplemental_rows.append(
                 {
-                    "id": f"E{len(rows) + 1}",
                     "source": "Google updates timeline (13M)",
                     "date": f"{updates_timeline.get('scan_start','')}..{updates_timeline.get('scan_end','')}",
                     "note": (
@@ -3242,9 +3269,8 @@ def _build_evidence_ledger(
         case_studies = additional_context.get("serp_case_studies", {})
         if isinstance(case_studies, dict) and case_studies.get("enabled"):
             summary = case_studies.get("summary", {})
-            rows.append(
+            supplemental_rows.append(
                 {
-                    "id": f"E{len(rows) + 1}",
                     "source": "SERP case-study scanner (13M)",
                     "date": f"{case_studies.get('scan_start','')}..{case_studies.get('scan_end','')}",
                     "note": (
@@ -3255,11 +3281,25 @@ def _build_evidence_ledger(
                     ),
                 }
             )
+        seo_presentations = additional_context.get("seo_presentations", {})
+        if isinstance(seo_presentations, dict) and seo_presentations.get("enabled"):
+            summary = seo_presentations.get("insight_summary", {})
+            total_insights = (
+                int(summary.get("total_highlights", 0) or 0)
+                if isinstance(summary, dict)
+                else 0
+            )
+            supplemental_rows.append(
+                {
+                    "source": "SEO specialist weekly reports (Drive, 13M)",
+                    "date": f"{seo_presentations.get('lookback_start','')}..{current.end.isoformat() if isinstance(current, DateWindow) else ''}",
+                    "note": f"extracted_insights={total_insights}",
+                }
+            )
         market_events = additional_context.get("market_event_calendar", {})
         if isinstance(market_events, dict) and market_events.get("enabled"):
-            rows.append(
+            supplemental_rows.append(
                 {
-                    "id": f"E{len(rows) + 1}",
                     "source": "Market event calendar",
                     "date": str(market_events.get("country_code", "")).strip() or "-",
                     "note": f"rows={len(market_events.get('events', []) if isinstance(market_events.get('events', []), list) else [])}",
@@ -3267,18 +3307,16 @@ def _build_evidence_ledger(
             )
         trends = additional_context.get("product_trends", {})
         if isinstance(trends, dict) and trends.get("enabled"):
-            rows.append(
+            supplemental_rows.append(
                 {
-                    "id": f"E{len(rows) + 1}",
                     "source": "Product trends sheets",
                     "date": str(trends.get("horizon_days", 31)),
                     "note": "YoY/current/upcoming non-brand trend context.",
                 }
             )
     if isinstance(weather_summary, dict):
-        rows.append(
+        supplemental_rows.append(
             {
-                "id": f"E{len(rows) + 1}",
                 "source": "Weather context",
                 "date": "-",
                 "note": (
@@ -3287,6 +3325,25 @@ def _build_evidence_ledger(
                 ),
             }
         )
+    reserve_for_supplemental = min(len(supplemental_rows), 5)
+    signal_slots = max(0, limit - len(rows) - reserve_for_supplemental)
+    for signal in filtered_signals[:signal_slots]:
+        note = str(signal.title).strip()[:140]
+        if isinstance(analysis_end, date) and signal.day > analysis_end:
+            note = f"Forward context: {note}"
+        rows.append(
+            {
+                "source": str(signal.source).strip(),
+                "date": signal.day.isoformat(),
+                "note": note,
+            }
+        )
+    for row in supplemental_rows:
+        if len(rows) >= max(1, limit):
+            break
+        rows.append(row)
+    for idx, row in enumerate(rows, start=1):
+        row["id"] = f"E{idx}"
     return rows[: max(1, limit)]
 
 
@@ -3983,6 +4040,49 @@ def _serp_case_study_compact_text(additional_context: dict[str, object] | None) 
     )
 
 
+def _seo_presentations_compact_text(additional_context: dict[str, object] | None) -> str:
+    payload = (additional_context or {}).get("seo_presentations", {})
+    if not isinstance(payload, dict) or not payload.get("enabled"):
+        return ""
+    summary = payload.get("insight_summary", {})
+    if not isinstance(summary, dict):
+        return ""
+    total = int(summary.get("total_highlights", 0) or 0)
+    recent = int(summary.get("recent_90d_highlights", 0) or 0)
+    metric_count = int(summary.get("metric_highlights", 0) or 0)
+    action_count = int(summary.get("action_highlights", 0) or 0)
+    top_themes = summary.get("top_themes_13m", [])
+    if not isinstance(top_themes, list):
+        top_themes = []
+    top_theme_bits = [
+        f"{str(row.get('theme', '')).strip()} ({int(row.get('count', 0) or 0)})"
+        for row in top_themes[:2]
+        if isinstance(row, dict) and str(row.get("theme", "")).strip()
+    ]
+    yoy_deltas = summary.get("yoy_theme_deltas", [])
+    yoy_line = ""
+    if isinstance(yoy_deltas, list) and yoy_deltas:
+        row = next((item for item in yoy_deltas if isinstance(item, dict)), None)
+        if isinstance(row, dict):
+            theme = str(row.get("theme", "")).strip() or "Top theme"
+            delta = int(row.get("delta", 0) or 0)
+            current_year = str(row.get("current_year", "")).strip()
+            previous_year = str(row.get("previous_year", "")).strip()
+            if current_year and previous_year:
+                yoy_line = f" YoY theme shift: {theme} ({current_year} vs {previous_year}: {delta:+d})."
+    return (
+        "SEO weekly reports archive (13M): "
+        f"{total} extracted insights ({recent} from last 90d), metrics-tagged {metric_count}, "
+        f"action-tagged {action_count}. "
+        + (
+            f"Top themes: {', '.join(top_theme_bits)}."
+            if top_theme_bits
+            else "Top themes were not detected."
+        )
+        + yoy_line
+    )
+
+
 def _serp_appearance_summary_text(additional_context: dict[str, object] | None) -> str:
     feature_split = (additional_context or {}).get("gsc_feature_split", {})
     if not isinstance(feature_split, dict) or not feature_split.get("enabled"):
@@ -4014,6 +4114,9 @@ def _serp_appearance_summary_text(additional_context: dict[str, object] | None) 
     else:
         yoy_reference_rows = weekly_rows
     yoy_gain, yoy_loss = _feature_mover_pairs(yoy_reference_rows, delta_key="delta_clicks_vs_previous", limit=2)
+    wow_net = sum(float((row or {}).get("delta_clicks_vs_previous", 0.0) or 0.0) for row in weekly_rows if isinstance(row, dict))
+    mom_net = sum(float((row or {}).get("delta_clicks_vs_previous", 0.0) or 0.0) for row in monthly_rows if isinstance(row, dict))
+    yoy_net = sum(float((row or {}).get("delta_clicks_vs_previous", 0.0) or 0.0) for row in yoy_reference_rows if isinstance(row, dict))
 
     parts: list[str] = []
     if wow_gain or wow_loss:
@@ -4021,18 +4124,21 @@ def _serp_appearance_summary_text(additional_context: dict[str, object] | None) 
             "WoW "
             + (f"up: {_feature_mover_text(wow_gain)}; " if wow_gain else "")
             + (f"down: {_feature_mover_text(wow_loss)}" if wow_loss else "")
+            + f"; net {_fmt_signed_compact(wow_net)}"
         )
     if mom_gain or mom_loss:
         parts.append(
             "MoM "
             + (f"up: {_feature_mover_text(mom_gain)}; " if mom_gain else "")
             + (f"down: {_feature_mover_text(mom_loss)}" if mom_loss else "")
+            + f"; net {_fmt_signed_compact(mom_net)}"
         )
     if yoy_gain or yoy_loss:
         parts.append(
             "YoY "
             + (f"up: {_feature_mover_text(yoy_gain)}; " if yoy_gain else "")
             + (f"down: {_feature_mover_text(yoy_loss)}" if yoy_loss else "")
+            + f"; net {_fmt_signed_compact(yoy_net)}"
         )
     if not parts:
         return ""
@@ -5082,15 +5188,30 @@ def _build_executive_summary_lines(
         additional_context=additional_context,
     )
     if serp_listing_lines:
-        why_text += "; " + _shorten(serp_listing_lines[0], 340)
-        if len(serp_listing_lines) > 2:
-            why_text += "; " + _shorten(serp_listing_lines[2], 300)
+        prioritized_serp = sorted(
+            serp_listing_lines,
+            key=lambda row: (
+                1
+                if re.search(
+                    r"attribution|CTR|position|WoW|YoY|MoM|MERCHANT_LISTINGS|PRODUCT_SNIPPETS|REVIEW_SNIPPET",
+                    str(row),
+                    flags=re.IGNORECASE,
+                )
+                else 0
+            ),
+            reverse=True,
+        )
+        why_text += "; " + _shorten(prioritized_serp[0], 340)
+        if len(prioritized_serp) > 1:
+            why_text += "; " + _shorten(prioritized_serp[1], 300)
     case_study_compact_line = _serp_case_study_compact_text(additional_context)
     if case_study_compact_line:
         why_text += "; case-study benchmark: " + _shorten(
             case_study_compact_line.replace("SERP case studies (13M): ", ""),
             240,
         )
+    else:
+        why_text += "; case-study benchmark unavailable in this run (check source warnings)"
     case_study_annual_line = _serp_case_study_text(
         additional_context,
         totals=totals,
@@ -5100,6 +5221,14 @@ def _build_executive_summary_lines(
             case_study_annual_line.replace("SERP case-study scanner (13M): ", ""),
             320,
         )
+    seo_archive_line = _seo_presentations_compact_text(additional_context)
+    if seo_archive_line:
+        why_text += "; " + _shorten(
+            seo_archive_line.replace("SEO weekly reports archive (13M): ", ""),
+            320,
+        )
+    else:
+        why_text += "; SEO specialist weekly-report archive insights unavailable in this run"
 
     risk_bits: list[str] = []
     if _ratio_delta(current.clicks, yoy.clicks) <= -0.08:
@@ -5424,6 +5553,24 @@ def _build_what_is_happening_lines(
         additional_context=additional_context,
     ):
         lines.append(row)
+    lines.append("**SERP layout and CTR comparison (WoW/MoM/YoY)**:")
+    serp_mix_line = _serp_appearance_summary_text(additional_context)
+    if serp_mix_line:
+        lines.append(serp_mix_line)
+    else:
+        lines.append("GSC searchAppearance split was unavailable in this run.")
+    lines.append("**External case-study benchmark (13M)**:")
+    case_study_line = _serp_case_study_text(additional_context, totals=totals)
+    if case_study_line:
+        lines.append(case_study_line)
+    else:
+        lines.append("SERP case-study scanner data was unavailable in this run.")
+    lines.append("**SEO specialist weekly reports insights (13M, Drive Docs/Slides)**:")
+    seo_archive_line = _seo_presentations_compact_text(additional_context)
+    if seo_archive_line:
+        lines.append(seo_archive_line)
+    else:
+        lines.append("SEO weekly reports archive insights were unavailable in this run.")
 
     trend_summary = _build_product_trend_summary(
         scope_results=scope_results,
@@ -6692,10 +6839,11 @@ def _build_reasoning_hypotheses(
         seo_presentations = additional_context.get("seo_presentations", {})
         if isinstance(seo_presentations, dict) and seo_presentations.get("enabled"):
             highlights = seo_presentations.get("highlights", [])
-            if isinstance(highlights, list) and highlights:
+            summary = seo_presentations.get("insight_summary", {})
+            if isinstance(highlights, list) and highlights and isinstance(summary, dict):
                 top_notes = [
                     str(row.get("note", "")).strip()
-                    for row in highlights[:2]
+                    for row in highlights[:3]
                     if isinstance(row, dict) and str(row.get("note", "")).strip()
                 ]
                 years_covered = [
@@ -6704,13 +6852,65 @@ def _build_reasoning_hypotheses(
                     if isinstance(row, dict) and str(row.get("year", "")).strip()
                 ]
                 years_label = ", ".join(years_covered[:2]) if years_covered else "current and previous year"
+                top_themes = summary.get("top_themes_13m", [])
+                if not isinstance(top_themes, list):
+                    top_themes = []
+                top_theme_bits = [
+                    f"{str(row.get('theme', '')).strip()} ({int(row.get('count', 0) or 0)})"
+                    for row in top_themes[:3]
+                    if isinstance(row, dict) and str(row.get("theme", "")).strip()
+                ]
+                yoy_deltas = summary.get("yoy_theme_deltas", [])
+                yoy_theme_line = ""
+                if isinstance(yoy_deltas, list):
+                    significant = [
+                        row
+                        for row in yoy_deltas
+                        if isinstance(row, dict) and abs(int(row.get("delta", 0) or 0)) >= 2
+                    ]
+                    if significant:
+                        row = significant[0]
+                        theme = str(row.get("theme", "")).strip() or "top theme"
+                        cur_year = str(row.get("current_year", "")).strip()
+                        prev_year = str(row.get("previous_year", "")).strip()
+                        delta = int(row.get("delta", 0) or 0)
+                        if cur_year and prev_year:
+                            yoy_theme_line = (
+                                f"Theme YoY shift: {theme} ({cur_year} vs {prev_year}: {delta:+d} insight mentions)."
+                            )
+                metric_count = int(summary.get("metric_highlights", 0) or 0)
+                action_count = int(summary.get("action_highlights", 0) or 0)
+                overlap_terms = _find_overlap_terms(top_notes, focus_terms)
+                overlap_line = (
+                    f"Overlap with this week's movers: {', '.join(overlap_terms[:5])}."
+                    if overlap_terms
+                    else "Direct overlap with this week's movers is limited."
+                )
+                confidence = 63
+                if overlap_terms:
+                    confidence += 9
+                if metric_count >= 8:
+                    confidence += 4
+                if action_count >= 6:
+                    confidence += 4
                 hypotheses.append(
                     {
                         "category": "Internal initiatives",
-                        "confidence": 61,
-                        "thesis": "Recent SEO team presentation topics may explain part of the observed movement in monitored segments.",
+                        "confidence": min(84, confidence),
+                        "thesis": (
+                            "Themes from SEO weekly reports (Docs/Slides, 13M window) are consistent with current shifts "
+                            "and should be used as execution context before treating the week as a standalone anomaly."
+                        ),
                         "evidence": [
                             f"Presentation archive analyzed for years: {years_label}.",
+                            (
+                                "Top recurring themes: " + ", ".join(top_theme_bits) + "."
+                                if top_theme_bits
+                                else "Top recurring themes were not detected from extracted highlights."
+                            ),
+                            f"Signal composition: metrics-tagged insights={metric_count}, action-tagged insights={action_count}.",
+                            overlap_line,
+                            yoy_theme_line or "Theme YoY shifts were not strong enough for directional inference in this run.",
                             top_notes[0] if top_notes else "Highlights extracted from team presentations.",
                         ],
                         "owner": "SEO Team",
@@ -8252,6 +8452,44 @@ def build_markdown_report(
     lines.append("### SEO team presentations (Drive)")
     if isinstance(seo_presentations, dict) and seo_presentations.get("enabled"):
         lines.append(f"- Source: {seo_presentations.get('source', 'Google Drive')}")
+        insight_summary = seo_presentations.get("insight_summary", {})
+        if isinstance(insight_summary, dict):
+            total_highlights = int(insight_summary.get("total_highlights", 0) or 0)
+            recent_90d = int(insight_summary.get("recent_90d_highlights", 0) or 0)
+            metric_count = int(insight_summary.get("metric_highlights", 0) or 0)
+            action_count = int(insight_summary.get("action_highlights", 0) or 0)
+            lines.append(
+                f"- Extracted insights: {total_highlights} (recent 90d: {recent_90d}, metrics-tagged: {metric_count}, action-tagged: {action_count})."
+            )
+            top_theme_rows = insight_summary.get("top_themes_13m", [])
+            if isinstance(top_theme_rows, list) and top_theme_rows:
+                theme_bits = []
+                for row in top_theme_rows[:4]:
+                    if not isinstance(row, dict):
+                        continue
+                    theme = str(row.get("theme", "")).strip()
+                    count = int(row.get("count", 0) or 0)
+                    if theme:
+                        theme_bits.append(f"{theme} ({count})")
+                if theme_bits:
+                    lines.append("- Dominant themes (13M): " + ", ".join(theme_bits) + ".")
+            yoy_theme_rows = insight_summary.get("yoy_theme_deltas", [])
+            if isinstance(yoy_theme_rows, list):
+                significant = [
+                    row
+                    for row in yoy_theme_rows
+                    if isinstance(row, dict) and abs(int(row.get("delta", 0) or 0)) >= 2
+                ]
+                if significant:
+                    row = significant[0]
+                    theme = str(row.get("theme", "")).strip() or "top theme"
+                    cur_year = str(row.get("current_year", "")).strip()
+                    prev_year = str(row.get("previous_year", "")).strip()
+                    delta = int(row.get("delta", 0) or 0)
+                    if cur_year and prev_year:
+                        lines.append(
+                            f"- Theme YoY shift: {theme} ({cur_year} vs {prev_year}: {delta:+d} insight mentions)."
+                        )
         year_rows = seo_presentations.get("years", [])
         if isinstance(year_rows, list) and year_rows:
             lines.append("| Year | Files in folder | Files with insights | Top insight sample |")
