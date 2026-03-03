@@ -36,6 +36,7 @@ QUALITY_MAX_GAIA_MODEL = "gpt-5.2"
 QUALITY_MAX_MIN_EVAL_SCORE = 88
 LLM_MODE_ENFORCED = True
 COUNTRY_RUN_TIMEOUT_SEC_DEFAULT = 1800
+COUNTRY_LLM_RETRIES_DEFAULT = 1
 RUNTIME_SOURCE_TOGGLES: dict[str, str] = {
     "news": "news_scraping_enabled",
     "weather": "weather_context_enabled",
@@ -807,19 +808,56 @@ def _run_country_report(
     }
 
 
+def _run_country_report_resilient(
+    *,
+    run_date: date,
+    config: AgentConfig,
+    country_code: str,
+    output_dir_str: str,
+    llm_retries: int,
+) -> dict[str, Any]:
+    attempts = max(1, int(llm_retries) + 1)
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _run_country_report(
+                run_date=run_date,
+                config=config,
+                country_code=country_code,
+                output_dir_str=output_dir_str,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if "LLM-only mode violation" not in str(exc):
+                raise
+            if attempt >= attempts:
+                raise
+            wait_sec = min(60, 10 * attempt)
+            print(
+                f"[{country_code}] LLM narrative missing (attempt {attempt}/{attempts}); retrying in {wait_sec}s...",
+                flush=True,
+            )
+            time.sleep(wait_sec)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"[{country_code}] Unknown country run failure.")
+
+
 def _country_run_worker(
     queue: multiprocessing.Queue,
     run_date: date,
     config: AgentConfig,
     country_code: str,
     output_dir_str: str,
+    llm_retries: int,
 ) -> None:
     try:
-        result = _run_country_report(
+        result = _run_country_report_resilient(
             run_date=run_date,
             config=config,
             country_code=country_code,
             output_dir_str=output_dir_str,
+            llm_retries=llm_retries,
         )
         queue.put({"ok": True, "result": result})
     except Exception as exc:
@@ -833,12 +871,13 @@ def _run_country_report_with_watchdog(
     country_code: str,
     output_dir_str: str,
     timeout_sec: int,
+    llm_retries: int,
 ) -> dict[str, Any]:
     timeout = max(60, int(timeout_sec))
     queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=1)
     process = multiprocessing.Process(
         target=_country_run_worker,
-        args=(queue, run_date, config, country_code, output_dir_str),
+        args=(queue, run_date, config, country_code, output_dir_str, llm_retries),
         daemon=False,
     )
     process.start()
@@ -1124,16 +1163,27 @@ def main() -> None:
     country_status = _initial_country_status(country_codes)
     run_started_at = time.time()
     gate_failures: list[tuple[str, str]] = []
+    env_max_workers = int(os.getenv("REPORT_MAX_WORKERS", "0") or 0)
+    strict_default_workers = 1 if bool(config.strict_llm_profile_enabled) else 4
+    requested_max_workers = (
+        env_max_workers
+        if env_max_workers > 0
+        else strict_default_workers
+    )
+    llm_retries = max(
+        0,
+        int(os.getenv("COUNTRY_LLM_RETRIES", str(COUNTRY_LLM_RETRIES_DEFAULT)) or 0),
+    )
     country_timeout_sec = max(
         60,
         int(os.getenv("COUNTRY_RUN_TIMEOUT_SEC", str(COUNTRY_RUN_TIMEOUT_SEC_DEFAULT))),
     )
-    max_workers = max(1, min(len(country_codes), 4))
+    max_workers = max(1, min(len(country_codes), requested_max_workers))
     force_serial = len(country_codes) == 1
     mode_label = "serial" if force_serial else "parallel"
     print(
         f"Starting {mode_label} batch: countries={','.join(country_codes)} | workers={1 if force_serial else max_workers} | "
-        f"country_timeout={country_timeout_sec}s"
+        f"country_timeout={country_timeout_sec}s | llm_retries={llm_retries}"
     )
 
     if force_serial:
@@ -1145,6 +1195,7 @@ def main() -> None:
                 country_code=country_code,
                 output_dir_str=str(output_dir),
                 timeout_sec=country_timeout_sec,
+                llm_retries=llm_retries,
             )
             successful_runs.append(result)
             country_status[country_code].update(
@@ -1196,6 +1247,7 @@ def main() -> None:
                     country_code=country_code,
                     output_dir_str=str(output_dir),
                     timeout_sec=country_timeout_sec,
+                    llm_retries=llm_retries,
                 ): country_code
                 for country_code in country_codes
             }

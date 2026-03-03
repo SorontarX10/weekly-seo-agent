@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from weekly_seo_agent.manager_document_agent.ai import (
     AIService,
     OutlineContext,
+    _extract_facts_from_summary,
     _load_playbook_grounding,
     _select_context_packs,
     _sanitize_inline_markdown_emphasis,
@@ -202,3 +203,21 @@ def test_invoke_paginates_when_llm_hits_length_limit(monkeypatch):
 
     continuation_prompt = fake_llm.calls[1][-1].content
     assert "Continue from exactly where you stopped." in continuation_prompt
+
+
+def test_extract_facts_from_summary_skips_web_research_noise_and_dangling_lines():
+    summary = """
+- # Web Research: GEO 2026
+- Provider: DuckDuckGo Instant Answer API
+- Retrieved results: 0
+- Playwright pages attempted: 0
+- 2026 Strategic Goal: Protect and grow organic GMV
+- This roadmap is built around five strategic programs:
+- I. Technical & Index Foundations (Protect the Core)
+""".strip()
+    facts = _extract_facts_from_summary(summary, limit=8)
+    assert "2026 Strategic Goal: Protect and grow organic GMV" in facts
+    assert any("Technical & Index Foundations" in fact for fact in facts)
+    assert all("Retrieved results" not in fact for fact in facts)
+    assert all("Playwright pages attempted" not in fact for fact in facts)
+    assert all(not fact.endswith(":") for fact in facts)

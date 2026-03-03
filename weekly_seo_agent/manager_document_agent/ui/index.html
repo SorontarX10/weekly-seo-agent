@@ -223,6 +223,45 @@
       border-color: color-mix(in srgb, var(--line) 85%, var(--accent));
       background: color-mix(in srgb, var(--panel) 90%, var(--surface));
     }
+    .markdown-preview {
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--surface) 76%, var(--panel));
+      padding: 12px;
+      max-height: 420px;
+      overflow: auto;
+      line-height: 1.45;
+    }
+    .markdown-preview h1,
+    .markdown-preview h2,
+    .markdown-preview h3 {
+      margin: 10px 0 8px 0;
+      line-height: 1.3;
+    }
+    .markdown-preview p {
+      margin: 8px 0;
+    }
+    .markdown-preview ul {
+      margin: 8px 0 8px 18px;
+      padding: 0;
+    }
+    .markdown-preview table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10px 0;
+      font-size: 13px;
+    }
+    .markdown-preview th,
+    .markdown-preview td {
+      border: 1px solid var(--line);
+      padding: 7px 8px;
+      vertical-align: top;
+      text-align: left;
+    }
+    .markdown-preview th {
+      background: color-mix(in srgb, var(--accent-soft) 65%, var(--panel));
+    }
     .planning-panel {
       border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
       background: linear-gradient(
@@ -301,14 +340,6 @@
         <input id="create-files" type="file" multiple />
         <h3>Google Drive (Alternative to Disk Upload)</h3>
         <div class="row">
-          <div>
-            <label>OAuth Client ID (optional)</label>
-            <input id="create-drive-client-id" placeholder="...apps.googleusercontent.com" />
-          </div>
-          <div>
-            <label>OAuth Client Secret (optional)</label>
-            <input id="create-drive-client-secret" type="password" />
-          </div>
           <div>
             <label>Drive Folder Name</label>
             <input id="create-drive-folder-name" value="Manager Documents" />
@@ -410,7 +441,14 @@
               <button id="outline-btn">Generate Outline</button>
               <button id="export-docx-btn">Export DOCX</button>
               <button id="export-drive-btn">Export Drive</button>
+              <button id="upload-edited-document-btn">Upload Edited Document</button>
+              <button id="sync-google-doc-btn">Sync with Google Doc</button>
+              <button id="update-google-doc-btn">Update Google Doc</button>
+              <input id="edited-export-file" type="file" style="display:none;" />
             </div>
+            <div class="note" id="editor-progress-note"></div>
+            <div class="note">Rendered preview (tables and sections)</div>
+            <div id="editor-preview" class="markdown-preview"></div>
             <div class="row" style="margin-top:10px;">
               <div>
                 <label>AI Prompt (full document edit)</label>
@@ -466,6 +504,7 @@
     let availableDriveFiles = [];
     let planningSession = null;
     let isCreatingDocument = false;
+    let lastSelectionRange = null;
 
     const editorPanel = document.getElementById('editor-panel');
     const editorContent = document.getElementById('editor-content');
@@ -503,6 +542,130 @@
         .replaceAll("'", '&#39;');
     }
 
+    function parsePipeRow(line) {
+      const raw = String(line || '').trim();
+      if (!raw.includes('|')) return [];
+      const stripped = raw.replace(/^\|/, '').replace(/\|$/, '');
+      return stripped.split('|').map((cell) => escapeHtml(cell.trim()));
+    }
+
+    function isTableSeparatorLine(line) {
+      const raw = String(line || '').trim();
+      if (!raw) return false;
+      if (!raw.includes('|')) return false;
+      const segments = raw
+        .replace(/^\|/, '')
+        .replace(/\|$/, '')
+        .split('|')
+        .map((part) => part.trim())
+        .filter(Boolean);
+      if (!segments.length) return false;
+      return segments.every((segment) => /^:?-{3,}:?$/.test(segment));
+    }
+
+    function looksLikeTableStart(lines, index) {
+      if (index + 1 >= lines.length) return false;
+      const header = String(lines[index] || '').trim();
+      const separator = String(lines[index + 1] || '').trim();
+      return header.includes('|') && isTableSeparatorLine(separator);
+    }
+
+    function renderMarkdownPreview(markdownText) {
+      const source = String(markdownText || '').replace(/\r\n?/g, '\n');
+      const lines = source.split('\n');
+      const html = [];
+      let index = 0;
+      while (index < lines.length) {
+        const rawLine = String(lines[index] || '');
+        const line = rawLine.trim();
+        if (!line) {
+          index += 1;
+          continue;
+        }
+
+        if (looksLikeTableStart(lines, index)) {
+          const header = parsePipeRow(lines[index]);
+          index += 2;
+          const rows = [];
+          while (index < lines.length) {
+            const rowLine = String(lines[index] || '').trim();
+            if (!rowLine) break;
+            if (!rowLine.includes('|')) break;
+            if (isTableSeparatorLine(rowLine)) {
+              index += 1;
+              continue;
+            }
+            const row = parsePipeRow(rowLine);
+            if (row.length) rows.push(row);
+            index += 1;
+          }
+          if (header.length) {
+            const colCount = Math.max(header.length, ...rows.map((row) => row.length));
+            const headerCells = Array.from({ length: colCount }, (_, i) => header[i] || '');
+            const bodyRows = rows.map((row) => Array.from({ length: colCount }, (_, i) => row[i] || ''));
+            html.push('<table><thead><tr>');
+            headerCells.forEach((cell) => html.push(`<th>${cell}</th>`));
+            html.push('</tr></thead><tbody>');
+            bodyRows.forEach((row) => {
+              html.push('<tr>');
+              row.forEach((cell) => html.push(`<td>${cell}</td>`));
+              html.push('</tr>');
+            });
+            html.push('</tbody></table>');
+          }
+          continue;
+        }
+
+        if (line.startsWith('### ')) {
+          html.push(`<h3>${escapeHtml(line.slice(4).trim())}</h3>`);
+          index += 1;
+          continue;
+        }
+        if (line.startsWith('## ')) {
+          html.push(`<h2>${escapeHtml(line.slice(3).trim())}</h2>`);
+          index += 1;
+          continue;
+        }
+        if (line.startsWith('# ')) {
+          html.push(`<h1>${escapeHtml(line.slice(2).trim())}</h1>`);
+          index += 1;
+          continue;
+        }
+
+        if (line.startsWith('- ')) {
+          const items = [];
+          while (index < lines.length) {
+            const bullet = String(lines[index] || '').trim();
+            if (!bullet.startsWith('- ')) break;
+            items.push(`<li>${escapeHtml(bullet.slice(2).trim())}</li>`);
+            index += 1;
+          }
+          html.push(`<ul>${items.join('')}</ul>`);
+          continue;
+        }
+
+        const paragraph = [];
+        while (index < lines.length) {
+          const candidate = String(lines[index] || '').trim();
+          if (!candidate) break;
+          if (candidate.startsWith('#')) break;
+          if (candidate.startsWith('- ')) break;
+          if (looksLikeTableStart(lines, index)) break;
+          paragraph.push(escapeHtml(candidate));
+          index += 1;
+        }
+        html.push(`<p>${paragraph.join(' ')}</p>`);
+      }
+      return html.join('');
+    }
+
+    function refreshEditorPreview(content = null) {
+      const preview = document.getElementById('editor-preview');
+      if (!preview) return;
+      const value = content == null ? editorContent.value : String(content);
+      preview.innerHTML = renderMarkdownPreview(value);
+    }
+
     async function api(path, options = {}) {
       const response = await fetch(path, options);
       if (!response.ok) {
@@ -528,6 +691,8 @@
       document.getElementById('attachments-list').innerHTML = '';
       document.getElementById('revisions-list').innerHTML = '';
       document.getElementById('exports-list').innerHTML = '';
+      setEditorProgress('');
+      refreshEditorPreview('');
       if (message) {
         alert(message);
       }
@@ -615,6 +780,48 @@
         createBtn.textContent = createBtn.dataset.idleLabel || 'Create Document';
         renderPlanningSession();
       }
+    }
+
+    function setEditorProgress(message) {
+      const note = document.getElementById('editor-progress-note');
+      note.textContent = String(message || '').trim();
+    }
+
+    function setButtonLoading(buttonId, loadingLabel, idleLabel) {
+      const button = document.getElementById(buttonId);
+      if (!button) return () => {};
+      button.disabled = true;
+      button.dataset.idleLabel = idleLabel || button.textContent || '';
+      button.textContent = loadingLabel;
+      return () => {
+        button.disabled = false;
+        button.textContent = button.dataset.idleLabel || idleLabel || '';
+      };
+    }
+
+    function captureEditorSelectionRange() {
+      const start = Number(editorContent.selectionStart || 0);
+      const end = Number(editorContent.selectionEnd || 0);
+      if (end > start) {
+        lastSelectionRange = { start, end };
+      }
+    }
+
+    function resolveSelectionRangeForRewrite() {
+      const start = Number(editorContent.selectionStart || 0);
+      const end = Number(editorContent.selectionEnd || 0);
+      if (end > start) {
+        return { start, end };
+      }
+      if (lastSelectionRange && Number(lastSelectionRange.end) > Number(lastSelectionRange.start)) {
+        const maxLen = editorContent.value.length;
+        const safeStart = Math.max(0, Math.min(Number(lastSelectionRange.start), maxLen));
+        const safeEnd = Math.max(safeStart, Math.min(Number(lastSelectionRange.end), maxLen));
+        if (safeEnd > safeStart) {
+          return { start: safeStart, end: safeEnd };
+        }
+      }
+      return { start: 0, end: 0 };
     }
 
     function applyPlanningBriefToCreateForm() {
@@ -1116,12 +1323,15 @@
 
     async function openDocument(documentId) {
       try {
+        setEditorProgress('');
+        lastSelectionRange = null;
         currentDocument = await api(`/documents/${documentId}`);
         document.getElementById('editor-title').textContent = currentDocument.title;
         const statusEl = document.getElementById('editor-status');
         statusEl.textContent = currentDocument.status;
         statusEl.className = `badge status-${currentDocument.status}`;
         editorContent.value = currentDocument.current_content;
+        refreshEditorPreview(currentDocument.current_content);
         editorDirty = false;
         editorPanel.classList.remove('hidden');
         await Promise.all([loadRevisions(), loadAttachments(), loadExports(), loadDriveSettings(), loadDocuments()]);
@@ -1169,6 +1379,8 @@
     async function generateOutline() {
       if (!currentDocument) return;
       const instructions = document.getElementById('ai-full-prompt').value;
+      const release = setButtonLoading('outline-btn', 'Generating Outline...', 'Generate Outline');
+      setEditorProgress('Generating outline with AI. Please wait...');
       try {
         const updated = await api(`/documents/${currentDocument.id}/outline`, {
           method: 'POST',
@@ -1177,9 +1389,17 @@
         });
         currentDocument = updated;
         editorContent.value = updated.current_content;
+        refreshEditorPreview(updated.current_content);
+        lastSelectionRange = null;
         await loadRevisions();
+        setEditorProgress('Outline generated.');
       } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        setEditorProgress('Outline generation failed.');
         alert(error.message);
+      } finally {
+        release();
       }
     }
 
@@ -1190,6 +1410,8 @@
         alert('Wpisz prompt do pełnej edycji AI.');
         return;
       }
+      const release = setButtonLoading('ai-full-btn', 'Applying AI Edit...', 'Apply AI Full Edit');
+      setEditorProgress('Applying full AI edit. Please wait...');
       try {
         const updated = await api(`/documents/${currentDocument.id}/rewrite`, {
           method: 'POST',
@@ -1198,19 +1420,26 @@
         });
         currentDocument = updated;
         editorContent.value = updated.current_content;
+        refreshEditorPreview(updated.current_content);
+        lastSelectionRange = null;
         await loadRevisions();
+        setEditorProgress('AI full edit applied.');
       } catch (error) {
         const handled = await handleStaleDocumentError(error);
         if (handled) return;
+        setEditorProgress('AI full edit failed.');
         alert(error.message);
+      } finally {
+        release();
       }
     }
 
     async function applyAISelectionEdit() {
       if (!currentDocument) return;
       const prompt = document.getElementById('ai-selection-prompt').value;
-      const selectionStart = editorContent.selectionStart;
-      const selectionEnd = editorContent.selectionEnd;
+      const resolvedSelection = resolveSelectionRangeForRewrite();
+      const selectionStart = resolvedSelection.start;
+      const selectionEnd = resolvedSelection.end;
       if (!prompt.trim()) {
         alert('Wpisz prompt do edycji zaznaczonego fragmentu.');
         return;
@@ -1219,6 +1448,8 @@
         alert('Zaznacz fragment tekstu do edycji.');
         return;
       }
+      const release = setButtonLoading('ai-selection-btn', 'Rewriting Selection...', 'Rewrite Selection');
+      setEditorProgress('Rewriting selected fragment with AI. Please wait...');
       try {
         const updated = await api(`/documents/${currentDocument.id}/rewrite-selection`, {
           method: 'POST',
@@ -1231,11 +1462,17 @@
         });
         currentDocument = updated;
         editorContent.value = updated.current_content;
+        refreshEditorPreview(updated.current_content);
+        lastSelectionRange = null;
         await loadRevisions();
+        setEditorProgress('Selected fragment updated.');
       } catch (error) {
         const handled = await handleStaleDocumentError(error);
         if (handled) return;
+        setEditorProgress('Selection rewrite failed.');
         alert(error.message);
+      } finally {
+        release();
       }
     }
 
@@ -1309,13 +1546,9 @@
     async function quickConnectDrive() {
       const createFolderName = document.getElementById('create-drive-folder-name').value;
       const createFolderId = document.getElementById('create-drive-folder-id').value;
-      const createClientId = document.getElementById('create-drive-client-id').value;
-      const createClientSecret = document.getElementById('create-drive-client-secret').value;
       const payload = {
         folder_name: document.getElementById('drive-folder-name').value || createFolderName || 'Manager Documents',
         folder_id: document.getElementById('drive-folder-id').value || createFolderId || '',
-        client_id: createClientId || '',
-        client_secret: createClientSecret || '',
       };
       try {
         const started = await api('/integrations/google-drive/quick-connect/start', {
@@ -1370,6 +1603,106 @@
         const handled = await handleStaleDocumentError(error);
         if (handled) return;
         alert(error.message);
+      }
+    }
+
+    function openEditedUploadDialog() {
+      if (!currentDocument) return;
+      const input = document.getElementById('edited-export-file');
+      input.value = '';
+      input.click();
+    }
+
+    function applyImportedDocumentState(doc, sourceLabel) {
+      currentDocument = doc;
+      editorDirty = false;
+      const dom = window.document;
+      dom.getElementById('editor-title').textContent = doc.title;
+      dom.getElementById('editor-status').innerHTML = statusBadge(doc.status);
+      editorContent.value = doc.current_content || '';
+      refreshEditorPreview();
+      setEditorProgress(`Imported edited content from ${sourceLabel}.`);
+    }
+
+    async function importEditedFile() {
+      if (!currentDocument) return;
+      const input = document.getElementById('edited-export-file');
+      const file = input.files && input.files[0] ? input.files[0] : null;
+      if (!file) {
+        alert('Select an edited file first.');
+        return;
+      }
+      const restore = setButtonLoading('upload-edited-document-btn', 'Uploading...', 'Upload Edited Document');
+      setEditorProgress('Importing edited file...');
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        const response = await fetch(`/documents/${currentDocument.id}/imports/edited-file`, {
+          method: 'POST',
+          body: formData,
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          const err = new Error(formatApiErrorDetail(body?.detail || body || 'Import failed'));
+          err.status = response.status;
+          throw err;
+        }
+        const updated = await response.json();
+        applyImportedDocumentState(updated, file.name);
+        input.value = '';
+        await Promise.all([loadRevisions(), loadExports()]);
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        setEditorProgress('Edited file import failed.');
+        alert(error.message);
+      } finally {
+        restore();
+      }
+    }
+
+    async function syncWithGoogleDoc() {
+      if (!currentDocument) return;
+      const restore = setButtonLoading('sync-google-doc-btn', 'Syncing...', 'Sync with Google Doc');
+      setEditorProgress('Syncing content from linked Google Doc...');
+      try {
+        const updated = await api(`/documents/${currentDocument.id}/google-doc/sync`, { method: 'POST' });
+        applyImportedDocumentState(updated, 'Google Drive');
+        await Promise.all([loadRevisions(), loadExports()]);
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        setEditorProgress('Google Drive sync failed.');
+        alert(error.message);
+      } finally {
+        restore();
+      }
+    }
+
+    async function updateGoogleDoc() {
+      if (!currentDocument) return;
+      const restore = setButtonLoading('update-google-doc-btn', 'Updating...', 'Update Google Doc');
+      setEditorProgress('Updating linked Google Doc with current content...');
+      try {
+        const exported = await api(`/documents/${currentDocument.id}/google-doc/update`, { method: 'POST' });
+        await loadExports();
+        const link = exported && exported.external_url ? String(exported.external_url).trim() : '';
+        if (link) {
+          const openNow = confirm(`Google Doc został zaktualizowany.\\n\\nOtworzyć teraz?\\n${link}`);
+          if (openNow) {
+            window.open(link, '_blank', 'noopener,noreferrer');
+          }
+        } else {
+          alert('Google Doc został zaktualizowany.');
+        }
+        setEditorProgress('Linked Google Doc updated.');
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        setEditorProgress('Google Doc update failed.');
+        alert(error.message);
+      } finally {
+        restore();
       }
     }
 
@@ -1455,6 +1788,10 @@
     document.getElementById('outline-btn').addEventListener('click', generateOutline);
     document.getElementById('export-docx-btn').addEventListener('click', exportDocx);
     document.getElementById('export-drive-btn').addEventListener('click', exportDrive);
+    document.getElementById('upload-edited-document-btn').addEventListener('click', openEditedUploadDialog);
+    document.getElementById('edited-export-file').addEventListener('change', importEditedFile);
+    document.getElementById('sync-google-doc-btn').addEventListener('click', syncWithGoogleDoc);
+    document.getElementById('update-google-doc-btn').addEventListener('click', updateGoogleDoc);
     document.getElementById('ai-full-btn').addEventListener('click', applyAIFullEdit);
     document.getElementById('ai-selection-btn').addEventListener('click', applyAISelectionEdit);
     document.getElementById('upload-attachment-btn').addEventListener('click', uploadAttachment);
@@ -1466,7 +1803,14 @@
 
     editorContent.addEventListener('input', () => {
       editorDirty = true;
+      if (lastSelectionRange && Number(lastSelectionRange.end) > editorContent.value.length) {
+        lastSelectionRange = null;
+      }
+      refreshEditorPreview();
     });
+    editorContent.addEventListener('select', captureEditorSelectionRange);
+    editorContent.addEventListener('mouseup', captureEditorSelectionRange);
+    editorContent.addEventListener('keyup', captureEditorSelectionRange);
 
     setInterval(() => {
       if (!editorDirty || !currentDocument || currentDocument.status !== 'IN_PROGRESS') return;
@@ -1476,6 +1820,7 @@
     renderCreateDriveFiles();
     renderCreateWebQueries();
     renderPlanningSession();
+    refreshEditorPreview('');
     initializeTheme();
     loadDriveSettings({ silent: true });
     ensurePlanningSessionStarted();

@@ -11,7 +11,7 @@ import time
 import uuid
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from google_auth_oauthlib.flow import Flow
 from pydantic import BaseModel, Field
 
@@ -592,6 +592,7 @@ def create_app(
         session_id: str,
         payload: DocumentPlanningCreateDocumentRequest,
         service: DocumentService = Depends(_get_service),
+        ai_service: AIService = Depends(_get_ai_service),
         planning_sessions: dict[str, dict] = Depends(_get_planning_sessions),
     ) -> DocumentPlanningCreateDocumentResponse:
         session = planning_sessions.get(session_id)
@@ -624,6 +625,12 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        generated_title = _generate_title_from_planning_context(
+            ai_service=ai_service,
+            session=session,
+        )
+        if generated_title:
+            document_payload["title"] = generated_title
 
         created = service.create_document(**document_payload)
         planning_session_mark_document_created(session=session, document_id=created.id)
@@ -1237,6 +1244,96 @@ def create_app(
         )
         return _to_attachment_response(attachment)
 
+    @app.post("/documents/{document_id}/imports/edited-file", response_model=DocumentResponse)
+    async def import_edited_document_file(
+        document_id: str,
+        file: UploadFile = File(...),
+        service: DocumentService = Depends(_get_service),
+    ) -> DocumentResponse:
+        try:
+            service.get_document(document_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        if file.filename is None:
+            raise HTTPException(status_code=400, detail="Edited file must include filename")
+
+        try:
+            raw_bytes = await file.read()
+            mime_type = file.content_type or "application/octet-stream"
+            parsed = _parse_imported_document_bytes(
+                filename=file.filename,
+                mime_type=mime_type,
+                raw_bytes=raw_bytes,
+            )
+            updated = service.update_document(
+                document_id,
+                current_content=parsed.extracted_text,
+                change_type=RevisionChangeType.SYSTEM,
+                prompt=f"import:edited-file:{file.filename}",
+            )
+        except AttachmentValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except DocumentLockedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Edited document import failed: {exc}",
+            ) from exc
+        return _to_document_response(updated)
+
+    @app.post("/documents/{document_id}/imports/edited-drive", response_model=DocumentResponse)
+    def sync_edited_document_from_google_drive(
+        document_id: str,
+        payload: DriveAttachmentImportRequest,
+        service: DocumentService = Depends(_get_service),
+    ) -> DocumentResponse:
+        try:
+            service.get_document(document_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        setting = service.get_integration_setting("google_drive")
+        if setting is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Google Drive integration is not configured yet.",
+            )
+        config = json.loads(setting.config_json)
+
+        try:
+            drive_client = _build_google_drive_client_from_config(
+                service=service,
+                config=config,
+            )
+            downloaded = drive_client.download_attachment(file_ref=payload.file_ref)
+            filename = str(downloaded.get("filename", "")).strip() or "google_drive_document.docx"
+            mime_type = str(downloaded.get("mime_type", "")).strip() or "application/octet-stream"
+            raw = downloaded.get("raw_bytes", b"")
+            raw_bytes = bytes(raw if isinstance(raw, (bytes, bytearray)) else b"")
+            parsed = _parse_imported_document_bytes(
+                filename=filename,
+                mime_type=mime_type,
+                raw_bytes=raw_bytes,
+            )
+            updated = service.update_document(
+                document_id,
+                current_content=parsed.extracted_text,
+                change_type=RevisionChangeType.SYSTEM,
+                prompt=f"import:edited-drive:{filename}",
+            )
+        except AttachmentValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except DocumentLockedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Google Drive sync failed: {exc}",
+            ) from exc
+        return _to_document_response(updated)
+
     @app.post("/integrations/google-drive", response_model=GoogleDriveSettingsResponse)
     def save_google_drive_settings(
         payload: GoogleDriveSettingsRequest,
@@ -1541,6 +1638,49 @@ def create_app(
             ) from exc
         return _to_export_record_response(record)
 
+    @app.get("/documents/{document_id}/export/docx/download")
+    def download_current_docx(
+        document_id: str,
+        service: DocumentService = Depends(_get_service),
+        exports_dir: Path = Depends(_get_exports_dir),
+    ) -> FileResponse:
+        try:
+            document = service.get_document(document_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        try:
+            exported_path = export_markdown_like_to_docx(
+                title=document.title,
+                content=document.current_content,
+                output_dir=exports_dir,
+                document_id=document.id,
+            )
+            service.add_export_record(
+                document_id=document_id,
+                export_type=ExportType.DOCX,
+                status=ExportStatus.SUCCESS,
+                file_path=str(exported_path),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            record = service.add_export_record(
+                document_id=document_id,
+                export_type=ExportType.DOCX,
+                status=ExportStatus.FAILED,
+                error_message=str(exc),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"DOCX export failed: {record.error_message}",
+            ) from exc
+
+        download_name = _safe_download_docx_name(document.title)
+        return FileResponse(
+            path=str(exported_path),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=download_name,
+        )
+
     @app.post("/documents/{document_id}/export/docx/async", response_model=EnqueuedJobResponse)
     def export_docx_async(
         document_id: str,
@@ -1570,62 +1710,99 @@ def create_app(
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+        try:
+            record = _export_document_to_google_drive(
+                service=service,
+                document=document,
+                exports_dir=exports_dir,
+            )
+        except HTTPException:
+            raise
+        return _to_export_record_response(record)
+
+    @app.post("/documents/{document_id}/google-doc/sync", response_model=DocumentResponse)
+    def sync_with_google_doc(
+        document_id: str,
+        service: DocumentService = Depends(_get_service),
+    ) -> DocumentResponse:
+        try:
+            service.get_document(document_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        linked_ref = _find_linked_google_doc_ref(service=service, document_id=document_id)
+        if not linked_ref:
+            raise HTTPException(
+                status_code=409,
+                detail="No linked Google Doc found. Export Drive first.",
+            )
+
         setting = service.get_integration_setting("google_drive")
         if setting is None:
-            message = (
-                "Google Drive settings are missing. Configure /integrations/google-drive first."
+            raise HTTPException(
+                status_code=400,
+                detail="Google Drive integration is not configured yet.",
             )
-            record = service.add_export_record(
-                document_id=document_id,
-                export_type=ExportType.GOOGLE_DRIVE,
-                status=ExportStatus.FAILED,
-                error_message=message,
-            )
-            raise HTTPException(status_code=400, detail=record.error_message)
-
         config = json.loads(setting.config_json)
+
         try:
-            docx_path = export_markdown_like_to_docx(
-                title=document.title,
-                content=document.current_content,
-                output_dir=exports_dir,
-                document_id=document.id,
-            )
-            drive_document_name = build_drive_export_name(
-                title=document.title,
-                document_id=document.id,
-            )
             drive_client = _build_google_drive_client_from_config(
                 service=service,
                 config=config,
             )
-            result = drive_client.upload_docx_as_google_doc(
-                docx_path,
-                document_name=drive_document_name,
+            downloaded = drive_client.download_attachment(file_ref=linked_ref)
+            filename = str(downloaded.get("filename", "")).strip() or "linked_google_doc.docx"
+            mime_type = str(downloaded.get("mime_type", "")).strip() or "application/octet-stream"
+            raw = downloaded.get("raw_bytes", b"")
+            raw_bytes = bytes(raw if isinstance(raw, (bytes, bytearray)) else b"")
+            parsed = _parse_imported_document_bytes(
+                filename=filename,
+                mime_type=mime_type,
+                raw_bytes=raw_bytes,
             )
-            external_url = str(result.get("webViewLink", "")).strip()
-            if not external_url:
-                verification = result.get("verification", {})
-                external_url = str(verification.get("web_view_link", "")).strip()
-            record = service.add_export_record(
-                document_id=document_id,
-                export_type=ExportType.GOOGLE_DRIVE,
-                status=ExportStatus.SUCCESS,
-                external_url=external_url,
-                file_path=str(docx_path),
+            updated = service.update_document(
+                document_id,
+                current_content=parsed.extracted_text,
+                change_type=RevisionChangeType.SYSTEM,
+                prompt="import:linked-google-doc:sync",
             )
+        except AttachmentValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except DocumentLockedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:
-            error_message = str(exc).strip() or "Unknown Google Drive error"
-            record = service.add_export_record(
-                document_id=document_id,
-                export_type=ExportType.GOOGLE_DRIVE,
-                status=ExportStatus.FAILED,
-                error_message=error_message,
-            )
             raise HTTPException(
                 status_code=502,
-                detail=f"Google Drive export failed: {record.error_message}",
+                detail=f"Google Doc sync failed: {exc}",
             ) from exc
+        return _to_document_response(updated)
+
+    @app.post("/documents/{document_id}/google-doc/update", response_model=ExportRecordResponse)
+    def update_google_doc(
+        document_id: str,
+        service: DocumentService = Depends(_get_service),
+        exports_dir: Path = Depends(_get_exports_dir),
+    ) -> ExportRecordResponse:
+        try:
+            document = service.get_document(document_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        linked_ref = _find_linked_google_doc_ref(service=service, document_id=document_id)
+        if not linked_ref:
+            raise HTTPException(
+                status_code=409,
+                detail="No linked Google Doc found. Export Drive first.",
+            )
+
+        try:
+            record = _export_document_to_google_drive(
+                service=service,
+                document=document,
+                exports_dir=exports_dir,
+            )
+        except HTTPException:
+            raise
         return _to_export_record_response(record)
 
     @app.post("/documents/{document_id}/export/drive/async", response_model=EnqueuedJobResponse)
@@ -1770,6 +1947,30 @@ def _to_document_planning_session_response(session: dict) -> DocumentPlanningSes
     )
 
 
+def _generate_title_from_planning_context(*, ai_service: AIService, session: dict) -> str:
+    brief = session.get("brief", {})
+    if not isinstance(brief, dict):
+        return ""
+    existing_title = str(brief.get("title", "")).strip()
+    if existing_title:
+        return existing_title
+    try:
+        generated = ai_service.generate_planning_title(
+            brief={str(k): str(v) for k, v in brief.items()},
+            messages=[
+                item
+                for item in session.get("messages", [])
+                if isinstance(item, dict)
+            ],
+        )
+    except Exception:
+        generated = ""
+    normalized = re.sub(r"\s+", " ", str(generated or "").strip())
+    if not normalized:
+        return ""
+    return normalized[:120].rstrip(" .,:;")
+
+
 def _to_document_response(document: Document) -> DocumentResponse:
     return DocumentResponse(
         id=document.id,
@@ -1808,6 +2009,102 @@ def _to_attachment_response(attachment: Attachment) -> AttachmentResponse:
 def _safe_filename(filename: str) -> str:
     base = Path(filename).name.strip().replace(" ", "_")
     return base or "attachment.bin"
+
+
+def _safe_download_docx_name(title: str) -> str:
+    normalized = re.sub(r"[\\/:*?\"<>|]+", " ", str(title or "").strip())
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .-_")
+    if not normalized:
+        normalized = "manager_document"
+    return f"{normalized[:120]}.docx"
+
+
+def _find_linked_google_doc_ref(*, service: DocumentService, document_id: str) -> str:
+    records = service.list_export_records(document_id)
+    for record in records:
+        if record.export_type != ExportType.GOOGLE_DRIVE:
+            continue
+        if record.status != ExportStatus.SUCCESS:
+            continue
+        ref = str(record.external_url or "").strip()
+        if ref:
+            return ref
+    return ""
+
+
+def _export_document_to_google_drive(
+    *,
+    service: DocumentService,
+    document: Document,
+    exports_dir: Path,
+) -> ExportRecord:
+    setting = service.get_integration_setting("google_drive")
+    if setting is None:
+        message = "Google Drive settings are missing. Configure /integrations/google-drive first."
+        record = service.add_export_record(
+            document_id=document.id,
+            export_type=ExportType.GOOGLE_DRIVE,
+            status=ExportStatus.FAILED,
+            error_message=message,
+        )
+        raise HTTPException(status_code=400, detail=record.error_message)
+
+    config = json.loads(setting.config_json)
+    try:
+        docx_path = export_markdown_like_to_docx(
+            title=document.title,
+            content=document.current_content,
+            output_dir=exports_dir,
+            document_id=document.id,
+        )
+        drive_document_name = build_drive_export_name(
+            title=document.title,
+            document_id=document.id,
+        )
+        drive_client = _build_google_drive_client_from_config(
+            service=service,
+            config=config,
+        )
+        result = drive_client.upload_docx_as_google_doc(
+            docx_path,
+            document_name=drive_document_name,
+        )
+        external_url = str(result.get("webViewLink", "")).strip()
+        if not external_url:
+            verification = result.get("verification", {})
+            external_url = str(verification.get("web_view_link", "")).strip()
+        return service.add_export_record(
+            document_id=document.id,
+            export_type=ExportType.GOOGLE_DRIVE,
+            status=ExportStatus.SUCCESS,
+            external_url=external_url,
+            file_path=str(docx_path),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        error_message = str(exc).strip() or "Unknown Google Drive error"
+        record = service.add_export_record(
+            document_id=document.id,
+            export_type=ExportType.GOOGLE_DRIVE,
+            status=ExportStatus.FAILED,
+            error_message=error_message,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Google Drive export failed: {record.error_message}",
+        ) from exc
+
+
+def _parse_imported_document_bytes(*, filename: str, mime_type: str, raw_bytes: bytes):
+    validate_attachment(filename, mime_type, len(raw_bytes))
+    validate_attachment_content(filename, raw_bytes)
+    parsed = parse_attachment(filename, raw_bytes)
+    extracted = str(parsed.extracted_text or "").strip()
+    if not extracted:
+        raise RuntimeError("Imported file does not contain extractable text")
+    parsed.extracted_text = extracted
+    return parsed
 
 
 def _safe_slug(value: str) -> str:

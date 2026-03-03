@@ -287,3 +287,47 @@ def test_docx_export_does_not_duplicate_title_when_h1_matches(tmp_path):
     docx = DocxDocument(str(exported))
     all_text = [paragraph.text.strip() for paragraph in docx.paragraphs if paragraph.text.strip()]
     assert all_text.count("SEO & GEO Outlook") == 1
+
+
+def test_docx_export_renders_markdown_tables_as_real_docx_tables(tmp_path):
+    exported = export_markdown_like_to_docx(
+        title="SEO Outlook",
+        content=(
+            "## KPI Framework\n\n"
+            "| KPI | 2026 Target | Owner | Deadline |\n"
+            "|---|---|---|---|\n"
+            "| CRVisits | +15% | SEO Team | Q4'26 |\n"
+            "| AI Visibility | +20% | AI Team | Q3'26 |\n"
+        ),
+        output_dir=tmp_path / "exports",
+        document_id="doc-3",
+    )
+    docx = DocxDocument(str(exported))
+    assert len(docx.tables) == 1
+    table = docx.tables[0]
+    assert table.rows[0].cells[0].text == "KPI"
+    assert table.rows[0].cells[1].text == "2026 Target"
+    assert table.rows[1].cells[0].text == "CRVisits"
+    assert table.rows[1].cells[1].text == "+15%"
+    assert table.rows[2].cells[0].text == "AI Visibility"
+
+
+def test_docx_export_renders_indented_markdown_lists_as_nested_list_styles(tmp_path):
+    exported = export_markdown_like_to_docx(
+        title="SEO Outlook",
+        content=(
+            "## Priorities\n"
+            "- Technical & Index Foundations:\n"
+            "  - Ensure crawl efficiency and URL stability.\n"
+            "  - Implement pruning and index hygiene.\n"
+            "- Authority & Brand Leadership:\n"
+            "  - Build authority through topical hubs.\n"
+        ),
+        output_dir=tmp_path / "exports",
+        document_id="doc-4",
+    )
+    docx = DocxDocument(str(exported))
+    paragraphs = [p for p in docx.paragraphs if p.text.strip()]
+    child = next(p for p in paragraphs if "Ensure crawl efficiency" in p.text)
+    assert child.style.name.startswith("List Bullet")
+    assert not child.text.strip().startswith("-")

@@ -11,6 +11,24 @@ Status:
   (DuckDuckGo HTML SERP fallback when Instant API has sparse results + explicit Playwright fetch stats in summary).
 - 2026-03-03: Refreshed UI and session flow
   (planning chat highlighted as default start with auto-session init + persistent Black Mode toggle).
+- 2026-03-03: Simplified Google Drive connect form in UI
+  (removed OAuth Client ID/Secret input fields from Create flow).
+- 2026-03-03: Improved outline readability and source-facts hygiene
+  (richer visual markdown structure with tables/sub-sections + filtering noisy web-research metadata and dangling facts).
+- 2026-03-03: Added editor-side AI progress signals
+  (visible status line + loading labels/disabled buttons during outline/full/selection AI generation).
+- 2026-03-03: Fixed selection rewrite UX in editor
+  (last selected text range is preserved across focus changes, so prompt/chat click does not lose target fragment).
+- 2026-03-03: Improved planning title generation + markdown preview rendering
+  (document title is generated from full planning context via AI/fallback logic; editor now shows rendered preview with proper table formatting).
+- 2026-03-03: Fixed DOCX/Google Docs table export fidelity
+  (markdown tables are now parsed into real DOCX tables instead of raw `| ... |` text lines).
+- 2026-03-03: Added exported-document edit mode + planning language step
+  (download current DOCX, import edited local file, sync edited Google Doc back into current content; planning chat now explicitly asks for target document language).
+- 2026-03-03: Improved Google Docs visual fidelity for exported documents
+  (indented markdown list items now export as real nested DOCX lists; reduced excessive spacing in exported paragraphs/headings for cleaner Google Docs layout).
+- 2026-03-03: Reworked Google Doc edit controls around linked process document
+  (replaced top-bar download action with upload-edited flow; added one-click "Sync with Google Doc" and "Update Google Doc" using the latest linked Drive export for the document).
 - 2026-03-03: Added LLM response pagination + merge for long generations
   (automatic continuation when model hits length limit; overlap-aware stitching to reduce cut content).
 - 2026-03-03: Google Drive switched to OAuth-only integration mode

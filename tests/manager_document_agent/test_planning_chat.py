@@ -50,7 +50,8 @@ def test_planning_chat_end_to_end_creates_document_after_approval(tmp_path):
             "Przygotuj dokument o strategii SEO i GEO na 2026 z naciskiem na decyzje zarządcze.",
             "Podkreśl wpływ na GMV, ryzyka wdrożenia i plan 90 dni.",
             "Potrzebujemy akceptacji priorytetów i budżetu.",
-            "Odbiorca: Management, typ: MANAGEMENT_BRIEF, język: en.",
+            "Odbiorca: Management, typ: MANAGEMENT_BRIEF.",
+            "Język: en (English).",
             "Ton formalny, max 2 strony, bez danych poufnych.",
         ]
         for message in messages:
@@ -63,6 +64,7 @@ def test_planning_chat_end_to_end_creates_document_after_approval(tmp_path):
 
         assert session["status"] == "READY_FOR_APPROVAL"
         assert len(session["suggested_points"]) >= 4
+        assert any("Język dokumentu: en" in point for point in session["suggested_points"])
         assert not session["ready_to_create"]
 
         approved = client.post(
@@ -85,6 +87,8 @@ def test_planning_chat_end_to_end_creates_document_after_approval(tmp_path):
         assert doc["id"]
         assert doc["status"] == "IN_PROGRESS"
         assert doc["language"] == "en"
+        assert doc["title"] == "SEO and GEO Plan 2026 for Management"
+        assert not doc["title"].startswith("Przygotuj dokument o strategii")
         assert "Approved Planning Points" in doc["current_content"]
         assert "Planning Chat Summary" in doc["current_content"]
 

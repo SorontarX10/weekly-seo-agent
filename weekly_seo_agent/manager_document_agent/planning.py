@@ -12,23 +12,27 @@ PLANNING_STATUS_DOCUMENT_CREATED = "DOCUMENT_CREATED"
 PLANNING_STEPS: list[tuple[str, str]] = [
     (
         "objective",
-        "1/5: Co dokładnie dokument ma dostarczyć? Opisz cel i kontekst biznesowy w 2-4 zdaniach.",
+        "1/6: Co dokładnie dokument ma dostarczyć? Opisz cel i kontekst biznesowy w 2-4 zdaniach.",
     ),
     (
         "emphasis",
-        "2/5: Co chcemy najmocniej podkreślić (np. wyniki, ryzyka, plan 90 dni, decyzje)?",
+        "2/6: Co chcemy najmocniej podkreślić (np. wyniki, ryzyka, plan 90 dni, decyzje)?",
     ),
     (
         "decisions_needed",
-        "3/5: Jakie decyzje lub akceptacje są potrzebne od odbiorców dokumentu?",
+        "3/6: Jakie decyzje lub akceptacje są potrzebne od odbiorców dokumentu?",
     ),
     (
         "audience_doc_type",
-        "4/5: Dla kogo dokument i jakiego typu? (np. Management + MANAGEMENT_BRIEF, Zarząd + STRATEGY_PAPER).",
+        "4/6: Dla kogo dokument i jakiego typu? (np. Management + MANAGEMENT_BRIEF, Zarząd + STRATEGY_PAPER).",
+    ),
+    (
+        "language",
+        "5/6: W jakim języku ma być dokument? (np. polski/pl lub english/en).",
     ),
     (
         "tone_constraints",
-        "5/5: Jaki ton i ograniczenia? (np. formalny, max 2 strony, bez danych poufnych).",
+        "6/6: Jaki ton i ograniczenia? (np. formalny, max 2 strony, bez danych poufnych).",
     ),
 ]
 
@@ -234,8 +238,6 @@ def _apply_step_answer(session: dict, message: str) -> None:
 
     if key == "objective":
         brief["objective"] = message
-        if not brief.get("title"):
-            brief["title"] = _generate_title(brief)
         return
     if key == "emphasis":
         brief["emphasis"] = message
@@ -245,6 +247,9 @@ def _apply_step_answer(session: dict, message: str) -> None:
         return
     if key == "audience_doc_type":
         _apply_audience_doc_type(brief, message)
+        return
+    if key == "language":
+        _apply_language_preference(brief, message)
         return
     if key == "tone_constraints":
         _apply_tone_constraints(brief, message)
@@ -276,6 +281,8 @@ def _apply_refinement(session: dict, message: str) -> None:
         brief["emphasis"] = message
     elif any(token in lower for token in ("decyz", "approve", "akcept")):
         brief["decisions_needed"] = message
+    elif any(token in lower for token in ("język", "jezyk", "language", "polish", "english", "polski")):
+        _apply_language_preference(brief, message)
     elif any(token in lower for token in ("audience", "management", "zarz", "board")):
         _apply_audience_doc_type(brief, message)
     elif any(token in lower for token in ("tone", "formal", "styl", "ograniczen", "constraint")):
@@ -306,6 +313,7 @@ def _build_suggested_points(brief: dict[str, str]) -> list[str]:
         f"Cel: {_normalize_text(brief.get('objective', '')) or 'Do doprecyzowania'}",
         f"Priorytet do podkreślenia: {_normalize_text(brief.get('emphasis', '')) or 'Do doprecyzowania'}",
         f"Odbiorca/typ: {brief.get('target_audience', 'Management')} / {brief.get('doc_type', 'MANAGEMENT_BRIEF')}",
+        f"Język dokumentu: {brief.get('language', 'pl')}",
         f"Decyzje do zatwierdzenia: {_normalize_text(brief.get('decisions_needed', '')) or 'Do doprecyzowania'}",
         f"Ton i ograniczenia: {brief.get('tone', 'formal')} | {_normalize_text(brief.get('constraints', '')) or 'brak dodatkowych'}",
     ]
@@ -356,6 +364,16 @@ def _apply_tone_constraints(brief: dict[str, str], message: str) -> None:
     elif "informal" in lowered or "luź" in lowered or "luz" in lowered:
         brief["tone"] = "informal"
     brief["constraints"] = _truncate(message, max_chars=1200)
+
+
+def _apply_language_preference(brief: dict[str, str], message: str) -> None:
+    lowered = message.lower()
+    if re.search(r"\b(english|en)\b", lowered):
+        brief["language"] = "en"
+        return
+    if re.search(r"\b(polish|polski|pl)\b", lowered):
+        brief["language"] = "pl"
+        return
 
 
 def _build_planned_document_content(
@@ -410,14 +428,41 @@ def _render_chat_summary_lines(brief: dict[str, str]) -> list[str]:
 
 
 def _generate_title(brief: dict[str, str]) -> str:
-    objective = _normalize_text(brief.get("objective", ""))
-    if objective:
-        compact = re.sub(r"\s+", " ", objective).strip()
-        compact = compact[:72].rstrip(" .,:;")
-        if compact:
-            return compact
-    doc_type = _normalize_text(brief.get("doc_type", "")) or "MANAGEMENT_BRIEF"
-    return f"{doc_type.replace('_', ' ').title()} Draft"
+    objective = _normalize_text(brief.get("objective", "")).lower()
+    emphasis = _normalize_text(brief.get("emphasis", "")).lower()
+    merged = f"{objective} {emphasis}".strip()
+    language = _normalize_text(brief.get("language", "")).lower() or "pl"
+    audience = _normalize_text(brief.get("target_audience", "")) or "Management"
+
+    has_seo = "seo" in merged
+    has_geo = "geo" in merged
+    year_match = re.search(r"\b(20\d{2})\b", merged)
+    year = year_match.group(1) if year_match else ""
+
+    if language.startswith("pl"):
+        if has_seo and has_geo:
+            base = "Plan SEO i GEO"
+        elif has_seo:
+            base = "Plan SEO"
+        elif has_geo:
+            base = "Plan GEO"
+        else:
+            base = "Plan strategiczny"
+        if year:
+            base = f"{base} na {year}"
+        return f"{base} dla {audience}".strip()
+
+    if has_seo and has_geo:
+        base = "SEO and GEO Plan"
+    elif has_seo:
+        base = "SEO Plan"
+    elif has_geo:
+        base = "GEO Plan"
+    else:
+        base = "Strategic Plan"
+    if year:
+        base = f"{base} {year}"
+    return f"{base} for {audience}".strip()
 
 
 def _append_message(session: dict, *, role: str, content: str) -> None:

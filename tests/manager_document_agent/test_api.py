@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 
+from docx import Document as DocxDocument
 from fastapi.testclient import TestClient
 
 import weekly_seo_agent.manager_document_agent.api as api_module
 from weekly_seo_agent.manager_document_agent.api import create_app
-from weekly_seo_agent.manager_document_agent.models import Attachment, ExtractionStatus
+from weekly_seo_agent.manager_document_agent.models import (
+    Attachment,
+    ExportStatus,
+    ExportType,
+    ExtractionStatus,
+)
 
 
 def _create_payload(title: str) -> dict:
@@ -22,6 +29,15 @@ def _create_payload(title: str) -> dict:
         "constraints": "No confidential details",
         "current_content": "Initial",
     }
+
+
+def _build_docx_bytes(paragraphs: list[str]) -> bytes:
+    document = DocxDocument()
+    for paragraph in paragraphs:
+        document.add_paragraph(paragraph)
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
 
 
 def _seed_oauth_drive_integration(client: TestClient, *, folder_name: str = "Manager Documents", folder_id: str = "") -> None:
@@ -351,6 +367,194 @@ def test_import_drive_attachment_uses_drive_client_and_persists_attachment(tmp_p
         listed = client.get(f"/documents/{document_id}/attachments")
         assert listed.status_code == 200
         assert len(listed.json()) == 1
+
+
+def test_download_current_docx_endpoint_returns_binary_file(tmp_path):
+    app = create_app(
+        db_path=tmp_path / "manager_agent_api.db",
+        exports_dir=tmp_path / "exports",
+    )
+
+    with TestClient(app) as client:
+        created = client.post("/documents", json=_create_payload("Download me"))
+        document_id = created.json()["id"]
+
+        downloaded = client.get(f"/documents/{document_id}/export/docx/download")
+        assert downloaded.status_code == 200
+        assert (
+            downloaded.headers["content-type"]
+            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        assert len(downloaded.content) > 100
+
+        history = client.get(f"/documents/{document_id}/exports")
+        assert history.status_code == 200
+        assert history.json()[0]["export_type"] == "DOCX"
+
+
+def test_import_edited_file_updates_document_content(tmp_path):
+    app = create_app(db_path=tmp_path / "manager_agent_api.db")
+
+    with TestClient(app) as client:
+        created = client.post("/documents", json=_create_payload("Import edited"))
+        document_id = created.json()["id"]
+
+        edited_docx = _build_docx_bytes(
+            ["Executive Summary", "Imported content from edited DOCX"]
+        )
+        imported = client.post(
+            f"/documents/{document_id}/imports/edited-file",
+            files={
+                "file": (
+                    "edited.docx",
+                    edited_docx,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+        assert imported.status_code == 200
+        body = imported.json()
+        assert "Imported content from edited DOCX" in body["current_content"]
+
+        revisions = client.get(f"/documents/{document_id}/revisions")
+        assert revisions.status_code == 200
+        assert revisions.json()[-1]["prompt"].startswith("import:edited-file:")
+
+
+def test_sync_edited_document_from_drive_updates_document_content(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "manager_agent_api.db")
+
+    docx_bytes = _build_docx_bytes(["Synced from Drive", "Updated paragraph"])
+
+    class FakeDriveClient:
+        def download_attachment(self, *, file_ref: str) -> dict:
+            assert file_ref == "drive-file-123"
+            return {
+                "filename": "drive_version.docx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "raw_bytes": docx_bytes,
+            }
+
+    monkeypatch.setattr(
+        api_module,
+        "_build_google_drive_client_from_config",
+        lambda *, service, config: FakeDriveClient(),
+    )
+
+    with TestClient(app) as client:
+        _seed_oauth_drive_integration(client)
+        created = client.post("/documents", json=_create_payload("Sync edited"))
+        document_id = created.json()["id"]
+
+        synced = client.post(
+            f"/documents/{document_id}/imports/edited-drive",
+            json={"file_ref": "drive-file-123"},
+        )
+        assert synced.status_code == 200
+        body = synced.json()
+        assert "Synced from Drive" in body["current_content"]
+
+        revisions = client.get(f"/documents/{document_id}/revisions")
+        assert revisions.status_code == 200
+        assert revisions.json()[-1]["prompt"].startswith("import:edited-drive:")
+
+
+def test_google_doc_sync_requires_linked_drive_export(tmp_path):
+    app = create_app(db_path=tmp_path / "manager_agent_api.db")
+
+    with TestClient(app) as client:
+        _seed_oauth_drive_integration(client)
+        created = client.post("/documents", json=_create_payload("No linked doc"))
+        document_id = created.json()["id"]
+
+        synced = client.post(f"/documents/{document_id}/google-doc/sync")
+        assert synced.status_code == 409
+        assert "export drive first" in synced.json()["detail"].lower()
+
+
+def test_google_doc_sync_uses_last_linked_export(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "manager_agent_api.db")
+    docx_bytes = _build_docx_bytes(["Linked Google Doc", "Synced content"])
+
+    class FakeDriveClient:
+        def download_attachment(self, *, file_ref: str) -> dict:
+            assert file_ref == "https://docs.google.com/document/d/linked-doc-1/edit"
+            return {
+                "filename": "linked.docx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "raw_bytes": docx_bytes,
+            }
+
+    monkeypatch.setattr(
+        api_module,
+        "_build_google_drive_client_from_config",
+        lambda *, service, config: FakeDriveClient(),
+    )
+
+    with TestClient(app) as client:
+        _seed_oauth_drive_integration(client)
+        created = client.post("/documents", json=_create_payload("Linked sync"))
+        document_id = created.json()["id"]
+        client.app.state.document_service.add_export_record(
+            document_id=document_id,
+            export_type=ExportType.GOOGLE_DRIVE,
+            status=ExportStatus.SUCCESS,
+            external_url="https://docs.google.com/document/d/linked-doc-1/edit",
+        )
+
+        synced = client.post(f"/documents/{document_id}/google-doc/sync")
+        assert synced.status_code == 200
+        assert "Synced content" in synced.json()["current_content"]
+
+
+def test_google_doc_update_requires_linked_drive_export(tmp_path):
+    app = create_app(db_path=tmp_path / "manager_agent_api.db")
+
+    with TestClient(app) as client:
+        _seed_oauth_drive_integration(client)
+        created = client.post("/documents", json=_create_payload("No linked update"))
+        document_id = created.json()["id"]
+
+        updated = client.post(f"/documents/{document_id}/google-doc/update")
+        assert updated.status_code == 409
+        assert "export drive first" in updated.json()["detail"].lower()
+
+
+def test_google_doc_update_exports_current_content_to_drive(tmp_path, monkeypatch):
+    app = create_app(
+        db_path=tmp_path / "manager_agent_api.db",
+        exports_dir=tmp_path / "exports",
+    )
+    captured: dict[str, str] = {}
+
+    class FakeDriveClient:
+        def upload_docx_as_google_doc(self, local_docx_path: Path, *, document_name: str = "") -> dict:
+            assert local_docx_path.exists()
+            captured["document_name"] = document_name
+            return {"webViewLink": "https://docs.google.com/document/d/updated-doc/edit"}
+
+    monkeypatch.setattr(
+        api_module,
+        "_build_google_drive_client_from_config",
+        lambda *, service, config: FakeDriveClient(),
+    )
+
+    with TestClient(app) as client:
+        _seed_oauth_drive_integration(client)
+        created = client.post("/documents", json=_create_payload("Linked update"))
+        document_id = created.json()["id"]
+        client.app.state.document_service.add_export_record(
+            document_id=document_id,
+            export_type=ExportType.GOOGLE_DRIVE,
+            status=ExportStatus.SUCCESS,
+            external_url="https://docs.google.com/document/d/linked-doc-2/edit",
+        )
+
+        updated = client.post(f"/documents/{document_id}/google-doc/update")
+        assert updated.status_code == 200
+        assert updated.json()["status"] == "SUCCESS"
+        assert updated.json()["external_url"].startswith("https://docs.google.com/document/d/updated-doc")
+        assert captured["document_name"]
 
 
 def test_list_google_drive_files_endpoint(tmp_path, monkeypatch):

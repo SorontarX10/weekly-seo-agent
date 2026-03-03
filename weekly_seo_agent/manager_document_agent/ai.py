@@ -130,6 +130,60 @@ class AIService:
         fallback = self._fallback_selection_rewrite(source, instruction)
         return guardrail_fragment(_sanitize_inline_markdown_emphasis(fallback))
 
+    def generate_planning_title(
+        self,
+        *,
+        brief: dict[str, str],
+        messages: list[dict] | None = None,
+    ) -> str:
+        fallback = _fallback_planning_title(brief)
+        if self._llm is None:
+            return fallback
+
+        history_lines: list[str] = []
+        for item in messages or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip() or "assistant"
+            content = _normalize_whitespace(str(item.get("content", "")))
+            if not content:
+                continue
+            history_lines.append(f"{role}: {content}")
+        history_text = _trim_text("\n".join(history_lines), max_chars=6000) or "(none)"
+
+        prompt = f"""
+Generate a concise management document title based on planning context.
+
+Brief:
+- objective: {brief.get("objective", "")}
+- emphasis: {brief.get("emphasis", "")}
+- decisions_needed: {brief.get("decisions_needed", "")}
+- audience: {brief.get("target_audience", "")}
+- doc_type: {brief.get("doc_type", "")}
+- language: {brief.get("language", "")}
+
+Planning chat history:
+{history_text}
+
+Rules:
+- Return title only (single line, no markdown, no quotes).
+- Keep 4-11 words.
+- Keep it specific and business-like.
+- Include year if present in context.
+- Match language from brief (pl -> Polish, en -> English).
+""".strip()
+        try:
+            raw = self._invoke(
+                "You generate concise business document titles.",
+                prompt,
+            )
+            candidate = _sanitize_generated_title(raw)
+            if candidate:
+                return candidate
+        except Exception:
+            pass
+        return fallback
+
     def _llm_outline(self, document: Document, context: OutlineContext) -> str:
         playbook_grounding = _playbook_prompt_block(
             self._playbook_grounding,
@@ -137,7 +191,9 @@ class AIService:
         )
         system = (
             "You are a senior strategy writer preparing management-ready documents. "
-            "Write in concise, concrete business language. Avoid placeholders and generic filler. "
+            "Write in concrete business language with strong visual readability. "
+            "Use meaningful markdown structure (sub-headings, tables, grouped bullets), not dense compact blocks. "
+            "Avoid placeholders and generic filler. "
             "Follow executive-writing standards from the provided playbook grounding. "
             "Return markdown only."
         )
@@ -192,9 +248,13 @@ Required structure:
 
 Rules:
 - Include concrete bullets under each section.
+- Keep content visually scannable: use short bullets, sub-headings, and spacing between thematic blocks.
+- Add at least one markdown table in `KPI Framework` and one markdown table in `90-Day Plan`.
+- Ensure each major section has at least 3 bullets (or equivalent table rows).
+- Target substantive depth: typically 1200-2200 words total for management-ready draft.
 - Do not include phrases like "Key point 1" or "Step 1".
 - Keep it board-ready and specific to provided context.
-- Avoid inline markdown emphasis markers like **bold** or __bold__ in output text.
+- You may use light emphasis for readability (for example bold labels in bullets), but avoid over-formatting.
 """.strip()
         return self._invoke(system, human)
 
@@ -231,11 +291,12 @@ Executive Playbook grounding:
 Rules:
 - Keep only high-signal content.
 - Add clear sections and concise bullets where useful.
+- Improve visual readability with sub-headings and compact tables where it helps (KPI, plan, owners).
 - Remove duplication and weak statements.
 - Do not append meta-commentary like "AI revision".
 - Keep recommendation-first flow and explicit decision framing.
 - Keep KPI + ownership + risks clearly visible when context allows.
-- Avoid inline markdown emphasis markers like **bold** or __bold__ in output text.
+- Keep output easy to scan for executives; avoid long unbroken bullet blocks.
 """.strip()
         return self._invoke(system, human)
 
@@ -292,38 +353,55 @@ Rules:
             f"# {document.title.strip() or 'Document'}",
             "",
             "## Executive Summary",
-            f"- Objective: {document.objective.strip() or 'Define the document objective clearly.'}",
+            f"- Recommendation: {document.objective.strip() or 'Define the document objective clearly and make decision intent explicit.'}",
             f"- Audience: {document.target_audience.strip() or 'Management'}",
-            "- Expected outcome: decision-ready direction for 2026 priorities.",
+            "- Expected outcome: decision-ready direction for 2026 priorities with explicit ownership and KPI governance.",
+            "- Business impact intent: protect growth, increase conversion quality, and improve discovery efficiency.",
             "",
             "## Strategic Context",
             "- Market and discovery behavior are shifting toward AI-assisted and zero-click journeys.",
             "- Discovery quality now directly impacts commercial performance, not only traffic volume.",
+            "- Competitive pressure is moving from ranking volume to authority, citations, and answer-surface presence.",
             "",
             "## Priorities for 2026",
             "- Prioritize high-impact discovery initiatives with measurable business outcomes.",
             "- Align SEO/GEO roadmap with product, content, and analytics operating cadence.",
             "- Establish repeatable experimentation and reporting routines for leadership visibility.",
+            "- Build scalable operating standards for technical quality, content governance, and AI integration.",
             "",
             "## Operating Model and Dependencies",
             "- Define ownership per initiative and cross-team dependency map.",
             "- Clarify resource assumptions and execution constraints.",
+            "",
+            "### Workstream Ownership Snapshot",
+            "| Workstream | Primary Owner | Core Dependencies | Cadence |",
+            "| --- | --- | --- | --- |",
+            "| Technical and Index Quality | SEO Tech Lead | Platform Engineering, Core Web | Weekly delivery review |",
+            "| GEO and AI Visibility | SEO/GEO Lead | AI Platform, Content Ops | Bi-weekly experiment review |",
+            "| Marketplace Quality | Category/Marketplace Lead | Seller tools, Moderation, Analytics | Monthly governance |",
             "",
             "## Risks and Mitigations",
             "- Risk: execution spread too thin across channels.",
             "- Mitigation: sequence roadmap by business impact and delivery capacity.",
             "- Risk: weak measurement discipline.",
             "- Mitigation: enforce KPI review cadence and data quality checks.",
+            "- Risk: AI platform volatility and model behavior drift.",
+            "- Mitigation: maintain monitored integration playbooks and fallback channels.",
             "",
             "## KPI Framework",
-            "- Business: GMV contribution and conversion from organic/AI-driven journeys.",
-            "- Discovery: visibility quality and answer-surface presence for strategic intents.",
-            "- Delivery: initiative throughput and cycle time.",
+            "| KPI | Why it matters | Target Direction | Owner |",
+            "| --- | --- | --- | --- |",
+            "| CRVisits | Measures conversion quality of discovery traffic | Up and stable QoQ | SEO/GEO Lead |",
+            "| Organic GMV Contribution | Connects discovery with business outcome | Up YoY | Head of SEO |",
+            "| AI Visibility Share | Tracks answer-engine discoverability and authority | Up by priority intents | GEO Program Owner |",
+            "| Crawl and Index Efficiency | Detects technical bottlenecks early | Improve cycle time and coverage quality | SEO Tech Lead |",
             "",
             "## 90-Day Plan",
-            "- Finalize initiative backlog and ownership matrix.",
-            "- Launch first decision-grade KPI baseline and weekly governance rhythm.",
-            "- Deliver first management checkpoint with risks, progress, and decisions needed.",
+            "| Window | Focus | Deliverable |",
+            "| --- | --- | --- |",
+            "| Days 1-30 | Baseline and prioritization | Final backlog, KPI baseline, owners confirmed |",
+            "| Days 31-60 | Pilot execution | First GEO/DEO pilots and quality-control rollout |",
+            "| Days 61-90 | Scale and governance | Management checkpoint with decisions, risks, and next-quarter scale plan |",
             "",
             "## Decisions Needed from Management",
             "- Confirm priority order for 2026 initiatives.",
@@ -767,6 +845,63 @@ def _normalize_overlap_line(line: str) -> str:
     return normalized
 
 
+def _sanitize_generated_title(value: str) -> str:
+    text = _normalize_whitespace(str(value or ""))
+    if not text:
+        return ""
+    first_line = text.splitlines()[0].strip()
+    first_line = re.sub(r"^[#>\-\s]+", "", first_line).strip()
+    first_line = re.sub(r"^['\"`]+|['\"`]+$", "", first_line).strip()
+    first_line = re.sub(r"\s+", " ", first_line)
+    if len(first_line) < 6:
+        return ""
+    if len(first_line) > 96:
+        first_line = first_line[:96].rsplit(" ", 1)[0].strip()
+    return first_line
+
+
+def _fallback_planning_title(brief: dict[str, str]) -> str:
+    objective = _normalize_whitespace(str(brief.get("objective", "")))
+    emphasis = _normalize_whitespace(str(brief.get("emphasis", "")))
+    target = _normalize_whitespace(str(brief.get("target_audience", "")))
+    language = _normalize_whitespace(str(brief.get("language", ""))).lower()
+    source = f"{objective} {emphasis}".strip().lower()
+
+    has_seo = "seo" in source
+    has_geo = "geo" in source
+    year_match = re.search(r"\b(20\d{2})\b", source)
+    year = year_match.group(1) if year_match else ""
+
+    if language.startswith("pl"):
+        if has_seo and has_geo:
+            core = "Plan SEO i GEO"
+        elif has_seo:
+            core = "Plan SEO"
+        elif has_geo:
+            core = "Plan GEO"
+        else:
+            core = "Plan strategiczny"
+        if year:
+            core = f"{core} na {year}"
+        if target:
+            return f"{core} dla {target}".strip()
+        return core
+
+    if has_seo and has_geo:
+        core = "SEO and GEO Plan"
+    elif has_seo:
+        core = "SEO Plan"
+    elif has_geo:
+        core = "GEO Plan"
+    else:
+        core = "Strategic Plan"
+    if year:
+        core = f"{core} {year}"
+    if target:
+        return f"{core} for {target}".strip()
+    return core
+
+
 def _extract_facts_from_summary(summary: str, *, limit: int) -> list[str]:
     if not summary.strip():
         return []
@@ -779,6 +914,10 @@ def _extract_facts_from_summary(summary: str, *, limit: int) -> list[str]:
         if re.search(r"\.(docx|xlsx|csv|tsv|txt|pdf)$", cleaned, flags=re.IGNORECASE):
             continue
         if cleaned.endswith("..."):
+            continue
+        if _is_noise_summary_fact(cleaned):
+            continue
+        if _looks_dangling_summary_fact(cleaned):
             continue
         if not cleaned or "." not in cleaned and ":" not in cleaned and not any(ch.isdigit() for ch in cleaned):
             continue
@@ -852,3 +991,31 @@ def _is_summary_program_fact(value: str) -> bool:
     if re.match(r"^(?:[IVX]{1,6}[.)-]\s+)", value):
         return True
     return bool(re.search(r"\b(?:program|roadmap|priority|goal)\b", value, flags=re.IGNORECASE))
+
+
+def _is_noise_summary_fact(value: str) -> bool:
+    lowered = value.lower()
+    noisy_fragments = (
+        "provider: duckduckgo",
+        "fallback:",
+        "region:",
+        "retrieved results:",
+        "playwright requested:",
+        "playwright pages attempted:",
+        "playwright excerpts captured:",
+        "playwright errors:",
+        "## results",
+        "# web research:",
+    )
+    return any(fragment in lowered for fragment in noisy_fragments)
+
+
+def _looks_dangling_summary_fact(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return True
+    if normalized.endswith(":"):
+        return True
+    if re.match(r"^(?:[IVX]{1,6}[.)-]?)$", normalized):
+        return True
+    return False
