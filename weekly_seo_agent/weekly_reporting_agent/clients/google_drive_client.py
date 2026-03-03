@@ -13,6 +13,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from google_auth_httplib2 import AuthorizedHttp
+import httplib2
 
 
 class GoogleDriveClient:
@@ -22,6 +24,7 @@ class GoogleDriveClient:
     DOCX_MIME = (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
+    HTTP_TIMEOUT_SEC = 45
 
     def __init__(
         self,
@@ -40,6 +43,14 @@ class GoogleDriveClient:
     @staticmethod
     def _escape_query_value(value: str) -> str:
         return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    @staticmethod
+    def _execute_request(request, retries: int = 2):
+        try:
+            return request.execute(num_retries=max(0, int(retries)))
+        except TypeError:
+            # Test doubles may not support the num_retries kwarg.
+            return request.execute()
 
     def _load_credentials(self) -> Credentials:
         secret_path = Path(self.client_secret_path)
@@ -100,10 +111,11 @@ class GoogleDriveClient:
     def _get_service(self):
         if self._service is None:
             credentials = self._load_credentials()
+            http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=self.HTTP_TIMEOUT_SEC))
             self._service = build(
                 "drive",
                 "v3",
-                credentials=credentials,
+                http=http,
                 cache_discovery=False,
             )
         return self._service
@@ -123,8 +135,8 @@ class GoogleDriveClient:
         response = (
             service.files()
             .list(q=query, spaces="drive", fields="files(id,name)", pageSize=1)
-            .execute()
         )
+        response = self._execute_request(response, retries=2)
         files = response.get("files", [])
         if files:
             return files[0]["id"]
@@ -135,8 +147,8 @@ class GoogleDriveClient:
                 body={"name": self.folder_name, "mimeType": self.FOLDER_MIME},
                 fields="id,name",
             )
-            .execute()
         )
+        created = self._execute_request(created, retries=2)
         folder_id = str(created.get("id", "")).strip()
         if not folder_id:
             raise RuntimeError("Failed to create Google Drive folder.")
@@ -152,15 +164,15 @@ class GoogleDriveClient:
         response = (
             service.files()
             .list(q=query, spaces="drive", fields="files(id,name)", pageSize=100)
-            .execute()
         )
+        response = self._execute_request(response, retries=2)
         files = response.get("files", [])
         deleted_count = 0
         for file_row in files:
             file_id = str(file_row.get("id", "")).strip()
             if not file_id:
                 continue
-            service.files().delete(fileId=file_id).execute()
+            self._execute_request(service.files().delete(fileId=file_id), retries=2)
             deleted_count += 1
         return deleted_count
 
@@ -178,8 +190,8 @@ class GoogleDriveClient:
                 fileId=file_id,
                 fields="id,name,parents,trashed,createdTime,modifiedTime,webViewLink",
             )
-            .execute()
         )
+        metadata = self._execute_request(metadata, retries=2)
         resolved_name = str(metadata.get("name", "")).strip()
         parents = metadata.get("parents", [])
         parent_ids = [str(item).strip() for item in parents if str(item).strip()]
@@ -241,8 +253,8 @@ class GoogleDriveClient:
                         media_body=media,
                         fields="id,name,webViewLink,mimeType,parents",
                     )
-                    .execute()
                 )
+                created = self._execute_request(created, retries=2)
                 break
             except HttpError as exc:
                 payload = str(exc)

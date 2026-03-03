@@ -13,6 +13,8 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from google_auth_httplib2 import AuthorizedHttp
+import httplib2
 
 
 class ContinuityClient:
@@ -21,6 +23,7 @@ class ContinuityClient:
     DOC_MIME = "application/vnd.google-apps.document"
     SHEET_MIME = "application/vnd.google-apps.spreadsheet"
     BRAND_TOKENS = ("allegro", "allegro.pl", "allegro pl")
+    HTTP_TIMEOUT_SEC = 45
 
     def __init__(
         self,
@@ -261,30 +264,36 @@ class ContinuityClient:
 
     def _drive_service(self):
         if self._drive is None:
+            credentials = self._load_credentials()
+            http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=self.HTTP_TIMEOUT_SEC))
             self._drive = build(
                 "drive",
                 "v3",
-                credentials=self._load_credentials(),
+                http=http,
                 cache_discovery=False,
             )
         return self._drive
 
     def _docs_service(self):
         if self._docs is None:
+            credentials = self._load_credentials()
+            http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=self.HTTP_TIMEOUT_SEC))
             self._docs = build(
                 "docs",
                 "v1",
-                credentials=self._load_credentials(),
+                http=http,
                 cache_discovery=False,
             )
         return self._docs
 
     def _sheets_service(self):
         if self._sheets is None:
+            credentials = self._load_credentials()
+            http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=self.HTTP_TIMEOUT_SEC))
             self._sheets = build(
                 "sheets",
                 "v4",
-                credentials=self._load_credentials(),
+                http=http,
                 cache_discovery=False,
             )
         return self._sheets

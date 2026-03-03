@@ -9,6 +9,7 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
 from datetime import date, timedelta
 from pathlib import Path
 import time
@@ -37,6 +38,7 @@ QUALITY_MAX_MIN_EVAL_SCORE = 88
 LLM_MODE_ENFORCED = True
 COUNTRY_RUN_TIMEOUT_SEC_DEFAULT = 1800
 COUNTRY_LLM_RETRIES_DEFAULT = 1
+PREFLIGHT_CHECK_TIMEOUT_SEC = 120
 RUNTIME_SOURCE_TOGGLES: dict[str, str] = {
     "news": "news_scraping_enabled",
     "weather": "weather_context_enabled",
@@ -283,6 +285,35 @@ def _append_preflight_row(
     )
 
 
+def _run_preflight_check_with_timeout(
+    fn,
+    *args,
+    timeout_sec: int = PREFLIGHT_CHECK_TIMEOUT_SEC,
+    **kwargs,
+):
+    holder: dict[str, object] = {}
+    finished = threading.Event()
+
+    def _runner() -> None:
+        try:
+            holder["result"] = fn(*args, **kwargs)
+        except Exception as exc:  # pragma: no cover - defensive
+            holder["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    if not finished.wait(timeout=float(max(10, int(timeout_sec)))):
+        raise TimeoutError(f"preflight check timed out after {timeout_sec}s: {fn.__name__}")
+    error = holder.get("error")
+    if error is not None:
+        if isinstance(error, Exception):
+            raise error
+        raise RuntimeError(str(error))
+    return holder.get("result")
+
+
 def _is_gsc_mapping_explicit(config: AgentConfig, country_codes: list[str]) -> bool:
     if len(country_codes) <= 1:
         return True
@@ -402,7 +433,12 @@ def _run_startup_preflight(
         )
     for country_code in country_codes:
         try:
-            ok, details = _check_gsc_country_access(config, run_date, country_code)
+            ok, details = _run_preflight_check_with_timeout(
+                _check_gsc_country_access,
+                config,
+                run_date,
+                country_code,
+            )
             _append_preflight_row(
                 rows,
                 source_group="gsc",
@@ -453,7 +489,11 @@ def _run_startup_preflight(
     # Sheets source availability checks.
     if continuity is not None:
         if config.status_log_enabled:
-            ok, details = _check_sheet_reference(continuity, config.status_file_reference)
+            ok, details = _run_preflight_check_with_timeout(
+                _check_sheet_reference,
+                continuity,
+                config.status_file_reference,
+            )
             _append_preflight_row(
                 rows,
                 source_group="sheets",
@@ -478,7 +518,11 @@ def _run_startup_preflight(
                 ("Product trends upcoming sheet", config.product_trends_upcoming_sheet_reference),
                 ("Product trends current sheet", config.product_trends_current_sheet_reference),
             ):
-                ok, details = _check_sheet_reference(continuity, reference)
+                ok, details = _run_preflight_check_with_timeout(
+                    _check_sheet_reference,
+                    continuity,
+                    reference,
+                )
                 _append_preflight_row(
                     rows,
                     source_group="sheets",
@@ -498,8 +542,10 @@ def _run_startup_preflight(
             )
 
         if config.trade_plan_enabled:
-            trade_ref_ok, trade_ref_details = _check_sheet_reference(
-                continuity, config.trade_plan_sheet_reference
+            trade_ref_ok, trade_ref_details = _run_preflight_check_with_timeout(
+                _check_sheet_reference,
+                continuity,
+                config.trade_plan_sheet_reference,
             )
             _append_preflight_row(
                 rows,
@@ -514,7 +560,12 @@ def _run_startup_preflight(
                 trade_sheet_id = str((trade_meta or {}).get("id", "")).strip() if isinstance(trade_meta, dict) else ""
                 for country_code in country_codes:
                     tab_name = config.trade_plan_tab_map.get(country_code, "").strip()
-                    ok, details = _check_sheet_tab_access(continuity, trade_sheet_id, tab_name)
+                    ok, details = _run_preflight_check_with_timeout(
+                        _check_sheet_tab_access,
+                        continuity,
+                        trade_sheet_id,
+                        tab_name,
+                    )
                     _append_preflight_row(
                         rows,
                         source_group="sheets",
@@ -542,7 +593,7 @@ def _run_startup_preflight(
                 folder_name=config.google_drive_folder_name,
                 folder_id=config.google_drive_folder_id,
             )
-            folder_id = drive_client._find_or_create_folder()
+            folder_id = _run_preflight_check_with_timeout(drive_client._find_or_create_folder)
             _append_preflight_row(
                 rows,
                 source_group="drive",

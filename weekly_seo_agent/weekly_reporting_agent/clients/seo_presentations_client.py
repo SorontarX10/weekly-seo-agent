@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 import re
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -13,6 +14,9 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from google_auth_httplib2 import AuthorizedHttp
+import httplib2
+from googleapiclient.http import MediaIoBaseDownload
 
 
 class SEOPresentationsClient:
@@ -20,8 +24,10 @@ class SEOPresentationsClient:
     FOLDER_MIME = "application/vnd.google-apps.folder"
     SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
     GOOGLE_SLIDES_MIME = "application/vnd.google-apps.presentation"
+    GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
     PRESENTATION_MIMES = {
         GOOGLE_SLIDES_MIME,
+        GOOGLE_DOC_MIME,
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "application/vnd.ms-powerpoint",
     }
@@ -95,6 +101,7 @@ class SEOPresentationsClient:
         "ferie",
         "season",
     )
+    HTTP_TIMEOUT_SEC = 45
 
     def __init__(
         self,
@@ -161,6 +168,16 @@ class SEOPresentationsClient:
         return None
 
     @staticmethod
+    def _subtract_months(base: date, months: int) -> date:
+        total_month = (base.year * 12 + base.month - 1) - max(0, int(months))
+        year = total_month // 12
+        month = (total_month % 12) + 1
+        first_of_month = date(year, month, 1)
+        first_next_month = (first_of_month + timedelta(days=32)).replace(day=1)
+        last_day = (first_next_month - timedelta(days=1)).day
+        return date(year, month, min(base.day, last_day))
+
+    @staticmethod
     def _parse_iso_datetime(raw: str) -> datetime | None:
         text = str(raw).strip()
         if not text:
@@ -204,20 +221,24 @@ class SEOPresentationsClient:
 
     def _drive_service(self):
         if self._drive is None:
+            credentials = self._load_credentials()
+            http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=self.HTTP_TIMEOUT_SEC))
             self._drive = build(
                 "drive",
                 "v3",
-                credentials=self._load_credentials(),
+                http=http,
                 cache_discovery=False,
             )
         return self._drive
 
     def _slides_service(self):
         if self._slides is None:
+            credentials = self._load_credentials()
+            http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=self.HTTP_TIMEOUT_SEC))
             self._slides = build(
                 "slides",
                 "v1",
-                credentials=self._load_credentials(),
+                http=http,
                 cache_discovery=False,
             )
         return self._slides
@@ -377,6 +398,24 @@ class SEOPresentationsClient:
             "file_date": parsed.isoformat() if parsed else "",
             "sort_day": sort_day,
         }
+
+    @staticmethod
+    def _filter_files_by_window(
+        rows: list[dict[str, Any]],
+        *,
+        start_day: date,
+        end_day: date,
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            sort_day = row.get("sort_day")
+            if not isinstance(sort_day, date):
+                continue
+            if sort_day < start_day or sort_day > end_day:
+                continue
+            filtered.append(row)
+        filtered.sort(key=lambda item: item.get("sort_day", date.min), reverse=True)
+        return filtered
 
     def _resolve_shortcut_row(self, row: dict[str, Any]) -> dict[str, Any]:
         mime = str(row.get("mimeType", "")).strip()
@@ -619,6 +658,49 @@ class SEOPresentationsClient:
                 break
         return highlights
 
+    def _extract_doc_highlights(
+        self,
+        document_id: str,
+        file_name: str = "",
+        max_items: int = 8,
+    ) -> list[str]:
+        drive = self._drive_service()
+        request = drive.files().export_media(
+            fileId=document_id,
+            mimeType="text/plain",
+        )
+        buffer = BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk(num_retries=2)
+        text = buffer.getvalue().decode("utf-8", errors="ignore")
+        candidates: list[tuple[int, int, str]] = []
+        seen: set[str] = set()
+        for idx, raw_line in enumerate(text.splitlines()):
+            line = self._normalize_text(raw_line).strip(" -*\t")
+            if len(line) < 24:
+                continue
+            if self._looks_like_url_or_slug(line):
+                continue
+            if self._is_generic_highlight(line, file_name=file_name):
+                continue
+            norm = self._normalize_for_match(line)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            score = self._score_highlight_line(line, slide_index=max(1, idx // 20))
+            if score < 4:
+                continue
+            candidates.append((score, idx, line[:260]))
+        candidates.sort(key=lambda row: (-row[0], row[1], row[2]))
+        out: list[str] = []
+        for _, _, line in candidates:
+            out.append(line)
+            if len(out) >= max_items:
+                break
+        return out
+
     @staticmethod
     def _is_slides_api_disabled_error(exc: Exception) -> bool:
         message = str(exc).lower()
@@ -660,19 +742,23 @@ class SEOPresentationsClient:
 
         for index, file_row in enumerate(files):
             file_row["highlights"] = []
-            if (
-                file_row.get("mimeType") == self.GOOGLE_SLIDES_MIME
-                and index < self.max_text_files_per_year
-                and not self._slides_api_disabled_reported
-            ):
+            if index < self.max_text_files_per_year:
+                mime = str(file_row.get("mimeType", "")).strip()
                 try:
-                    file_row["highlights"] = self._extract_slide_highlights(
-                        presentation_id=str(file_row.get("id", "")).strip(),
-                        file_name=str(file_row.get("name", "")).strip(),
-                        max_items=6,
-                    )
+                    if mime == self.GOOGLE_SLIDES_MIME and not self._slides_api_disabled_reported:
+                        file_row["highlights"] = self._extract_slide_highlights(
+                            presentation_id=str(file_row.get("id", "")).strip(),
+                            file_name=str(file_row.get("name", "")).strip(),
+                            max_items=6,
+                        )
+                    elif mime == self.GOOGLE_DOC_MIME:
+                        file_row["highlights"] = self._extract_doc_highlights(
+                            document_id=str(file_row.get("id", "")).strip(),
+                            file_name=str(file_row.get("name", "")).strip(),
+                            max_items=6,
+                        )
                 except Exception as exc:
-                    if self._is_slides_api_disabled_error(exc):
+                    if mime == self.GOOGLE_SLIDES_MIME and self._is_slides_api_disabled_error(exc):
                         if not self._slides_api_disabled_reported:
                             errors.append(
                                 "Google Slides API is disabled for current credentials. "
@@ -680,8 +766,9 @@ class SEOPresentationsClient:
                             )
                         self._slides_api_disabled_reported = True
                     else:
+                        parser_label = "Slides" if mime == self.GOOGLE_SLIDES_MIME else "Docs"
                         errors.append(
-                            f"Slides parsing failed for '{file_row.get('name', '')}': {exc}"
+                            f"{parser_label} parsing failed for '{file_row.get('name', '')}': {exc}"
                         )
             for line in file_row.get("highlights", [])[:2]:
                 note_key = self._normalize_for_match(str(line))
@@ -711,7 +798,8 @@ class SEOPresentationsClient:
                 "highlights": [],
             }
 
-        years = [run_date.year, run_date.year - 1]
+        lookback_start = self._subtract_months(run_date, 13)
+        years = list(range(run_date.year, lookback_start.year - 1, -1))
         errors: list[str] = []
         year_rows_by_year: dict[int, dict[str, Any]] = {}
         highlights: list[dict[str, str]] = []
@@ -729,6 +817,11 @@ class SEOPresentationsClient:
                     str(year_folder.get("id", "")).strip(),
                     max_depth=3,
                 )[: self.max_files_per_year]
+            files = self._filter_files_by_window(
+                files,
+                start_day=lookback_start,
+                end_day=run_date,
+            )
             year_rows_by_year[year] = {
                 "year": str(year),
                 "folder_id": str(year_folder.get("id", "")).strip(),
@@ -753,8 +846,11 @@ class SEOPresentationsClient:
 
             for year in backfill_years:
                 files = files_by_year.get(year, [])
-                files.sort(key=lambda item: item.get("sort_day", date.min), reverse=True)
-                files = files[: self.max_files_per_year]
+                files = self._filter_files_by_window(
+                    files,
+                    start_day=lookback_start,
+                    end_day=run_date,
+                )[: self.max_files_per_year]
                 if not files:
                     continue
                 self._attach_highlights(year=year, files=files, errors=errors, highlights=highlights)
@@ -778,6 +874,8 @@ class SEOPresentationsClient:
             "enabled": True,
             "source": "Google Drive SEO Team Presentations",
             "root_folder_id": folder_id,
+            "lookback_months": 13,
+            "lookback_start": lookback_start.isoformat(),
             "years": year_rows,
             "highlights": highlights[:30],
             "errors": errors,

@@ -432,8 +432,11 @@ class AgentConfig:
                 "GOOGLE_DRIVE_FOLDER_NAME", "SEO Weekly Reports"
             ),
             google_drive_folder_id=_env("GOOGLE_DRIVE_FOLDER_ID"),
-            seo_presentations_enabled=_env_bool("SEO_PRESENTATIONS_ENABLED", False),
-            seo_presentations_folder_reference=_env("SEO_PRESENTATIONS_FOLDER_REFERENCE"),
+            seo_presentations_enabled=_env_bool("SEO_PRESENTATIONS_ENABLED", True),
+            seo_presentations_folder_reference=_env(
+                "SEO_PRESENTATIONS_FOLDER_REFERENCE",
+                "https://drive.google.com/drive/folders/1xNFrx8EFdl9Ikh-c3KtO1X0oaUq-2EF4",
+            ),
             seo_presentations_max_files_per_year=_env_int(
                 "SEO_PRESENTATIONS_MAX_FILES_PER_YEAR", 20
             ),

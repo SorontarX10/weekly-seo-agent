@@ -62,6 +62,15 @@ class WorkflowState(TypedDict, total=False):
     final_report: str
 
 
+def _stage_log(state: WorkflowState, stage: str, status: str, extra: str = "") -> None:
+    config = state.get("config")
+    country = "NA"
+    if isinstance(config, AgentConfig):
+        country = str(config.report_country_code or "NA").strip().upper() or "NA"
+    suffix = f" | {extra}" if extra.strip() else ""
+    print(f"[WF][{country}][{stage}] {status}{suffix}", flush=True)
+
+
 AI_SECTION_TITLES = (
     "Narrative Flow",
     "Causal Chain",
@@ -4328,6 +4337,7 @@ def _allegro_trends_candidate_queries(
 
 
 def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
+    _stage_log(state, "collect_and_analyze", "START")
     node_started = time.time()
     run_date = state["run_date"]
     config = state["config"]
@@ -5449,7 +5459,7 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         query_filter_stats=query_filter_stats,
     )
 
-    return {
+    result = {
         "totals": totals,
         "scope_results": scope_results,
         "query_filter_stats": query_filter_stats,
@@ -5461,29 +5471,57 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         "additional_context": additional_context,
         "markdown_report": markdown_report,
     }
+    _stage_log(
+        state,
+        "collect_and_analyze",
+        "DONE",
+        extra=f"runtime={time.time() - node_started:.2f}s",
+    )
+    return result
 
 
 def llm_generate_node(state: WorkflowState) -> WorkflowState:
+    _stage_log(
+        state,
+        "llm_generate",
+        "START",
+        extra=f"round={int(state.get('llm_validation_round', 0)) + 1}",
+    )
+    stage_started = time.time()
     config = state["config"]
     markdown_report = state["markdown_report"]
     current_round = int(state.get("llm_validation_round", 0))
     feedback_notes = state.get("llm_feedback_notes", [])
 
     if not config.use_llm_analysis:
-        return {
+        result = {
             "llm_commentary": "LLM analysis disabled (USE_LLM_ANALYSIS=false).",
             "final_report": markdown_report,
             "llm_skip_validation": True,
             "llm_validation_passed": True,
         }
+        _stage_log(
+            state,
+            "llm_generate",
+            "SKIP",
+            extra=f"reason=use_llm_analysis_false runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
 
     if not config.gaia_llm_enabled:
-        return {
+        result = {
             "llm_commentary": "LLM analysis skipped because GAIA config is missing.",
             "final_report": markdown_report,
             "llm_skip_validation": True,
             "llm_validation_passed": True,
         }
+        _stage_log(
+            state,
+            "llm_generate",
+            "SKIP",
+            extra=f"reason=gaia_missing runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
 
     try:
         feedback_payload = feedback_notes if isinstance(feedback_notes, list) else []
@@ -5544,12 +5582,19 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
         commentary = _inject_missing_date_context(commentary, markdown_report)
         # Re-normalize after de-duplication/date injection so required sections cannot stay empty.
         commentary = _normalize_ai_commentary_markdown(commentary)
-        return {
+        result = {
             "llm_commentary_draft": commentary,
             "llm_feedback_notes": feedback_notes if isinstance(feedback_notes, list) else [],
             "llm_validation_round": current_round + 1,
             "llm_skip_validation": False,
         }
+        _stage_log(
+            state,
+            "llm_generate",
+            "DONE",
+            extra=f"runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
     except Exception as exc:
         cached_reduce = _cache_load_latest_by_prefix(
             "llm_reduce_commentary_v2",
@@ -5563,7 +5608,7 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
         if cached_commentary:
             cached_commentary = _normalize_ai_commentary_markdown(cached_commentary)
             fallback_report = _compose_final_report(markdown_report, cached_commentary)
-            return {
+            result = {
                 "llm_commentary": cached_commentary,
                 "final_report": fallback_report,
                 "llm_skip_validation": True,
@@ -5572,6 +5617,19 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
                     f"LLM live call unavailable ({exc}); used recent cached LLM narrative fallback."
                 ],
             }
+            _stage_log(
+                state,
+                "llm_generate",
+                "DONE",
+                extra=f"mode=cached_fallback runtime={time.time() - stage_started:.2f}s",
+            )
+            return result
+        _stage_log(
+            state,
+            "llm_generate",
+            "ERROR",
+            extra=f"runtime={time.time() - stage_started:.2f}s error={exc}",
+        )
         return {
             "llm_commentary": f"LLM analysis failed: {exc}",
             "final_report": markdown_report,
@@ -5581,24 +5639,52 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
 
 
 def llm_validate_node(state: WorkflowState) -> WorkflowState:
+    _stage_log(
+        state,
+        "llm_validate",
+        "START",
+        extra=f"round={int(state.get('llm_validation_round', 0))}",
+    )
+    stage_started = time.time()
     markdown_report = state["markdown_report"]
     if state.get("llm_skip_validation"):
-        return {"llm_validation_passed": True, "llm_validation_issues": []}
+        result = {"llm_validation_passed": True, "llm_validation_issues": []}
+        _stage_log(
+            state,
+            "llm_validate",
+            "SKIP",
+            extra=f"reason=llm_skip_validation runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
 
     commentary = str(state.get("llm_commentary_draft", "")).strip()
     if not commentary:
-        return {
+        result = {
             "llm_validation_passed": False,
             "llm_validation_issues": ["Generated commentary is empty."],
             "llm_feedback_notes": ["Narrative output was empty. Rebuild full narrative with all required sections."],
         }
+        _stage_log(
+            state,
+            "llm_validate",
+            "DONE",
+            extra=f"passed=False runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
 
     config = state["config"]
     if not config.use_llm_validator:
-        return {
+        result = {
             "llm_validation_passed": True,
             "llm_validation_issues": ["[info] LLM validator disabled by USE_LLM_VALIDATOR=false."],
         }
+        _stage_log(
+            state,
+            "llm_validate",
+            "SKIP",
+            extra=f"reason=use_llm_validator_false runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
     try:
         llm, config_for_llm = _build_gaia_llm_with_runtime_fallback(config)
         candidate_report = _compose_validation_report(
@@ -5637,31 +5723,61 @@ def llm_validate_node(state: WorkflowState) -> WorkflowState:
         )
         round_no = int(state.get("llm_validation_round", 0))
         if approved:
-            return {
+            result = {
                 "llm_validation_passed": True,
                 "llm_validation_issues": issues,
             }
+            _stage_log(
+                state,
+                "llm_validate",
+                "DONE",
+                extra=f"passed=True issues={len(issues)} runtime={time.time() - stage_started:.2f}s",
+            )
+            return result
         max_rounds = max(1, int(config.llm_validation_max_rounds))
         if round_no >= max_rounds:
             fallback_report = _compose_final_report(markdown_report, commentary)
-            return {
+            result = {
                 "llm_validation_passed": True,
                 "llm_validation_issues": issues,
                 "llm_skip_validation": True,
                 "llm_commentary": commentary,
                 "final_report": fallback_report,
             }
+            _stage_log(
+                state,
+                "llm_validate",
+                "DONE",
+                extra=(
+                    f"passed=True mode=max_rounds_reached issues={len(issues)} "
+                    f"runtime={time.time() - stage_started:.2f}s"
+                ),
+            )
+            return result
         next_feedback: list[str] = []
         if isinstance(feedback, list):
             next_feedback = [str(item).strip() for item in feedback if str(item).strip()]
         if not next_feedback:
             next_feedback = [str(item).strip() for item in issues if str(item).strip()]
-        return {
+        result = {
             "llm_validation_passed": False,
             "llm_validation_issues": issues,
             "llm_feedback_notes": next_feedback[:12],
         }
+        _stage_log(
+            state,
+            "llm_validate",
+            "DONE",
+            extra=f"passed=False issues={len(issues)} runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
     except Exception as exc:
+        _stage_log(
+            state,
+            "llm_validate",
+            "ERROR",
+            extra=f"runtime={time.time() - stage_started:.2f}s error={exc}",
+        )
         return {
             "llm_validation_passed": True,
             "llm_validation_issues": [f"Validator skipped due to error: {exc}"],
@@ -5675,24 +5791,47 @@ def _route_after_validation(state: WorkflowState) -> str:
 
 
 def llm_finalize_node(state: WorkflowState) -> WorkflowState:
+    _stage_log(state, "llm_finalize", "START")
+    stage_started = time.time()
     markdown_report = state["markdown_report"]
     if state.get("llm_skip_validation"):
-        return {
+        result = {
             "llm_commentary": str(state.get("llm_commentary", "")).strip() or "LLM analysis skipped.",
             "final_report": str(state.get("final_report", "")).strip() or markdown_report,
         }
+        _stage_log(
+            state,
+            "llm_finalize",
+            "DONE",
+            extra=f"mode=skip_validation runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
 
     commentary = str(state.get("llm_commentary_draft", "")).strip()
     if not commentary:
-        return {
+        result = {
             "llm_commentary": "LLM analysis failed: empty commentary draft.",
             "final_report": markdown_report,
         }
+        _stage_log(
+            state,
+            "llm_finalize",
+            "DONE",
+            extra=f"mode=empty_draft runtime={time.time() - stage_started:.2f}s",
+        )
+        return result
     final_report = _compose_final_report(markdown_report, commentary)
-    return {
+    result = {
         "llm_commentary": commentary,
         "final_report": final_report,
     }
+    _stage_log(
+        state,
+        "llm_finalize",
+        "DONE",
+        extra=f"runtime={time.time() - stage_started:.2f}s",
+    )
+    return result
 
 
 def build_workflow_app():
@@ -5719,6 +5858,10 @@ def build_workflow_app():
 
 
 def run_weekly_workflow(run_date: date, config: AgentConfig) -> WorkflowState:
+    started = time.time()
+    country = str(config.report_country_code or "NA").strip().upper() or "NA"
+    print(f"[WF][{country}][run] START | run_date={run_date.isoformat()}", flush=True)
     app = build_workflow_app()
     final_state = app.invoke({"run_date": run_date, "config": config})
+    print(f"[WF][{country}][run] DONE | runtime={time.time() - started:.2f}s", flush=True)
     return final_state

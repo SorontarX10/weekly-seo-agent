@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import time
 from datetime import date
 from pathlib import Path
 from typing import Sequence
@@ -10,6 +13,8 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google_auth_httplib2 import AuthorizedHttp
+import httplib2
 
 from weekly_seo_agent.weekly_reporting_agent.models import DateWindow, MetricRow, MetricSummary
 
@@ -28,6 +33,9 @@ class GSCClient:
         oauth_token_uri: str = "https://oauth2.googleapis.com/token",
         country_filter: str = "",
         row_limit: int = 3000,
+        http_timeout_sec: int = 45,
+        execute_timeout_sec: int = 65,
+        max_retries: int = 4,
     ) -> None:
         self.site_url = site_url
         self.credentials_path = credentials_path
@@ -36,6 +44,9 @@ class GSCClient:
         self.oauth_token_uri = oauth_token_uri
         self.country_filter = self._normalize_country_filter(country_filter)
         self.row_limit = row_limit
+        self.http_timeout_sec = max(10, int(http_timeout_sec))
+        self.execute_timeout_sec = max(15, int(execute_timeout_sec))
+        self.max_retries = max(1, int(max_retries))
         self._service = None
 
     @staticmethod
@@ -68,13 +79,57 @@ class GSCClient:
             return self._service
 
         credentials = self._build_credentials()
+        http = AuthorizedHttp(credentials, http=httplib2.Http(timeout=self.http_timeout_sec))
         self._service = build(
             "searchconsole",
             "v1",
-            credentials=credentials,
+            http=http,
             cache_discovery=False,
         )
         return self._service
+
+    def _execute_request(self, request, context: str) -> dict:
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            holder: dict[str, object] = {}
+            finished = threading.Event()
+
+            def _runner() -> None:
+                try:
+                    try:
+                        holder["response"] = request.execute(num_retries=2)
+                    except TypeError:
+                        # Test doubles may not support the num_retries kwarg.
+                        holder["response"] = request.execute()
+                except Exception as exc:  # pragma: no cover - defensive
+                    holder["error"] = exc
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=_runner, daemon=True)
+            thread.start()
+            completed = finished.wait(timeout=float(self.execute_timeout_sec))
+            if not completed:
+                last_error = TimeoutError(
+                    f"GSC request timed out after {self.execute_timeout_sec}s ({context})"
+                )
+            else:
+                error = holder.get("error")
+                if error is None:
+                    response = holder.get("response")
+                    if isinstance(response, dict):
+                        return response
+                    return {}
+                last_error = error if isinstance(error, Exception) else RuntimeError(str(error))
+
+            retryable = isinstance(last_error, (TimeoutError, socket.timeout))
+            if isinstance(last_error, HttpError):
+                retryable = last_error.resp.status in {429, 500, 502, 503, 504}
+            if not retryable or attempt >= self.max_retries:
+                break
+            time.sleep(min(8.0, 1.2 * (2 ** (attempt - 1))))
+
+        raise RuntimeError(f"GSC API error ({context}): {last_error}") from last_error
 
     def _build_credentials(self) -> Credentials:
         if self.credentials_path:
@@ -142,14 +197,11 @@ class GSCClient:
         if filter_groups:
             body["dimensionFilterGroups"] = filter_groups
 
-        try:
-            response = (
-                service.searchanalytics()
-                .query(siteUrl=self.site_url, body=body)
-                .execute()
-            )
-        except HttpError as exc:
-            raise RuntimeError(f"GSC API error for dimensions {dimensions}: {exc}") from exc
+        request = service.searchanalytics().query(siteUrl=self.site_url, body=body)
+        response = self._execute_request(
+            request,
+            f"dimensions={','.join(dimensions)} window={window.start.isoformat()}..{window.end.isoformat()}",
+        )
 
         rows: list[MetricRow] = []
         for row in response.get("rows", []):
@@ -177,14 +229,11 @@ class GSCClient:
         if filter_groups:
             body["dimensionFilterGroups"] = filter_groups
 
-        try:
-            response = (
-                service.searchanalytics()
-                .query(siteUrl=self.site_url, body=body)
-                .execute()
-            )
-        except HttpError as exc:
-            raise RuntimeError(f"GSC API totals error: {exc}") from exc
+        request = service.searchanalytics().query(siteUrl=self.site_url, body=body)
+        response = self._execute_request(
+            request,
+            f"totals window={window.start.isoformat()}..{window.end.isoformat()}",
+        )
 
         row = (response.get("rows") or [{}])[0]
         clicks = float(row.get("clicks", 0.0))
