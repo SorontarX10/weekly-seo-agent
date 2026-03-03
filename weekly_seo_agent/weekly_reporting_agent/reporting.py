@@ -4316,18 +4316,26 @@ def _serp_case_study_text(
     elif delta_30d_vs_yoy <= -2:
         annual_intensity = "lower"
 
+    impact_direction = "neutral"
     impact_phrase = (
-        "Expected effect: YoY case-study benchmark is unavailable, so keep this as secondary context."
+        "Potential impact this week: YoY case-study benchmark is unavailable, so treat this as low-weight supporting context only."
         if annual_intensity == "unknown"
         else
-        "Expected effect on overall SEO is neutral this week."
+        "Potential impact this week: neutral baseline for SERP-layout pressure."
         if annual_intensity == "similar"
         else (
-            "Expected effect: higher SERP-change pressure can reallocate visibility across result types and reduce classic-organic CTR share."
+            "Potential impact this week: negative for classic-organic CTR share, because stronger layout volatility tends to move clicks toward non-classic result types."
             if annual_intensity == "higher"
-            else "Expected effect: lower SERP-change pressure usually means smaller layout-driven CTR distortion."
+            else "Potential impact this week: neutral-to-positive for classic-organic CTR share, because lower layout volatility usually reduces feature-driven click reallocation."
         )
     )
+    if annual_intensity == "higher":
+        impact_direction = "negative"
+    elif annual_intensity == "lower":
+        impact_direction = "positive"
+
+    support_strength = "medium"
+    support_confidence = 58
     if isinstance(totals, dict):
         current = totals.get("current_28d")
         previous = totals.get("previous_28d")
@@ -4340,10 +4348,18 @@ def _serp_case_study_text(
                 impact_phrase += (
                     f" This run is directionally aligned (CTR {ctr_wow_pp:+.2f} pp WoW; {ctr_yoy_pp:+.2f} pp YoY)."
                 )
+                support_strength = "strong"
+                support_confidence = 74
             elif annual_intensity == "lower" and ctr_wow_pp >= 0.0:
                 impact_phrase += (
                     f" This run is directionally aligned (CTR {ctr_wow_pp:+.2f} pp WoW; position {position_wow:+.2f} WoW)."
                 )
+                support_strength = "strong"
+                support_confidence = 72
+            elif annual_intensity in {"higher", "lower"}:
+                support_strength = "weak"
+                support_confidence = 52
+                impact_phrase += " Current CTR/position movement is not directionally aligned, so this signal should not be treated as a primary driver."
 
     return (
         "SERP case-study scanner (13M): recurring external patterns include "
@@ -4357,6 +4373,7 @@ def _serp_case_study_text(
             else ". YoY-30d baseline unavailable. "
         )
         + impact_phrase.rstrip(". ")
+        + f" Impact direction for this week: {impact_direction}. Support strength: {support_strength} ({support_confidence}/100)."
         + ". "
         + (
             f"Latest relevant publication: {latest_date} (`{latest_title}`)."
