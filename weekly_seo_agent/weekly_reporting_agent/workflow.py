@@ -2429,10 +2429,58 @@ def _extract_key_data_packets(
             "payload": _trim_text_by_lines(payload, payload_max_chars),
         }
 
+    def _source_packet(field: str, name: str, *, top_n: int = 10) -> dict[str, str] | None:
+        if not isinstance(additional_context, dict):
+            return None
+        raw = additional_context.get(field, {})
+        compact = _compact_ctx_rows(raw, top_n=top_n)
+        if not isinstance(compact, dict):
+            return None
+        enabled = bool(compact.get("enabled", False))
+        rows = compact.get("rows")
+        has_rows = isinstance(rows, list) and bool(rows)
+        has_payload = bool(compact) and (
+            enabled
+            or has_rows
+            or bool(compact.get("signals_count"))
+            or bool(compact.get("notes_count"))
+        )
+        if not has_payload:
+            return None
+        payload = json.dumps(
+            {
+                "source_key": field,
+                "source_payload": compact,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        return {
+            "name": name,
+            "payload": _trim_text_by_lines(payload, payload_max_chars),
+        }
+
     packets.append(_metric_pack())
     packets.append(_context_pack())
     packets.append(_market_pack())
     packets.append(_context_28d_pack())
+    for packet in (
+        _source_packet("gsc_feature_split", "SERP appearance and listing shifts", top_n=14),
+        _source_packet("daily_serp_feature_shifts", "Daily SERP feature movement lens", top_n=14),
+        _source_packet("daily_gsc_anomalies", "Daily GSC anomaly lens", top_n=14),
+        _source_packet("trade_plan", "Trade plan and campaign overlap", top_n=12),
+        _source_packet("product_trends", "Product trends and demand movers", top_n=12),
+        _source_packet("status_log", "Status log topics and team updates", top_n=12),
+        _source_packet("seo_presentations", "SEO specialist weekly reports archive", top_n=14),
+        _source_packet("historical_reports", "Historical continuity reports", top_n=12),
+        _source_packet("serp_case_studies", "SERP case-study scanner (13M)", top_n=14),
+        _source_packet("google_updates_timeline", "Google updates timeline (13M)", top_n=14),
+        _source_packet("market_event_calendar", "Marketplace events and promo calendar", top_n=12),
+        _source_packet("weekly_news_digest", "Weekly SEO/GEO news digest", top_n=12),
+        _source_packet("senuto_intelligence", "Senuto competitive intelligence", top_n=12),
+    ):
+        if packet:
+            packets.append(packet)
 
     # Pass A -> score packets by expected insight impact.
     scored_packets: list[tuple[float, dict[str, str]]] = []
@@ -2452,8 +2500,53 @@ def _extract_key_data_packets(
         scored_packets.append((score, packet))
 
     scored_packets.sort(key=lambda item: item[0], reverse=True)
-    # Pass B -> keep top packets to minimize prompt cost and context loss.
-    return [packet for _, packet in scored_packets[: max(1, max_packets)]]
+    dedup_scored: list[tuple[float, dict[str, str]]] = []
+    seen_names: set[str] = set()
+    for score, packet in scored_packets:
+        packet_name = str(packet.get("name", "")).strip().lower()
+        if not packet_name or packet_name in seen_names:
+            continue
+        seen_names.add(packet_name)
+        dedup_scored.append((score, packet))
+
+    required_keywords: list[str] = []
+    if isinstance(additional_context, dict):
+        if bool((additional_context.get("gsc_feature_split", {}) or {}).get("enabled")):
+            required_keywords.append("serp appearance")
+        if bool((additional_context.get("serp_case_studies", {}) or {}).get("enabled")):
+            required_keywords.append("case-study")
+        if bool((additional_context.get("seo_presentations", {}) or {}).get("enabled")):
+            required_keywords.append("specialist weekly reports")
+        if bool((additional_context.get("trade_plan", {}) or {}).get("enabled")):
+            required_keywords.append("trade plan")
+        if bool((additional_context.get("product_trends", {}) or {}).get("enabled")):
+            required_keywords.append("product trends")
+        if bool((additional_context.get("status_log", {}) or {}).get("enabled")):
+            required_keywords.append("status log")
+        if bool((additional_context.get("google_updates_timeline", {}) or {}).get("enabled")):
+            required_keywords.append("google updates timeline")
+        if bool((additional_context.get("weekly_news_digest", {}) or {}).get("enabled")):
+            required_keywords.append("news digest")
+        if bool((additional_context.get("historical_reports", {}) or {}).get("enabled")):
+            required_keywords.append("historical continuity reports")
+
+    required: list[dict[str, str]] = []
+    optional: list[dict[str, str]] = []
+    for _, packet in dedup_scored:
+        name = str(packet.get("name", "")).lower()
+        if any(keyword in name for keyword in required_keywords):
+            required.append(packet)
+        else:
+            optional.append(packet)
+
+    # Keep required source packets even if they exceed nominal max_packets.
+    target_count = max(max(1, max_packets), len(required))
+    selected = required[:]
+    for packet in optional:
+        if len(selected) >= target_count:
+            break
+        selected.append(packet)
+    return selected
 
 
 def _parse_json_object(raw: str) -> dict[str, object]:
@@ -3157,35 +3250,64 @@ def _generate_three_step_llm_commentary(
     ) or "- none"
     additional_context = state.get("additional_context", {})
     source_requirements: list[str] = []
+    source_coverage_matrix: list[dict[str, object]] = []
+
+    def _add_source_requirement(label: str, tokens: list[str]) -> None:
+        source_requirements.append(label)
+        source_coverage_matrix.append({"label": label, "tokens": [token.lower() for token in tokens]})
+
     if isinstance(additional_context, dict):
         if bool((additional_context.get("gsc_feature_split", {}) or {}).get("enabled")):
-            source_requirements.append("GSC searchAppearance (SERP layout/feature shifts)")
+            _add_source_requirement(
+                "GSC searchAppearance (SERP layout/feature shifts)",
+                ["searchappearance", "merchant_listings", "product_snippets", "serp"],
+            )
         if bool((additional_context.get("serp_case_studies", {}) or {}).get("enabled")):
-            source_requirements.append("SERP case-study scanner (13M)")
+            _add_source_requirement(
+                "SERP case-study scanner (13M)",
+                ["case-study", "external pattern", "serp scanner"],
+            )
         if bool((additional_context.get("seo_presentations", {}) or {}).get("enabled")):
-            source_requirements.append("SEO specialist weekly reports archive (Drive Docs/Slides, 13M)")
+            _add_source_requirement(
+                "SEO specialist weekly reports archive (Drive Docs/Slides, 13M)",
+                ["seo specialist", "weekly reports archive", "drive docs/slides"],
+            )
         if bool((additional_context.get("trade_plan", {}) or {}).get("enabled")):
-            source_requirements.append("Trade plan")
+            _add_source_requirement("Trade plan", ["trade plan", "campaign overlap", "campaign window"])
         if bool((additional_context.get("product_trends", {}) or {}).get("enabled")):
-            source_requirements.append("Product trends sheets")
+            _add_source_requirement("Product trends sheets", ["product trends", "non-brand", "demand movers"])
         if bool((additional_context.get("google_updates_timeline", {}) or {}).get("enabled")):
-            source_requirements.append("Google updates timeline (13M)")
+            _add_source_requirement(
+                "Google updates timeline (13M)",
+                ["google update", "core update", "search status"],
+            )
         if bool((additional_context.get("platform_regulatory_pulse", {}) or {}).get("enabled")):
-            source_requirements.append("Platform/regulatory pulse")
+            _add_source_requirement("Platform/regulatory pulse", ["regulatory", "platform pulse", "commission"])
         if bool((additional_context.get("weekly_news_digest", {}) or {}).get("enabled")):
-            source_requirements.append("Weekly SEO/GEO news digest")
+            _add_source_requirement("Weekly SEO/GEO news digest", ["weekly news", "seo pulse", "geo"])
         if bool((additional_context.get("weather_forecast", {}) or {}).get("enabled")):
-            source_requirements.append("Weather context")
+            _add_source_requirement("Weather context", ["weather", "temperature", "precipitation"])
         if bool((additional_context.get("senuto_intelligence", {}) or {}).get("enabled")):
-            source_requirements.append("Senuto intelligence")
+            _add_source_requirement("Senuto intelligence", ["senuto", "competitor pressure", "keyword overlap"])
         if bool((additional_context.get("historical_reports", {}) or {}).get("enabled")):
-            source_requirements.append("Historical continuity reports")
+            _add_source_requirement(
+                "Historical continuity reports",
+                ["historical continuity", "previous report", "continuity"],
+            )
         if bool((additional_context.get("status_log", {}) or {}).get("enabled")):
-            source_requirements.append("Status log updates")
+            _add_source_requirement("Status log updates", ["status log", "team update", "agenda"])
     source_requirements_text = (
         "\n".join(f"- {item}" for item in source_requirements)
         if source_requirements
         else "- No additional source requirements detected."
+    )
+    source_coverage_matrix_text = (
+        "\n".join(
+            f"- {row['label']} | mention tokens: {', '.join(row.get('tokens', [])[:4])}"
+            for row in source_coverage_matrix
+        )
+        if source_coverage_matrix
+        else "- No source coverage matrix."
     )
 
     # Step 2: run multiple focused LLM summaries over compressed packets.
@@ -3315,6 +3437,65 @@ Validator feedback to address (if any):
 
         partial_summaries.append("\n".join(lines))
 
+    # Step 2b: synthesize source-level capsules first, then merge globally.
+    source_capsules_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """
+You are an SEO synthesis analyst.
+Create compact source capsules from packet summaries.
+
+Rules:
+1. Use ONLY provided packet summaries.
+2. Return markdown only.
+3. Use heading exactly `### Source Capsules`.
+4. Produce up to 12 bullets in format:
+   `- [Source] Fact: ... | Business impact: ... | Evidence: ... | Confidence: x/100.`
+5. Keep each bullet one sentence, no placeholders, no ellipses.
+6. Cover all required sources when evidence exists; if missing, explicitly write "insufficient evidence".
+7. Prefer concrete numbers/date windows/source names over generic wording.
+""".strip(),
+            ),
+            (
+                "user",
+                """
+Required source coverage:
+{required_source_coverage}
+
+Coverage matrix:
+{source_coverage_matrix}
+
+<compressed_packet_summaries>
+{compressed_packet_summaries}
+</compressed_packet_summaries>
+""".strip(),
+            ),
+        ]
+    )
+    source_capsules_chain = source_capsules_prompt | llm | StrOutputParser()
+    source_capsules_payload = {
+        "required_source_coverage": source_requirements_text,
+        "source_coverage_matrix": source_coverage_matrix_text,
+        "compressed_packet_summaries": "\n\n".join(partial_summaries),
+    }
+    cached_capsules = _cache_load_json(
+        "llm_source_capsules_v1",
+        (json.dumps({"model": config.gaia_model, **source_capsules_payload}, ensure_ascii=False, sort_keys=True),),
+        max_age_sec=LLM_CACHE_MAX_AGE_SEC,
+    )
+    source_capsules = str(cached_capsules.get("capsules", "")) if isinstance(cached_capsules, dict) else ""
+    if not source_capsules.strip():
+        source_capsules = source_capsules_chain.invoke(source_capsules_payload)
+        _cache_save_json(
+            "llm_source_capsules_v1",
+            (json.dumps({"model": config.gaia_model, **source_capsules_payload}, ensure_ascii=False, sort_keys=True),),
+            {"capsules": source_capsules},
+        )
+    source_capsules = source_capsules.strip()
+    if not source_capsules:
+        source_capsules = "### Source Capsules\n- [Coverage] insufficient evidence from packet summaries."
+
     # Step 3: merge partial summaries into final narrative.
     reduce_prompt = ChatPromptTemplate.from_messages(
         [
@@ -3378,6 +3559,8 @@ Output constraints:
 20. Every source listed in "Required source coverage" below must appear at least once in narrative or dependency map.
 21. Include at least 6 source-specific facts in total (numbers, date windows, named sources, named programs or events).
 22. Each major section must include at least one source-specific detail (not a generic sentence).
+23. Use "Source Capsules" as first-class evidence and preserve their source labels in final text.
+24. Prefer one specific claim per source over broad generic summaries.
 	""".strip(),
             ),
             (
@@ -3390,6 +3573,13 @@ Validator feedback to address (if any):
 Required source coverage:
 {required_source_coverage}
 
+Source coverage matrix:
+{source_coverage_matrix}
+
+<source_capsules>
+{source_capsules}
+</source_capsules>
+
 <compressed_packet_summaries>
 {compressed_packet_summaries}
 </compressed_packet_summaries>
@@ -3401,6 +3591,8 @@ Required source coverage:
     reduce_payload = {
         "feedback": feedback_block,
         "required_source_coverage": source_requirements_text,
+        "source_coverage_matrix": source_coverage_matrix_text,
+        "source_capsules": source_capsules,
         "compressed_packet_summaries": "\n\n".join(partial_summaries),
         "playbook_grounding": playbook_grounding,
     }
@@ -3413,6 +3605,67 @@ Required source coverage:
     if cached_output:
         return cached_output
     result = reduce_chain.invoke(reduce_payload)
+
+    # Targeted supplement: if required source coverage is missing, regenerate focused add-on only.
+    lowered_result = result.lower()
+    missing_labels: list[str] = []
+    for item in source_coverage_matrix:
+        label = str(item.get("label", "")).strip()
+        tokens = [str(token).lower() for token in item.get("tokens", []) if str(token).strip()]
+        if not label or not tokens:
+            continue
+        if not any(token in lowered_result for token in tokens):
+            missing_labels.append(label)
+    if missing_labels:
+        supplement_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    """
+You repair missing source coverage in a weekly SEO narrative.
+Return markdown only with these headings exactly:
+- `### Evidence by Source`
+- `### Cross-Source Dependency Map`
+
+Rules:
+1. Use only provided source capsules and packet summaries.
+2. Add only missing-source bullets, concise and concrete.
+3. Every bullet must include explicit Evidence and Confidence x/100.
+4. Do not repeat existing claims unless needed for dependency logic.
+""".strip(),
+                ),
+                (
+                    "user",
+                    """
+Missing source labels:
+{missing_source_labels}
+
+<current_narrative>
+{current_narrative}
+</current_narrative>
+
+<source_capsules>
+{source_capsules}
+</source_capsules>
+
+<compressed_packet_summaries>
+{compressed_packet_summaries}
+</compressed_packet_summaries>
+""".strip(),
+                ),
+            ]
+        )
+        supplement_chain = supplement_prompt | llm | StrOutputParser()
+        supplement = supplement_chain.invoke(
+            {
+                "missing_source_labels": "\n".join(f"- {label}" for label in missing_labels),
+                "current_narrative": result,
+                "source_capsules": source_capsules,
+                "compressed_packet_summaries": "\n\n".join(partial_summaries),
+            }
+        )
+        if supplement.strip():
+            result = f"{result.strip()}\n\n{supplement.strip()}"
     _cache_save_json(
         "llm_reduce_commentary_v2",
         (json.dumps({"model": config.gaia_model, **reduce_payload}, ensure_ascii=False, sort_keys=True),),
