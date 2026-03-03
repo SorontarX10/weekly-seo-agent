@@ -387,8 +387,11 @@
           </div>
           <div class="actions" style="align-items:end;">
             <button id="create-add-web-query-btn">Add Web Query</button>
+            <button id="create-suggest-web-queries-btn">Suggest from Chat</button>
+            <button id="create-accept-suggested-web-btn">Accept Selected Suggestions</button>
           </div>
         </div>
+        <ul id="create-web-suggested-list" class="clean"></ul>
         <ul id="create-web-queries-list" class="clean"></ul>
         <div class="actions" style="margin-top:10px;">
           <button class="primary" id="create-document-btn">Create Document</button>
@@ -412,6 +415,27 @@
             <button id="refresh-documents-btn">Refresh</button>
           </div>
         </div>
+        <div class="row" style="margin-top:10px;">
+          <div class="actions" style="align-items:end;">
+            <button id="documents-upload-docx-btn">Upload .docx document</button>
+            <input id="documents-upload-docx-input" type="file" accept=".docx" style="display:none;" />
+          </div>
+          <div>
+            <label>Google Doc URL or File ID</label>
+            <input id="documents-google-doc-ref" placeholder="https://docs.google.com/document/d/... or fileId" />
+          </div>
+          <div class="actions" style="align-items:end;">
+            <button id="documents-sync-google-doc-btn">Sync Google Doc</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <div class="actions" style="align-items:end;">
+            <button id="documents-suggest-web-queries-btn">Suggest DDG Searches from Chat</button>
+            <button id="documents-accept-suggested-web-btn">Accept Selected Suggestions</button>
+          </div>
+        </div>
+        <ul id="documents-web-suggested-list" class="clean"></ul>
+        <ul id="documents-web-queries-list" class="clean"></ul>
         <div id="documents-list"></div>
       </section>
 
@@ -501,6 +525,9 @@
     let editorDirty = false;
     let pendingCreateDriveFiles = [];
     let pendingCreateWebQueries = [];
+    let suggestedCreateWebQueries = [];
+    let pendingImportWebQueries = [];
+    let suggestedImportWebQueries = [];
     let availableDriveFiles = [];
     let planningSession = null;
     let isCreatingDocument = false;
@@ -1105,6 +1132,143 @@
       });
     }
 
+    function renderCreateSuggestedWebQueries() {
+      const list = document.getElementById('create-web-suggested-list');
+      if (!suggestedCreateWebQueries.length) {
+        list.innerHTML = '<li class="muted">No suggested web searches yet.</li>';
+        return;
+      }
+      list.innerHTML = suggestedCreateWebQueries.map((query, index) => `
+        <li>
+          <label>
+            <input type="checkbox" data-create-suggested-web-index="${index}" checked />
+            ${query}
+          </label>
+        </li>
+      `).join('');
+    }
+
+    function renderImportWebQueries() {
+      const list = document.getElementById('documents-web-queries-list');
+      if (!pendingImportWebQueries.length) {
+        list.innerHTML = '<li class="muted">No accepted web searches for import.</li>';
+        return;
+      }
+      list.innerHTML = pendingImportWebQueries.map((query, index) => `
+        <li>
+          <div><strong>${query}</strong></div>
+          <button data-remove-import-web-query-index="${index}">Remove</button>
+        </li>
+      `).join('');
+      list.querySelectorAll('[data-remove-import-web-query-index]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const index = Number(button.dataset.removeImportWebQueryIndex);
+          pendingImportWebQueries = pendingImportWebQueries.filter((_, i) => i !== index);
+          renderImportWebQueries();
+        });
+      });
+    }
+
+    function renderImportSuggestedWebQueries() {
+      const list = document.getElementById('documents-web-suggested-list');
+      if (!suggestedImportWebQueries.length) {
+        list.innerHTML = '<li class="muted">No suggested web searches yet.</li>';
+        return;
+      }
+      list.innerHTML = suggestedImportWebQueries.map((query, index) => `
+        <li>
+          <label>
+            <input type="checkbox" data-import-suggested-web-index="${index}" checked />
+            ${query}
+          </label>
+        </li>
+      `).join('');
+    }
+
+    function buildWebSuggestionPayload() {
+      const messages = planningSession && Array.isArray(planningSession.messages) ? planningSession.messages : [];
+      const conversation = messages
+        .map((msg) => `${msg.role || 'assistant'}: ${msg.content || ''}`)
+        .join('\n')
+        .slice(0, 8000);
+      const brief = planningSession && planningSession.brief ? planningSession.brief : {};
+      return {
+        title: String(brief.title || document.getElementById('create-title').value || '').trim(),
+        objective: String(brief.objective || document.getElementById('create-objective').value || '').trim(),
+        doc_type: String(brief.doc_type || document.getElementById('create-type').value || '').trim(),
+        target_audience: String(brief.target_audience || document.getElementById('create-audience').value || '').trim(),
+        language: String(brief.language || document.getElementById('create-language').value || 'pl').trim(),
+        conversation,
+        max_suggestions: 6,
+      };
+    }
+
+    async function suggestCreateWebQueriesFromChat() {
+      try {
+        const payload = buildWebSuggestionPayload();
+        const response = await api('/research/web/suggestions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        suggestedCreateWebQueries = Array.isArray(response.suggestions) ? response.suggestions : [];
+        renderCreateSuggestedWebQueries();
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    function acceptCreateSuggestedWebQueries() {
+      const selected = Array.from(document.querySelectorAll('[data-create-suggested-web-index]'))
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => Number(checkbox.dataset.createSuggestedWebIndex))
+        .filter((index) => Number.isFinite(index) && index >= 0 && index < suggestedCreateWebQueries.length)
+        .map((index) => suggestedCreateWebQueries[index]);
+      if (!selected.length) {
+        alert('Select at least one suggested web search.');
+        return;
+      }
+      selected.forEach((query) => {
+        if (!pendingCreateWebQueries.includes(query)) {
+          pendingCreateWebQueries.push(query);
+        }
+      });
+      renderCreateWebQueries();
+    }
+
+    async function suggestImportWebQueriesFromChat() {
+      try {
+        const payload = buildWebSuggestionPayload();
+        const response = await api('/research/web/suggestions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        suggestedImportWebQueries = Array.isArray(response.suggestions) ? response.suggestions : [];
+        renderImportSuggestedWebQueries();
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    function acceptImportSuggestedWebQueries() {
+      const selected = Array.from(document.querySelectorAll('[data-import-suggested-web-index]'))
+        .filter((checkbox) => checkbox.checked)
+        .map((checkbox) => Number(checkbox.dataset.importSuggestedWebIndex))
+        .filter((index) => Number.isFinite(index) && index >= 0 && index < suggestedImportWebQueries.length)
+        .map((index) => suggestedImportWebQueries[index]);
+      if (!selected.length) {
+        alert('Select at least one suggested web search.');
+        return;
+      }
+      selected.forEach((query) => {
+        if (!pendingImportWebQueries.includes(query)) {
+          pendingImportWebQueries.push(query);
+        }
+      });
+      renderImportWebQueries();
+    }
+
     function addCreateWebQuery() {
       const input = document.getElementById('create-web-query');
       const value = input.value.trim();
@@ -1290,6 +1454,112 @@
         const handled = await handleStaleDocumentError(error);
         if (handled) return;
         alert(error.message);
+      }
+    }
+
+    function openDocumentsDocxImportDialog() {
+      const input = document.getElementById('documents-upload-docx-input');
+      input.value = '';
+      input.click();
+    }
+
+    async function importNewDocumentFromDocx() {
+      const input = document.getElementById('documents-upload-docx-input');
+      const file = input.files && input.files[0] ? input.files[0] : null;
+      if (!file) return;
+      const restore = setButtonLoading('documents-upload-docx-btn', 'Importing...', 'Upload .docx document');
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        const response = await fetch('/documents/import/docx', {
+          method: 'POST',
+          body: formData,
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          const err = new Error(formatApiErrorDetail(body?.detail || body || 'DOCX import failed'));
+          err.status = response.status;
+          throw err;
+        }
+        const created = await response.json();
+        const failedQueries = [];
+        for (let index = 0; index < pendingImportWebQueries.length; index += 1) {
+          const query = pendingImportWebQueries[index];
+          try {
+            await api(`/documents/${created.id}/attachments/research-web`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                query,
+                region: 'us-en',
+                max_results: 6,
+                fetch_pages: true,
+                max_pages: 3,
+                page_char_limit: 1800,
+              }),
+            });
+          } catch (_) {
+            failedQueries.push(query);
+          }
+        }
+        pendingImportWebQueries = failedQueries;
+        renderImportWebQueries();
+        await Promise.all([loadDocuments(), loadArchive(), loadLastOpened()]);
+        await openDocument(created.id);
+        if (failedQueries.length) {
+          alert(`Document imported, but some web research queries failed:\\n${failedQueries.join('\\n')}`);
+        }
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        restore();
+      }
+    }
+
+    async function importNewDocumentFromGoogleDoc() {
+      const fileRef = document.getElementById('documents-google-doc-ref').value.trim();
+      if (!fileRef) {
+        alert('Wpisz URL lub ID Google Doca.');
+        return;
+      }
+      const restore = setButtonLoading('documents-sync-google-doc-btn', 'Importing...', 'Sync Google Doc');
+      try {
+        const created = await api('/documents/import/google-doc', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ file_ref: fileRef }),
+        });
+        const failedQueries = [];
+        for (let index = 0; index < pendingImportWebQueries.length; index += 1) {
+          const query = pendingImportWebQueries[index];
+          try {
+            await api(`/documents/${created.id}/attachments/research-web`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                query,
+                region: 'us-en',
+                max_results: 6,
+                fetch_pages: true,
+                max_pages: 3,
+                page_char_limit: 1800,
+              }),
+            });
+          } catch (_) {
+            failedQueries.push(query);
+          }
+        }
+        pendingImportWebQueries = failedQueries;
+        renderImportWebQueries();
+        await Promise.all([loadDocuments(), loadArchive(), loadLastOpened()]);
+        await openDocument(created.id);
+        if (failedQueries.length) {
+          alert(`Document imported, but some web research queries failed:\\n${failedQueries.join('\\n')}`);
+        }
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        restore();
       }
     }
 
@@ -1780,9 +2050,16 @@
     document.getElementById('create-drive-picker-search-btn').addEventListener('click', () => loadDrivePickerFiles().catch((e) => alert(e.message)));
     document.getElementById('create-drive-picker-close-btn').addEventListener('click', closeDrivePicker);
     document.getElementById('create-add-web-query-btn').addEventListener('click', addCreateWebQuery);
+    document.getElementById('create-suggest-web-queries-btn').addEventListener('click', suggestCreateWebQueriesFromChat);
+    document.getElementById('create-accept-suggested-web-btn').addEventListener('click', acceptCreateSuggestedWebQueries);
     document.getElementById('create-quick-connect-drive-btn').addEventListener('click', quickConnectDrive);
     document.getElementById('create-verify-drive-btn').addEventListener('click', verifyDriveConnection);
     document.getElementById('refresh-documents-btn').addEventListener('click', loadDocuments);
+    document.getElementById('documents-upload-docx-btn').addEventListener('click', openDocumentsDocxImportDialog);
+    document.getElementById('documents-upload-docx-input').addEventListener('change', importNewDocumentFromDocx);
+    document.getElementById('documents-sync-google-doc-btn').addEventListener('click', importNewDocumentFromGoogleDoc);
+    document.getElementById('documents-suggest-web-queries-btn').addEventListener('click', suggestImportWebQueriesFromChat);
+    document.getElementById('documents-accept-suggested-web-btn').addEventListener('click', acceptImportSuggestedWebQueries);
     document.getElementById('save-btn').addEventListener('click', () => saveDocument().catch((e) => alert(e.message)));
     document.getElementById('finalize-btn').addEventListener('click', finalizeDocument);
     document.getElementById('outline-btn').addEventListener('click', generateOutline);
@@ -1819,6 +2096,9 @@
 
     renderCreateDriveFiles();
     renderCreateWebQueries();
+    renderCreateSuggestedWebQueries();
+    renderImportSuggestedWebQueries();
+    renderImportWebQueries();
     renderPlanningSession();
     refreshEditorPreview('');
     initializeTheme();

@@ -29,6 +29,12 @@ Status:
   (indented markdown list items now export as real nested DOCX lists; reduced excessive spacing in exported paragraphs/headings for cleaner Google Docs layout).
 - 2026-03-03: Reworked Google Doc edit controls around linked process document
   (replaced top-bar download action with upload-edited flow; added one-click "Sync with Google Doc" and "Update Google Doc" using the latest linked Drive export for the document).
+- 2026-03-03: Improved Google Doc sync parsing quality
+  (DOCX parser now preserves block order and maps Google Doc export structure into markdown-like headings, lists, and tables instead of flattening content into raw text lines).
+- 2026-03-03: Added "Documents" tab import entry points for ready-made docs
+  (new actions: "Upload .docx document" and "Sync Google Doc" create fresh editable system documents from imported content, then open them in standard agent editing flow).
+- 2026-03-03: Added DDG search suggestions from planning chat with approval
+  (new `/research/web/suggestions` context-based query suggestion endpoint + UI acceptance lists in both Create and Documents import flows; accepted queries are attached after create/import).
 - 2026-03-03: Added LLM response pagination + merge for long generations
   (automatic continuation when model hits length limit; overlap-aware stitching to reduce cut content).
 - 2026-03-03: Google Drive switched to OAuth-only integration mode

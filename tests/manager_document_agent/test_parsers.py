@@ -34,7 +34,15 @@ def test_parse_txt_csv_tsv():
 def test_parse_docx_and_xlsx():
     docx_buffer = BytesIO()
     docx = DocxDocument()
-    docx.add_paragraph("Executive summary")
+    docx.add_heading("Executive Summary", level=2)
+    docx.add_paragraph("Key outcome paragraph.")
+    docx.add_paragraph("Top priority", style="List Bullet")
+    docx.add_paragraph("Nested task", style="List Bullet 2")
+    table = docx.add_table(rows=2, cols=2)
+    table.rows[0].cells[0].text = "KPI"
+    table.rows[0].cells[1].text = "Owner"
+    table.rows[1].cells[0].text = "CRVisits"
+    table.rows[1].cells[1].text = "SEO Team"
     docx.save(docx_buffer)
     parsed_docx = parse_attachment("report.docx", docx_buffer.getvalue())
 
@@ -50,7 +58,11 @@ def test_parse_docx_and_xlsx():
     parsed_xlsx = parse_attachment("data.xlsx", xlsx_buffer.getvalue())
 
     assert parsed_docx.extraction_status == ExtractionStatus.OK
-    assert "Executive summary" in parsed_docx.extracted_text
+    assert "## Executive Summary" in parsed_docx.extracted_text
+    assert "- Top priority" in parsed_docx.extracted_text
+    assert "  - Nested task" in parsed_docx.extracted_text
+    assert "| KPI | Owner |" in parsed_docx.extracted_text
+    assert "| CRVisits | SEO Team |" in parsed_docx.extracted_text
 
     assert parsed_xlsx.extraction_status == ExtractionStatus.OK
     assert "# Sheet: Data" in parsed_xlsx.extracted_text

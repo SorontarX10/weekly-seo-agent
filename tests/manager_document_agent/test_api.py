@@ -557,6 +557,62 @@ def test_google_doc_update_exports_current_content_to_drive(tmp_path, monkeypatc
         assert captured["document_name"]
 
 
+def test_create_new_document_from_docx_import(tmp_path):
+    app = create_app(db_path=tmp_path / "manager_agent_api.db")
+
+    with TestClient(app) as client:
+        docx_bytes = _build_docx_bytes(
+            ["## Imported Strategy", "This content comes from uploaded document."]
+        )
+        created = client.post(
+            "/documents/import/docx",
+            files={
+                "file": (
+                    "imported_strategy.docx",
+                    docx_bytes,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+        assert created.status_code == 200
+        body = created.json()
+        assert body["status"] == "IN_PROGRESS"
+        assert body["doc_type"] == "DOCUMENTATION"
+        assert "This content comes from uploaded document." in body["current_content"]
+
+
+def test_create_new_document_from_google_doc_import(tmp_path, monkeypatch):
+    app = create_app(db_path=tmp_path / "manager_agent_api.db")
+    imported_bytes = _build_docx_bytes(["Google Doc Title", "Imported from linked Google Doc"])
+
+    class FakeDriveClient:
+        def download_attachment(self, *, file_ref: str) -> dict:
+            assert file_ref == "https://docs.google.com/document/d/google-doc-42/edit"
+            return {
+                "filename": "google_import.docx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "raw_bytes": imported_bytes,
+            }
+
+    monkeypatch.setattr(
+        api_module,
+        "_build_google_drive_client_from_config",
+        lambda *, service, config: FakeDriveClient(),
+    )
+
+    with TestClient(app) as client:
+        _seed_oauth_drive_integration(client)
+        created = client.post(
+            "/documents/import/google-doc",
+            json={"file_ref": "https://docs.google.com/document/d/google-doc-42/edit"},
+        )
+        assert created.status_code == 200
+        body = created.json()
+        assert body["status"] == "IN_PROGRESS"
+        assert body["doc_type"] == "DOCUMENTATION"
+        assert "Imported from linked Google Doc" in body["current_content"]
+
+
 def test_list_google_drive_files_endpoint(tmp_path, monkeypatch):
     app = create_app(db_path=tmp_path / "manager_agent_api.db")
 
@@ -635,6 +691,29 @@ def test_web_research_endpoint_returns_rows(tmp_path, monkeypatch):
         assert body["query"] == "SEO GEO outlook 2026"
         assert len(body["items"]) == 1
         assert body["items"][0]["url"] == "https://example.com/article"
+
+
+def test_web_research_suggestions_endpoint_returns_queries(tmp_path):
+    app = create_app(db_path=tmp_path / "manager_agent_api.db")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/research/web/suggestions",
+            json={
+                "title": "SEO & GEO Outlook 2026",
+                "objective": "Prepare management-ready strategy with KPIs and risks.",
+                "doc_type": "MANAGEMENT_BRIEF",
+                "target_audience": "Management",
+                "language": "en",
+                "conversation": "User: emphasize AI visibility and CRVisits in 90 day plan.",
+                "max_suggestions": 5,
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["language"] == "en"
+        assert 2 <= len(body["suggestions"]) <= 5
+        assert all(isinstance(query, str) and query.strip() for query in body["suggestions"])
 
 
 def test_attach_web_research_creates_text_attachment(tmp_path, monkeypatch):

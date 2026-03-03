@@ -110,6 +110,10 @@ class DriveAttachmentImportRequest(BaseModel):
     file_ref: str = Field(min_length=1)
 
 
+class CreateFromGoogleDocRequest(BaseModel):
+    file_ref: str = Field(min_length=1)
+
+
 class WebResearchRequest(BaseModel):
     query: str = Field(min_length=3, max_length=300)
     region: str = Field(default="us-en")
@@ -117,6 +121,21 @@ class WebResearchRequest(BaseModel):
     fetch_pages: bool = Field(default=True)
     max_pages: int = Field(default=3, ge=0, le=8)
     page_char_limit: int = Field(default=1800, ge=200, le=6000)
+
+
+class WebResearchSuggestionRequest(BaseModel):
+    title: str = Field(default="")
+    objective: str = Field(default="")
+    doc_type: str = Field(default="")
+    target_audience: str = Field(default="")
+    language: str = Field(default="pl")
+    conversation: str = Field(default="")
+    max_suggestions: int = Field(default=6, ge=2, le=12)
+
+
+class WebResearchSuggestionResponse(BaseModel):
+    language: str
+    suggestions: list[str]
 
 
 class WebResearchItemResponse(BaseModel):
@@ -656,6 +675,103 @@ def create_app(
         )
         return _to_document_response(document)
 
+    @app.post("/documents/import/docx", response_model=DocumentResponse)
+    async def create_document_from_docx_upload(
+        file: UploadFile = File(...),
+        service: DocumentService = Depends(_get_service),
+    ) -> DocumentResponse:
+        if file.filename is None:
+            raise HTTPException(status_code=400, detail="Document file must include filename")
+        extension = Path(file.filename).suffix.lower()
+        if extension != ".docx":
+            raise HTTPException(status_code=400, detail="Only .docx is supported in this action")
+
+        try:
+            raw_bytes = await file.read()
+            mime_type = file.content_type or "application/octet-stream"
+            parsed = _parse_imported_document_bytes(
+                filename=file.filename,
+                mime_type=mime_type,
+                raw_bytes=raw_bytes,
+            )
+            content = str(parsed.extracted_text or "").strip()
+            title = _infer_document_title_from_import(
+                filename=file.filename,
+                extracted_text=content,
+            )
+            language = _infer_language_from_text(content)
+            created = service.create_document(
+                title=title,
+                doc_type="DOCUMENTATION",
+                target_audience="Management",
+                language=language,
+                objective="Imported from DOCX document.",
+                tone="formal",
+                constraints="",
+                current_content=content,
+            )
+        except AttachmentValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"DOCX import failed: {exc}",
+            ) from exc
+        return _to_document_response(created)
+
+    @app.post("/documents/import/google-doc", response_model=DocumentResponse)
+    def create_document_from_google_doc(
+        payload: CreateFromGoogleDocRequest,
+        service: DocumentService = Depends(_get_service),
+    ) -> DocumentResponse:
+        setting = service.get_integration_setting("google_drive")
+        if setting is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Google Drive integration is not configured yet.",
+            )
+        config = json.loads(setting.config_json)
+
+        try:
+            drive_client = _build_google_drive_client_from_config(
+                service=service,
+                config=config,
+            )
+            downloaded = drive_client.download_attachment(file_ref=payload.file_ref)
+            filename = str(downloaded.get("filename", "")).strip() or "google_doc_import.docx"
+            mime_type = str(downloaded.get("mime_type", "")).strip() or "application/octet-stream"
+            raw = downloaded.get("raw_bytes", b"")
+            raw_bytes = bytes(raw if isinstance(raw, (bytes, bytearray)) else b"")
+            parsed = _parse_imported_document_bytes(
+                filename=filename,
+                mime_type=mime_type,
+                raw_bytes=raw_bytes,
+            )
+            content = str(parsed.extracted_text or "").strip()
+            title = _infer_document_title_from_import(
+                filename=filename,
+                extracted_text=content,
+            )
+            language = _infer_language_from_text(content)
+            created = service.create_document(
+                title=title,
+                doc_type="DOCUMENTATION",
+                target_audience="Management",
+                language=language,
+                objective="Imported from Google Doc.",
+                tone="formal",
+                constraints="",
+                current_content=content,
+            )
+        except AttachmentValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Google Doc import failed: {exc}",
+            ) from exc
+        return _to_document_response(created)
+
     @app.get("/documents", response_model=list[DocumentResponse])
     def list_documents(
         status: Optional[DocumentStatus] = None,
@@ -1101,6 +1217,24 @@ def create_app(
             warning=str(result.get("warning", "")).strip(),
             summary_text=str(result.get("summary_text", "")).strip(),
             items=items,
+        )
+
+    @app.post("/research/web/suggestions", response_model=WebResearchSuggestionResponse)
+    def suggest_web_research_queries(
+        payload: WebResearchSuggestionRequest,
+    ) -> WebResearchSuggestionResponse:
+        suggestions = _suggest_web_queries_from_context(
+            title=payload.title,
+            objective=payload.objective,
+            doc_type=payload.doc_type,
+            target_audience=payload.target_audience,
+            language=payload.language,
+            conversation=payload.conversation,
+            max_suggestions=payload.max_suggestions,
+        )
+        return WebResearchSuggestionResponse(
+            language=payload.language.strip() or "pl",
+            suggestions=suggestions,
         )
 
     @app.post(
@@ -2112,6 +2246,133 @@ def _safe_slug(value: str) -> str:
     if not normalized:
         return "query"
     return normalized[:64]
+
+
+def _infer_document_title_from_import(*, filename: str, extracted_text: str) -> str:
+    for raw_line in str(extracted_text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line.strip())
+        if not line:
+            continue
+        if line.startswith("#"):
+            normalized = re.sub(r"^#+\s*", "", line).strip()
+            if normalized:
+                return normalized[:120]
+        if len(line) >= 4:
+            return line[:120]
+    stem = Path(filename).stem.strip() or "Imported Document"
+    return re.sub(r"\s+", " ", stem).strip()[:120]
+
+
+def _infer_language_from_text(text: str) -> str:
+    sample = str(text or "")[:1200].lower()
+    polish_markers = ("ą", "ć", "ę", "ł", "ń", "ó", "ś", "ź", "ż", " oraz ", " dla ", " dokument ")
+    english_markers = (" the ", " and ", " for ", " with ", " from ", " management ")
+    pl_score = sum(1 for marker in polish_markers if marker in sample)
+    en_score = sum(1 for marker in english_markers if marker in sample)
+    return "pl" if pl_score >= en_score else "en"
+
+
+def _suggest_web_queries_from_context(
+    *,
+    title: str,
+    objective: str,
+    doc_type: str,
+    target_audience: str,
+    language: str,
+    conversation: str,
+    max_suggestions: int,
+) -> list[str]:
+    lang = (language or "pl").strip().lower() or "pl"
+    source_text = "\n".join(
+        [
+            str(title or ""),
+            str(objective or ""),
+            str(doc_type or ""),
+            str(target_audience or ""),
+            str(conversation or ""),
+        ]
+    )
+    year = _extract_research_year(source_text) or "2026"
+    keywords = _extract_research_keywords(source_text, lang=lang)
+    topic = " ".join(keywords[:3]).strip() or ("SEO GEO" if lang.startswith("pl") else "SEO GEO")
+
+    templates_pl = [
+        "{topic} trendy {year}",
+        "{topic} KPI framework {year}",
+        "{topic} ryzyka i mitigacje {year}",
+        "{topic} case study e-commerce {year}",
+        "{topic} roadmap 90 dni",
+        "{topic} best practices management brief",
+        "{topic} AI visibility zero-click {year}",
+        "{topic} competitive benchmark {year}",
+    ]
+    templates_en = [
+        "{topic} trends {year}",
+        "{topic} KPI framework {year}",
+        "{topic} risks and mitigations {year}",
+        "{topic} ecommerce case study {year}",
+        "{topic} 90 day plan",
+        "{topic} best practices management brief",
+        "{topic} AI visibility zero-click {year}",
+        "{topic} competitive benchmark {year}",
+    ]
+    templates = templates_pl if lang.startswith("pl") else templates_en
+
+    queries: list[str] = []
+    for template in templates:
+        candidate = template.format(topic=topic, year=year).strip()
+        if not candidate:
+            continue
+        if candidate in queries:
+            continue
+        queries.append(candidate)
+        if len(queries) >= max_suggestions:
+            break
+    return queries[:max_suggestions]
+
+
+def _extract_research_year(text: str) -> str:
+    match = re.search(r"\b(20\d{2})\b", str(text or ""))
+    if not match:
+        return ""
+    return match.group(1)
+
+
+def _extract_research_keywords(text: str, *, lang: str) -> list[str]:
+    raw_tokens = re.findall(r"[A-Za-z0-9&+#.-]{3,}", str(text or ""))
+    stopwords_pl = {
+        "oraz", "dla", "przez", "jako", "tego", "też", "jest", "będzie", "plan", "dokument",
+        "management", "brief", "document", "the", "and", "with", "from", "that", "this",
+    }
+    stopwords_en = {
+        "the", "and", "with", "from", "that", "this", "plan", "document", "for", "into",
+        "management", "brief", "oraz", "dla", "przez", "jako",
+    }
+    stopwords = stopwords_pl if lang.startswith("pl") else stopwords_en
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in raw_tokens:
+        normalized = token.strip().lower()
+        if len(normalized) < 3:
+            continue
+        if normalized in stopwords:
+            continue
+        if re.fullmatch(r"20\d{2}", normalized):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        tokens.append(token)
+    priority = ["SEO", "GEO", "AI", "Discovery", "Organic", "GMV"]
+    ordered: list[str] = []
+    for preferred in priority:
+        for token in tokens:
+            if token.lower() == preferred.lower() and token not in ordered:
+                ordered.append(token)
+    for token in tokens:
+        if token not in ordered:
+            ordered.append(token)
+    return ordered[:8]
 
 
 def _build_attachment_summary(attachments: list[Attachment]) -> str:
