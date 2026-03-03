@@ -1,0 +1,1485 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Manager Document Agent</title>
+  <style>
+    :root {
+      --bg: #eef2f7;
+      --panel: #ffffff;
+      --ink: #142437;
+      --muted: #60758b;
+      --line: #cfdae6;
+      --accent: #0f6fb8;
+      --accent-soft: #e4f0fb;
+      --warn: #9c5f16;
+      --ok: #1e7a44;
+      --surface: #f9fbfe;
+      --shadow: 0 18px 46px rgba(13, 38, 76, 0.12);
+    }
+    body[data-theme="dark"] {
+      --bg: #090c12;
+      --panel: #0f1621;
+      --ink: #e8efff;
+      --muted: #95a7be;
+      --line: #1e2b3d;
+      --accent: #3ea3f2;
+      --accent-soft: #0f253b;
+      --warn: #ffbe6d;
+      --ok: #5ad78d;
+      --surface: #121b29;
+      --shadow: 0 18px 42px rgba(0, 0, 0, 0.42);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top right, rgba(84, 145, 211, 0.22), transparent 42%),
+        radial-gradient(circle at 10% 120%, rgba(15, 111, 184, 0.14), transparent 35%),
+        var(--bg);
+    }
+    header {
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 88%, transparent);
+      backdrop-filter: blur(8px);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    .header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    h1 { margin: 0; font-size: 20px; letter-spacing: 0.2px; }
+    .layout {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      min-height: calc(100vh - 65px);
+    }
+    nav {
+      border-right: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 72%, var(--surface));
+      padding: 16px;
+    }
+    .tab {
+      width: 100%;
+      text-align: left;
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 80%, var(--surface));
+      color: var(--ink);
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      transition: transform 0.14s ease, border-color 0.14s ease, background 0.14s ease;
+    }
+    .tab:hover {
+      transform: translateY(-1px);
+    }
+    .tab.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 600;
+      background: var(--accent-soft);
+    }
+    main { padding: 20px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow);
+    }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    input, select, textarea, button {
+      font: inherit;
+    }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      background: var(--surface);
+      color: var(--ink);
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
+      border-color: var(--accent);
+    }
+    textarea { min-height: 120px; resize: vertical; }
+    .editor textarea { min-height: 360px; }
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    button {
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 82%, var(--surface));
+      color: var(--ink);
+      border-radius: 10px;
+      padding: 8px 12px;
+      cursor: pointer;
+      transition: transform 0.14s ease, border-color 0.14s ease, background 0.14s ease;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+    }
+    button:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .badge {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 11px;
+      border: 1px solid var(--line);
+      margin-left: 8px;
+    }
+    .status-IN_PROGRESS { color: var(--warn); border-color: #efccad; background: #fff2e5; }
+    .status-FINALIZED { color: var(--ok); border-color: #b8e0c5; background: #eaf8ef; }
+    .status-ARCHIVED { color: #405366; border-color: #cad7e3; background: #eef3f8; }
+    .list-item {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      margin-bottom: 8px;
+      background: color-mix(in srgb, var(--panel) 84%, var(--surface));
+      cursor: pointer;
+      transition: transform 0.14s ease, border-color 0.14s ease;
+    }
+    .list-item:hover {
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+    }
+    .muted { color: var(--muted); font-size: 12px; }
+    .hidden { display: none; }
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 12px;
+    }
+    ul.clean {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      max-height: 300px;
+      overflow: auto;
+    }
+    ul.clean li {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 0;
+      font-size: 13px;
+    }
+    .note { font-size: 12px; color: var(--muted); }
+    .chat-history {
+      border: 1px solid var(--line);
+      background: color-mix(in srgb, var(--surface) 74%, var(--panel));
+      border-radius: 12px;
+      padding: 10px;
+      max-height: 320px;
+      overflow: auto;
+      margin-bottom: 8px;
+    }
+    .chat-msg {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 8px 10px;
+      margin-bottom: 8px;
+      background: color-mix(in srgb, var(--panel) 85%, var(--surface));
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .chat-msg.assistant {
+      border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+      background: color-mix(in srgb, var(--accent-soft) 72%, var(--panel));
+    }
+    .chat-msg.user {
+      border-color: color-mix(in srgb, var(--line) 85%, var(--accent));
+      background: color-mix(in srgb, var(--panel) 90%, var(--surface));
+    }
+    .planning-panel {
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+      background: linear-gradient(
+        145deg,
+        color-mix(in srgb, var(--accent-soft) 70%, var(--panel)),
+        color-mix(in srgb, var(--panel) 88%, var(--surface))
+      );
+    }
+    .theme-toggle {
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+      min-width: 140px;
+    }
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { border-right: 0; border-bottom: 1px solid var(--line); }
+      .split { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-row">
+      <h1>Manager Document Agent POC</h1>
+      <button id="theme-toggle-btn" class="theme-toggle">Black Mode: Off</button>
+    </div>
+  </header>
+  <div class="layout">
+    <nav>
+      <button class="tab active" data-tab="create">Create New</button>
+      <button class="tab" data-tab="documents">Documents</button>
+      <button class="tab" data-tab="last-opened">Last Opened</button>
+      <button class="tab" data-tab="archive">Archive</button>
+    </nav>
+    <main>
+      <section id="tab-create" class="panel">
+        <h2>Create New Document</h2>
+        <div class="panel planning-panel">
+          <h3 style="margin-top:0;">Planning Chat (Start Here)</h3>
+          <div class="note" id="planning-status-note">
+            Rozpocznij chat. Po zatwierdzeniu punktów będzie można utworzyć dokument.
+          </div>
+          <div class="actions" style="margin:8px 0;">
+            <button id="planning-start-btn">Restart Planning Chat</button>
+            <button id="planning-refresh-btn">Refresh Session</button>
+          </div>
+          <div id="planning-chat-history" class="chat-history"></div>
+          <div class="row" style="grid-template-columns: 1fr auto;">
+            <div>
+              <label>Planning message</label>
+              <input id="planning-message-input" placeholder="Napisz, co powinno być w dokumencie..." />
+            </div>
+            <div class="actions" style="align-items:end;">
+              <button id="planning-send-btn">Send</button>
+            </div>
+          </div>
+          <label>Suggested points to approve</label>
+          <ul id="planning-suggested-list" class="clean"></ul>
+          <div class="actions" style="margin-top:6px;">
+            <button id="planning-approve-btn">Approve Suggested Points</button>
+          </div>
+        </div>
+
+        <div class="row">
+          <div><label>Title</label><input id="create-title" /></div>
+          <div><label>Type</label><input id="create-type" value="MANAGEMENT_BRIEF" /></div>
+          <div><label>Audience</label><input id="create-audience" value="Management" /></div>
+          <div><label>Language</label><input id="create-language" value="pl" /></div>
+          <div><label>Objective</label><input id="create-objective" /></div>
+          <div><label>Tone</label><input id="create-tone" value="formal" /></div>
+        </div>
+        <label>Constraints</label>
+        <textarea id="create-constraints"></textarea>
+        <label>Initial Content</label>
+        <textarea id="create-content"></textarea>
+        <label>Attachments From Disk</label>
+        <input id="create-files" type="file" multiple />
+        <h3>Google Drive (Alternative to Disk Upload)</h3>
+        <div class="row">
+          <div>
+            <label>OAuth Client ID (optional)</label>
+            <input id="create-drive-client-id" placeholder="...apps.googleusercontent.com" />
+          </div>
+          <div>
+            <label>OAuth Client Secret (optional)</label>
+            <input id="create-drive-client-secret" type="password" />
+          </div>
+          <div>
+            <label>Drive Folder Name</label>
+            <input id="create-drive-folder-name" value="Manager Documents" />
+          </div>
+          <div>
+            <label>Drive Folder ID (optional)</label>
+            <input id="create-drive-folder-id" />
+          </div>
+        </div>
+        <div class="actions" style="margin-top:4px;">
+          <button id="create-quick-connect-drive-btn">Quick Connect Google Drive</button>
+          <button id="create-verify-drive-btn">Verify Drive Connection</button>
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <div>
+            <label>Drive File URL or ID</label>
+            <input id="create-drive-file-ref" placeholder="https://drive.google.com/file/d/... or file ID" />
+          </div>
+          <div class="actions" style="align-items:end;">
+            <button id="create-add-drive-file-btn">Add Drive File</button>
+            <button id="create-browse-drive-files-btn">Browse Drive Files</button>
+          </div>
+        </div>
+        <div id="create-drive-picker-panel" class="panel hidden" style="margin-top:10px;">
+          <h4 style="margin:0 0 8px 0;">Google Drive File Picker</h4>
+          <div class="row">
+            <div>
+              <label>Search file name</label>
+              <input id="create-drive-picker-query" placeholder="e.g. outlook 2026" />
+            </div>
+            <div class="actions" style="align-items:end;">
+              <button id="create-drive-picker-search-btn">Search</button>
+              <button id="create-drive-picker-close-btn">Close</button>
+            </div>
+          </div>
+          <ul id="create-drive-picker-list" class="clean"></ul>
+          <div id="create-drive-picker-note" class="note"></div>
+        </div>
+        <ul id="create-drive-files-list" class="clean"></ul>
+        <h3>Web Research (DuckDuckGo + Playwright Stealth)</h3>
+        <div class="row" style="margin-top:10px;">
+          <div>
+            <label>Research Query</label>
+            <input id="create-web-query" placeholder="SEO GEO Allegro 2026 priorities" />
+          </div>
+          <div class="actions" style="align-items:end;">
+            <button id="create-add-web-query-btn">Add Web Query</button>
+          </div>
+        </div>
+        <ul id="create-web-queries-list" class="clean"></ul>
+        <div class="actions" style="margin-top:10px;">
+          <button class="primary" id="create-document-btn">Create Document</button>
+        </div>
+        <div class="note" id="create-progress-note"></div>
+      </section>
+
+      <section id="tab-documents" class="panel hidden">
+        <h2>Documents</h2>
+        <div class="row">
+          <div>
+            <label>Status Filter</label>
+            <select id="documents-status-filter">
+              <option value="">All</option>
+              <option value="IN_PROGRESS">IN_PROGRESS</option>
+              <option value="FINALIZED">FINALIZED</option>
+              <option value="ARCHIVED">ARCHIVED</option>
+            </select>
+          </div>
+          <div class="actions" style="align-items:end;">
+            <button id="refresh-documents-btn">Refresh</button>
+          </div>
+        </div>
+        <div id="documents-list"></div>
+      </section>
+
+      <section id="tab-last-opened" class="panel hidden">
+        <h2>Last Opened</h2>
+        <div id="last-opened-content" class="muted">No data yet.</div>
+      </section>
+
+      <section id="tab-archive" class="panel hidden">
+        <h2>Archive</h2>
+        <div id="archive-list"></div>
+      </section>
+
+      <section id="editor-panel" class="panel hidden editor">
+        <h2>
+          <span id="editor-title">Document</span>
+          <span id="editor-status" class="badge"></span>
+        </h2>
+        <div class="split">
+          <div>
+            <label>Content</label>
+            <textarea id="editor-content"></textarea>
+            <div class="note">Autosave every 5s for IN_PROGRESS documents.</div>
+            <div class="actions" style="margin-top:10px;">
+              <button id="save-btn">Save</button>
+              <button id="finalize-btn">Finalize</button>
+              <button id="outline-btn">Generate Outline</button>
+              <button id="export-docx-btn">Export DOCX</button>
+              <button id="export-drive-btn">Export Drive</button>
+            </div>
+            <div class="row" style="margin-top:10px;">
+              <div>
+                <label>AI Prompt (full document edit)</label>
+                <textarea id="ai-full-prompt"></textarea>
+                <button id="ai-full-btn">Apply AI Full Edit</button>
+              </div>
+              <div>
+                <label>AI Prompt (selected fragment)</label>
+                <textarea id="ai-selection-prompt"></textarea>
+                <button id="ai-selection-btn">Rewrite Selection</button>
+              </div>
+            </div>
+          </div>
+          <div>
+            <h3>Attachments</h3>
+            <input id="editor-file" type="file" />
+            <button id="upload-attachment-btn">Upload Attachment</button>
+            <label style="margin-top:8px;">Web research query</label>
+            <input id="editor-web-query" placeholder="AI SEO trends Europe 2026" />
+            <button id="run-web-research-btn">Research Web + Attach</button>
+            <ul id="attachments-list" class="clean"></ul>
+            <h3>Google Drive Settings</h3>
+            <label>Folder Name</label>
+            <input id="drive-folder-name" value="Manager Documents" />
+            <label>Folder ID (optional)</label>
+            <input id="drive-folder-id" />
+            <button id="quick-connect-drive-btn">Quick Connect Google Drive</button>
+            <button id="verify-drive-connection-btn">Verify Drive Connection</button>
+            <h3>Export History</h3>
+            <ul id="exports-list" class="clean"></ul>
+            <h3>Revision Timeline</h3>
+            <ul id="revisions-list" class="clean"></ul>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const THEME_STORAGE_KEY = 'manager-document-agent-theme';
+    const tabs = document.querySelectorAll('.tab');
+    const tabPanels = {
+      'create': document.getElementById('tab-create'),
+      'documents': document.getElementById('tab-documents'),
+      'last-opened': document.getElementById('tab-last-opened'),
+      'archive': document.getElementById('tab-archive'),
+    };
+
+    let currentDocument = null;
+    let editorDirty = false;
+    let pendingCreateDriveFiles = [];
+    let pendingCreateWebQueries = [];
+    let availableDriveFiles = [];
+    let planningSession = null;
+    let isCreatingDocument = false;
+
+    const editorPanel = document.getElementById('editor-panel');
+    const editorContent = document.getElementById('editor-content');
+
+    tabs.forEach((button) => {
+      button.addEventListener('click', () => activateTab(button.dataset.tab));
+    });
+
+    function formatApiErrorDetail(detail) {
+      if (Array.isArray(detail)) {
+        const lines = detail.map((entry) => {
+          const loc = Array.isArray(entry?.loc) ? entry.loc.filter((part) => part !== 'body') : [];
+          const field = loc.length ? loc.join('.') : 'unknown field';
+          const msg = String(entry?.msg || 'validation error').trim();
+          return `- ${field}: ${msg}`;
+        });
+        return `Validation error:\\n${lines.join('\\n')}`;
+      }
+      if (detail && typeof detail === 'object') {
+        try {
+          return JSON.stringify(detail);
+        } catch {
+          return String(detail);
+        }
+      }
+      return String(detail || 'Request failed');
+    }
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, options);
+      if (!response.ok) {
+        let detail = 'Request failed';
+        try {
+          const body = await response.json();
+          detail = formatApiErrorDetail(body.detail ?? body);
+        } catch {
+          detail = await response.text();
+        }
+        const error = new Error(detail);
+        error.status = response.status;
+        error.detail = detail;
+        throw error;
+      }
+      return response.status === 204 ? null : response.json();
+    }
+
+    function clearCurrentDocument(message) {
+      currentDocument = null;
+      editorDirty = false;
+      editorPanel.classList.add('hidden');
+      document.getElementById('attachments-list').innerHTML = '';
+      document.getElementById('revisions-list').innerHTML = '';
+      document.getElementById('exports-list').innerHTML = '';
+      if (message) {
+        alert(message);
+      }
+    }
+
+    function applyTheme(theme) {
+      const normalized = theme === 'dark' ? 'dark' : 'light';
+      if (normalized === 'dark') {
+        document.body.setAttribute('data-theme', 'dark');
+      } else {
+        document.body.removeAttribute('data-theme');
+      }
+      const toggle = document.getElementById('theme-toggle-btn');
+      if (toggle) {
+        toggle.textContent = `Black Mode: ${normalized === 'dark' ? 'On' : 'Off'}`;
+      }
+      try {
+        localStorage.setItem(THEME_STORAGE_KEY, normalized);
+      } catch (_) {
+        // ignore storage write errors
+      }
+    }
+
+    function initializeTheme() {
+      let theme = 'light';
+      try {
+        const stored = localStorage.getItem(THEME_STORAGE_KEY);
+        if (stored === 'dark' || stored === 'light') {
+          theme = stored;
+        }
+      } catch (_) {
+        // ignore storage read errors
+      }
+      applyTheme(theme);
+    }
+
+    function toggleTheme() {
+      const current = document.body.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+      applyTheme(current === 'dark' ? 'light' : 'dark');
+    }
+
+    async function handleStaleDocumentError(error) {
+      const status = error && error.status ? Number(error.status) : 0;
+      const message = (error && error.message) ? String(error.message) : '';
+      const isNotFound = status === 404 || message.includes('was not found');
+      if (!isNotFound) return false;
+
+      clearCurrentDocument('Dokument nie istnieje w bieżącej bazie. Odświeżam listę dokumentów.');
+      try {
+        await Promise.all([loadDocuments(), loadArchive(), loadLastOpened()]);
+      } catch (_) {
+        // Best-effort refresh only.
+      }
+      return true;
+    }
+
+    function activateTab(tabName) {
+      tabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.tab === tabName));
+      Object.entries(tabPanels).forEach(([name, panel]) => panel.classList.toggle('hidden', name !== tabName));
+
+      if (tabName === 'documents') loadDocuments();
+      if (tabName === 'last-opened') loadLastOpened();
+      if (tabName === 'archive') loadArchive();
+    }
+
+    function statusBadge(status) {
+      return `<span class="badge status-${status}">${status}</span>`;
+    }
+
+    function setCreateProgress(message) {
+      const note = document.getElementById('create-progress-note');
+      note.textContent = String(message || '').trim();
+    }
+
+    function setCreateDocumentLoading(active) {
+      isCreatingDocument = Boolean(active);
+      const createBtn = document.getElementById('create-document-btn');
+      if (isCreatingDocument) {
+        if (!createBtn.dataset.idleLabel) {
+          createBtn.dataset.idleLabel = createBtn.textContent;
+        }
+        createBtn.textContent = 'Creating...';
+        createBtn.disabled = true;
+      } else {
+        createBtn.textContent = createBtn.dataset.idleLabel || 'Create Document';
+        renderPlanningSession();
+      }
+    }
+
+    function applyPlanningBriefToCreateForm() {
+      if (!planningSession || !planningSession.brief) return;
+      const brief = planningSession.brief;
+      if (brief.title) document.getElementById('create-title').value = brief.title;
+      if (brief.doc_type) document.getElementById('create-type').value = brief.doc_type;
+      if (brief.target_audience) document.getElementById('create-audience').value = brief.target_audience;
+      if (brief.language) document.getElementById('create-language').value = brief.language;
+      if (brief.objective) document.getElementById('create-objective').value = brief.objective;
+      if (brief.tone) document.getElementById('create-tone').value = brief.tone;
+      if (brief.constraints) document.getElementById('create-constraints').value = brief.constraints;
+    }
+
+    function getSelectedPlanningPoints() {
+      const checked = Array.from(document.querySelectorAll('[data-planning-point-checkbox]'))
+        .filter((input) => input.checked)
+        .map((input) => decodeURIComponent(String(input.value || '').trim()))
+        .filter(Boolean);
+      return checked;
+    }
+
+    function renderPlanningSession() {
+      const statusNote = document.getElementById('planning-status-note');
+      const history = document.getElementById('planning-chat-history');
+      const suggested = document.getElementById('planning-suggested-list');
+      const createBtn = document.getElementById('create-document-btn');
+
+      if (!planningSession) {
+        statusNote.textContent = 'Rozpocznij chat. Po zatwierdzeniu punktów będzie można utworzyć dokument.';
+        history.innerHTML = '<div class="muted">No planning session started.</div>';
+        suggested.innerHTML = '<li class="muted">No suggested points yet.</li>';
+        createBtn.disabled = true;
+        return;
+      }
+
+      const ready = planningSession.status === 'APPROVED' || planningSession.status === 'DOCUMENT_CREATED';
+      statusNote.textContent = `Planning status: ${planningSession.status}${ready ? ' (ready to create)' : ''}`;
+      createBtn.disabled = isCreatingDocument || !ready;
+
+      const messages = Array.isArray(planningSession.messages) ? planningSession.messages : [];
+      if (!messages.length) {
+        history.innerHTML = '<div class="muted">No messages.</div>';
+      } else {
+        history.innerHTML = messages.map((msg) => {
+          const role = msg.role === 'user' ? 'user' : 'assistant';
+          return `
+            <div class="chat-msg ${role}">
+              <strong>${role === 'user' ? 'You' : 'Assistant'}</strong>
+              <div>${escapeHtml(msg.content || '')}</div>
+            </div>
+          `;
+        }).join('');
+        history.scrollTop = history.scrollHeight;
+      }
+
+      const points = Array.isArray(planningSession.suggested_points) ? planningSession.suggested_points : [];
+      const approved = new Set(Array.isArray(planningSession.approved_points) ? planningSession.approved_points : []);
+      if (!points.length) {
+        suggested.innerHTML = '<li class="muted">No suggested points yet.</li>';
+      } else {
+        suggested.innerHTML = points.map((point, index) => {
+          const checked = approved.size ? approved.has(point) : true;
+          const encoded = encodeURIComponent(point);
+          return `
+            <li>
+              <label style="display:flex; gap:8px; align-items:flex-start; margin:0;">
+                <input type="checkbox" data-planning-point-checkbox value="${encoded}" ${checked ? 'checked' : ''} />
+                <span>${escapeHtml(point)}</span>
+              </label>
+            </li>
+          `;
+        }).join('');
+      }
+
+      applyPlanningBriefToCreateForm();
+    }
+
+    async function startPlanningSession(options = {}) {
+      const silent = Boolean(options.silent);
+      const payload = {
+        title: document.getElementById('create-title').value.trim(),
+        doc_type: document.getElementById('create-type').value.trim() || 'MANAGEMENT_BRIEF',
+        target_audience: document.getElementById('create-audience').value.trim() || 'Management',
+        language: document.getElementById('create-language').value.trim() || 'pl',
+        objective: document.getElementById('create-objective').value.trim(),
+        tone: document.getElementById('create-tone').value.trim() || 'formal',
+        constraints: document.getElementById('create-constraints').value.trim(),
+      };
+      try {
+        planningSession = await api('/document-planning/sessions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        renderPlanningSession();
+      } catch (error) {
+        if (!silent) {
+          alert(error.message);
+        }
+      }
+    }
+
+    async function ensurePlanningSessionStarted() {
+      if (planningSession && planningSession.id) {
+        return;
+      }
+      const statusNote = document.getElementById('planning-status-note');
+      statusNote.textContent = 'Uruchamiam domyślną sesję planning chat...';
+      await startPlanningSession({ silent: true });
+      if (!planningSession || !planningSession.id) {
+        statusNote.textContent = 'Nie udało się uruchomić planning chat automatycznie. Kliknij Restart Planning Chat.';
+      }
+    }
+
+    async function refreshPlanningSession() {
+      if (!planningSession || !planningSession.id) {
+        alert('Najpierw uruchom planning chat.');
+        return;
+      }
+      try {
+        planningSession = await api(`/document-planning/sessions/${planningSession.id}`);
+        renderPlanningSession();
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    async function sendPlanningMessage() {
+      if (!planningSession || !planningSession.id) {
+        alert('Najpierw uruchom planning chat.');
+        return;
+      }
+      const input = document.getElementById('planning-message-input');
+      const message = input.value.trim();
+      if (!message) {
+        alert('Wpisz wiadomość do planowania dokumentu.');
+        return;
+      }
+      try {
+        planningSession = await api(`/document-planning/sessions/${planningSession.id}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message }),
+        });
+        input.value = '';
+        renderPlanningSession();
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    async function approvePlanningPoints() {
+      if (!planningSession || !planningSession.id) {
+        alert('Najpierw uruchom planning chat.');
+        return;
+      }
+      const approvedPoints = getSelectedPlanningPoints();
+      try {
+        planningSession = await api(`/document-planning/sessions/${planningSession.id}/approve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ approved_points: approvedPoints }),
+        });
+        renderPlanningSession();
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    function renderCreateDriveFiles() {
+      const list = document.getElementById('create-drive-files-list');
+      if (!pendingCreateDriveFiles.length) {
+        list.innerHTML = '<li class="muted">No Google Drive files selected.</li>';
+        return;
+      }
+      list.innerHTML = pendingCreateDriveFiles.map((ref, index) => `
+        <li>
+          <div><strong>${ref}</strong></div>
+          <button data-remove-drive-index="${index}">Remove</button>
+        </li>
+      `).join('');
+      list.querySelectorAll('[data-remove-drive-index]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const index = Number(button.dataset.removeDriveIndex);
+          pendingCreateDriveFiles = pendingCreateDriveFiles.filter((_, i) => i !== index);
+          renderCreateDriveFiles();
+        });
+      });
+    }
+
+    function addCreateDriveFile() {
+      const input = document.getElementById('create-drive-file-ref');
+      const value = input.value.trim();
+      if (!value) {
+        alert('Wpisz URL lub ID pliku z Google Drive.');
+        return;
+      }
+      if (pendingCreateDriveFiles.includes(value)) {
+        alert('Ten plik Google Drive jest już dodany.');
+        return;
+      }
+      pendingCreateDriveFiles.push(value);
+      input.value = '';
+      renderCreateDriveFiles();
+    }
+
+    function renderDrivePickerList() {
+      const list = document.getElementById('create-drive-picker-list');
+      const note = document.getElementById('create-drive-picker-note');
+      if (!availableDriveFiles.length) {
+        list.innerHTML = '<li class="muted">No files found.</li>';
+        note.textContent = 'Tip: Use Search to filter by file name.';
+        return;
+      }
+      note.textContent = '';
+      list.innerHTML = availableDriveFiles.map((file) => `
+        <li>
+          <strong>${file.name || '(untitled)'}</strong>
+          <div class="muted">${file.mime_type} | ${file.modified_time || '-'}</div>
+          <div class="actions" style="margin-top:4px;">
+            <button data-add-drive-file-id="${file.file_id}">Add</button>
+            ${file.web_view_link ? `<a href="${file.web_view_link}" target="_blank" rel="noopener noreferrer">Open</a>` : ''}
+          </div>
+        </li>
+      `).join('');
+      list.querySelectorAll('[data-add-drive-file-id]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const id = button.dataset.addDriveFileId;
+          if (!id) return;
+          if (pendingCreateDriveFiles.includes(id)) {
+            alert('Ten plik jest już dodany.');
+            return;
+          }
+          pendingCreateDriveFiles.push(id);
+          renderCreateDriveFiles();
+        });
+      });
+    }
+
+    async function loadDrivePickerFiles() {
+      const query = document.getElementById('create-drive-picker-query').value.trim();
+      const scope = 'all';
+      const path = `/integrations/google-drive/files?limit=30&scope=${encodeURIComponent(scope)}${query ? `&query=${encodeURIComponent(query)}` : ''}`;
+      const response = await api(path);
+      availableDriveFiles = Array.isArray(response.files) ? response.files : [];
+      renderDrivePickerList();
+    }
+
+    async function openDrivePicker() {
+      document.getElementById('create-drive-picker-panel').classList.remove('hidden');
+      try {
+        await loadDrivePickerFiles();
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    function closeDrivePicker() {
+      document.getElementById('create-drive-picker-panel').classList.add('hidden');
+    }
+
+    function renderCreateWebQueries() {
+      const list = document.getElementById('create-web-queries-list');
+      if (!pendingCreateWebQueries.length) {
+        list.innerHTML = '<li class="muted">No web research queries selected.</li>';
+        return;
+      }
+      list.innerHTML = pendingCreateWebQueries.map((query, index) => `
+        <li>
+          <div><strong>${query}</strong></div>
+          <button data-remove-web-query-index="${index}">Remove</button>
+        </li>
+      `).join('');
+      list.querySelectorAll('[data-remove-web-query-index]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const index = Number(button.dataset.removeWebQueryIndex);
+          pendingCreateWebQueries = pendingCreateWebQueries.filter((_, i) => i !== index);
+          renderCreateWebQueries();
+        });
+      });
+    }
+
+    function addCreateWebQuery() {
+      const input = document.getElementById('create-web-query');
+      const value = input.value.trim();
+      if (!value) {
+        alert('Wpisz zapytanie do web research.');
+        return;
+      }
+      if (pendingCreateWebQueries.includes(value)) {
+        alert('To zapytanie jest już dodane.');
+        return;
+      }
+      pendingCreateWebQueries.push(value);
+      input.value = '';
+      renderCreateWebQueries();
+    }
+
+    async function createDocument() {
+      if (isCreatingDocument) {
+        return;
+      }
+      if (!planningSession || !planningSession.id) {
+        alert('Najpierw uruchom Planning Chat i zbierz wymagania.');
+        return;
+      }
+      if (!(planningSession.status === 'APPROVED' || planningSession.status === 'DOCUMENT_CREATED')) {
+        alert('Najpierw zatwierdź proponowane punkty (Approve Suggested Points).');
+        return;
+      }
+
+      setCreateDocumentLoading(true);
+      setCreateProgress('Creating document draft...');
+
+      try {
+        const planned = await api(`/document-planning/sessions/${planningSession.id}/create-document`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ include_chat_summary: true }),
+        });
+        planningSession = planned.session;
+        const created = planned.document;
+
+        const uploadErrors = [];
+        const files = Array.from(document.getElementById('create-files').files || []);
+        for (let index = 0; index < files.length; index += 1) {
+          const file = files[index];
+          setCreateProgress(`Uploading disk attachments (${index + 1}/${files.length})...`);
+          const formData = new FormData();
+          formData.append('file', file);
+          try {
+            await api(`/documents/${created.id}/attachments`, { method: 'POST', body: formData });
+          } catch (error) {
+            uploadErrors.push(`Disk file '${file.name}': ${error.message}`);
+          }
+        }
+
+        const failedDriveRefs = [];
+        for (let index = 0; index < pendingCreateDriveFiles.length; index += 1) {
+          const fileRef = pendingCreateDriveFiles[index];
+          setCreateProgress(`Importing Google Drive files (${index + 1}/${pendingCreateDriveFiles.length})...`);
+          try {
+            await api(`/documents/${created.id}/attachments/import-drive`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ file_ref: fileRef }),
+            });
+          } catch (error) {
+            failedDriveRefs.push(fileRef);
+            uploadErrors.push(`Drive file '${fileRef}': ${error.message}`);
+          }
+        }
+        pendingCreateDriveFiles = failedDriveRefs;
+        renderCreateDriveFiles();
+
+        const failedWebQueries = [];
+        for (let index = 0; index < pendingCreateWebQueries.length; index += 1) {
+          const query = pendingCreateWebQueries[index];
+          setCreateProgress(`Running web research imports (${index + 1}/${pendingCreateWebQueries.length})...`);
+          try {
+            await api(`/documents/${created.id}/attachments/research-web`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                query,
+                region: 'us-en',
+                max_results: 6,
+                fetch_pages: true,
+                max_pages: 3,
+                page_char_limit: 1600,
+              }),
+            });
+          } catch (error) {
+            failedWebQueries.push(query);
+            uploadErrors.push(`Web query '${query}': ${error.message}`);
+          }
+        }
+        pendingCreateWebQueries = failedWebQueries;
+        renderCreateWebQueries();
+
+        setCreateProgress('Opening created document...');
+        await openDocument(created.id);
+        activateTab('documents');
+        renderPlanningSession();
+        setCreateProgress('Document created successfully.');
+        if (uploadErrors.length) {
+          alert(`Document created, but some attachments failed:\\n${uploadErrors.join('\\n')}`);
+        }
+      } catch (error) {
+        setCreateProgress(`Create failed: ${error.message}`);
+        alert(error.message);
+      } finally {
+        setCreateDocumentLoading(false);
+      }
+    }
+
+    function renderDocumentList(targetId, documents) {
+      const container = document.getElementById(targetId);
+      if (!documents.length) {
+        container.innerHTML = '<div class="muted">No documents.</div>';
+        return;
+      }
+      const withActions = targetId === 'documents-list';
+      container.innerHTML = documents.map((doc) => `
+        <div class="list-item" data-id="${doc.id}">
+          <div><strong>${doc.title}</strong> ${statusBadge(doc.status)}</div>
+          <div class="muted">${doc.doc_type} | ${doc.target_audience} | updated: ${doc.updated_at}</div>
+          ${withActions ? `
+            <div class="actions" style="margin-top:8px;">
+              ${doc.status !== 'ARCHIVED' ? `<button data-doc-action="archive" data-id="${doc.id}">Archive</button>` : ''}
+              <button data-doc-action="delete" data-id="${doc.id}">Delete</button>
+            </div>
+          ` : ''}
+        </div>
+      `).join('');
+      container.querySelectorAll('.list-item').forEach((item) => {
+        item.addEventListener('click', () => openDocument(item.dataset.id));
+      });
+      if (withActions) {
+        container.querySelectorAll('[data-doc-action]').forEach((button) => {
+          button.addEventListener('click', async (event) => {
+            event.stopPropagation();
+            const documentId = String(button.dataset.id || '').trim();
+            const action = String(button.dataset.docAction || '').trim();
+            if (!documentId || !action) return;
+            if (action === 'archive') {
+              await archiveDocumentFromList(documentId);
+              return;
+            }
+            if (action === 'delete') {
+              await deleteDocumentFromList(documentId);
+            }
+          });
+        });
+      }
+    }
+
+    async function archiveDocumentFromList(documentId) {
+      if (!confirm('Archive this document? It will become read-only and move to Archive view.')) return;
+      try {
+        const archived = await api(`/documents/${documentId}/archive`, { method: 'POST' });
+        if (currentDocument && currentDocument.id === documentId) {
+          currentDocument = archived;
+          const statusEl = document.getElementById('editor-status');
+          statusEl.textContent = archived.status;
+          statusEl.className = `badge status-${archived.status}`;
+        }
+        await Promise.all([loadDocuments(), loadArchive(), loadLastOpened()]);
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function deleteDocumentFromList(documentId) {
+      if (!confirm('Delete this document permanently? This action cannot be undone.')) return;
+      try {
+        await api(`/documents/${documentId}`, { method: 'DELETE' });
+        if (currentDocument && currentDocument.id === documentId) {
+          clearCurrentDocument('Document deleted.');
+        }
+        await Promise.all([loadDocuments(), loadArchive(), loadLastOpened()]);
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function loadDocuments() {
+      const status = document.getElementById('documents-status-filter').value;
+      const query = status ? `?status=${encodeURIComponent(status)}` : '';
+      const documents = await api(`/documents${query}`);
+      renderDocumentList('documents-list', documents);
+    }
+
+    async function loadArchive() {
+      const archived = await api('/documents/archive');
+      renderDocumentList('archive-list', archived);
+    }
+
+    async function loadLastOpened() {
+      const data = await api('/documents/last-opened');
+      const container = document.getElementById('last-opened-content');
+      if (!data) {
+        container.innerHTML = '<div class="muted">No last opened document found.</div>';
+        return;
+      }
+      container.innerHTML = `
+        <div class="list-item" data-id="${data.id}">
+          <div><strong>${data.title}</strong> ${statusBadge(data.status)}</div>
+          <div class="muted">${data.doc_type} | last opened: ${data.last_opened_at}</div>
+        </div>
+      `;
+      container.querySelector('.list-item').addEventListener('click', () => openDocument(data.id));
+    }
+
+    async function openDocument(documentId) {
+      try {
+        currentDocument = await api(`/documents/${documentId}`);
+        document.getElementById('editor-title').textContent = currentDocument.title;
+        const statusEl = document.getElementById('editor-status');
+        statusEl.textContent = currentDocument.status;
+        statusEl.className = `badge status-${currentDocument.status}`;
+        editorContent.value = currentDocument.current_content;
+        editorDirty = false;
+        editorPanel.classList.remove('hidden');
+        await Promise.all([loadRevisions(), loadAttachments(), loadExports(), loadDriveSettings(), loadDocuments()]);
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function saveDocument() {
+      if (!currentDocument || currentDocument.status !== 'IN_PROGRESS') return;
+      const payload = { current_content: editorContent.value, change_type: 'MANUAL' };
+      try {
+        const updated = await api(`/documents/${currentDocument.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        currentDocument = updated;
+        editorDirty = false;
+        await Promise.all([loadRevisions(), loadDocuments()]);
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        throw error;
+      }
+    }
+
+    async function finalizeDocument() {
+      if (!currentDocument) return;
+      try {
+        const finalized = await api(`/documents/${currentDocument.id}/finalize`, { method: 'POST' });
+        currentDocument = finalized;
+        document.getElementById('editor-status').textContent = finalized.status;
+        document.getElementById('editor-status').className = `badge status-${finalized.status}`;
+        await loadDocuments();
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function generateOutline() {
+      if (!currentDocument) return;
+      const instructions = document.getElementById('ai-full-prompt').value;
+      try {
+        const updated = await api(`/documents/${currentDocument.id}/outline`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ instructions }),
+        });
+        currentDocument = updated;
+        editorContent.value = updated.current_content;
+        await loadRevisions();
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    async function applyAIFullEdit() {
+      if (!currentDocument) return;
+      const prompt = document.getElementById('ai-full-prompt').value;
+      if (!prompt.trim()) {
+        alert('Wpisz prompt do pełnej edycji AI.');
+        return;
+      }
+      try {
+        const updated = await api(`/documents/${currentDocument.id}/rewrite`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt }),
+        });
+        currentDocument = updated;
+        editorContent.value = updated.current_content;
+        await loadRevisions();
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function applyAISelectionEdit() {
+      if (!currentDocument) return;
+      const prompt = document.getElementById('ai-selection-prompt').value;
+      const selectionStart = editorContent.selectionStart;
+      const selectionEnd = editorContent.selectionEnd;
+      if (!prompt.trim()) {
+        alert('Wpisz prompt do edycji zaznaczonego fragmentu.');
+        return;
+      }
+      if (selectionEnd <= selectionStart) {
+        alert('Zaznacz fragment tekstu do edycji.');
+        return;
+      }
+      try {
+        const updated = await api(`/documents/${currentDocument.id}/rewrite-selection`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            selection_start: selectionStart,
+            selection_end: selectionEnd,
+            prompt,
+          }),
+        });
+        currentDocument = updated;
+        editorContent.value = updated.current_content;
+        await loadRevisions();
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function uploadAttachment() {
+      if (!currentDocument) return;
+      const input = document.getElementById('editor-file');
+      if (!input.files.length) return;
+
+      const formData = new FormData();
+      formData.append('file', input.files[0]);
+      try {
+        await api(`/documents/${currentDocument.id}/attachments`, {
+          method: 'POST',
+          body: formData,
+        });
+        input.value = '';
+        await loadAttachments();
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function runWebResearchAttachment() {
+      if (!currentDocument) return;
+      const query = document.getElementById('editor-web-query').value.trim();
+      if (!query) {
+        alert('Wpisz zapytanie do researchu.');
+        return;
+      }
+      try {
+        await api(`/documents/${currentDocument.id}/attachments/research-web`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query,
+            region: 'us-en',
+            max_results: 6,
+            fetch_pages: true,
+            max_pages: 3,
+            page_char_limit: 1800,
+          }),
+        });
+        document.getElementById('editor-web-query').value = '';
+        await loadAttachments();
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function loadDriveSettings(options = {}) {
+      const silent = Boolean(options.silent);
+      try {
+        const settings = await api('/integrations/google-drive');
+        if (!settings) return;
+        const config = settings.config || {};
+        document.getElementById('drive-folder-name').value = config.folder_name || 'Manager Documents';
+        document.getElementById('drive-folder-id').value = config.folder_id || '';
+        document.getElementById('create-drive-folder-name').value = config.folder_name || 'Manager Documents';
+        document.getElementById('create-drive-folder-id').value = config.folder_id || '';
+      } catch (error) {
+        if (!silent) {
+          alert(error.message);
+        }
+      }
+    }
+
+    async function quickConnectDrive() {
+      const createFolderName = document.getElementById('create-drive-folder-name').value;
+      const createFolderId = document.getElementById('create-drive-folder-id').value;
+      const createClientId = document.getElementById('create-drive-client-id').value;
+      const createClientSecret = document.getElementById('create-drive-client-secret').value;
+      const payload = {
+        folder_name: document.getElementById('drive-folder-name').value || createFolderName || 'Manager Documents',
+        folder_id: document.getElementById('drive-folder-id').value || createFolderId || '',
+        client_id: createClientId || '',
+        client_secret: createClientSecret || '',
+      };
+      try {
+        const started = await api('/integrations/google-drive/quick-connect/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        window.open(started.authorization_url, '_blank', 'noopener,noreferrer,width=900,height=800');
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    async function verifyDriveConnection() {
+      try {
+        const verification = await api('/integrations/google-drive/quick-connect/verify', {
+          method: 'POST',
+        });
+        alert(`Drive OK. Folder: ${verification.folder_name} (${verification.folder_id})`);
+      } catch (error) {
+        alert(error.message);
+      }
+    }
+
+    async function exportDocx() {
+      if (!currentDocument) return;
+      try {
+        await api(`/documents/${currentDocument.id}/export/docx`, { method: 'POST' });
+        await loadExports();
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function exportDrive() {
+      if (!currentDocument) return;
+      try {
+        const exported = await api(`/documents/${currentDocument.id}/export/drive`, { method: 'POST' });
+        await loadExports();
+        const link = exported && exported.external_url ? String(exported.external_url).trim() : '';
+        if (link) {
+          const openNow = confirm(`Dokument został wyeksportowany na Google Drive.\\n\\nOtworzyć teraz?\\n${link}`);
+          if (openNow) {
+            window.open(link, '_blank', 'noopener,noreferrer');
+          }
+        } else {
+          alert('Dokument został wyeksportowany na Google Drive.');
+        }
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        alert(error.message);
+      }
+    }
+
+    async function loadExports() {
+      if (!currentDocument) return;
+      try {
+        const exports = await api(`/documents/${currentDocument.id}/exports`);
+        const list = document.getElementById('exports-list');
+        list.innerHTML = exports.map((exp) => `
+          <li>
+            <strong>${exp.export_type}</strong> ${exp.status}
+            <div class="muted">${exp.created_at}</div>
+            <div class="muted">${exp.external_url || exp.file_path || ''}</div>
+            <div class="muted">${exp.error_message || ''}</div>
+          </li>
+        `).join('');
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        throw error;
+      }
+    }
+
+    async function loadRevisions() {
+      if (!currentDocument) return;
+      try {
+        const revisions = await api(`/documents/${currentDocument.id}/revisions`);
+        const list = document.getElementById('revisions-list');
+        list.innerHTML = revisions.slice().reverse().map((rev) => `
+          <li>
+            <strong>#${rev.revision_no}</strong> ${rev.change_type}
+            <div class="muted">${rev.created_at}</div>
+            <div class="muted">${rev.prompt || ''}</div>
+          </li>
+        `).join('');
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        throw error;
+      }
+    }
+
+    async function loadAttachments() {
+      if (!currentDocument) return;
+      try {
+        const attachments = await api(`/documents/${currentDocument.id}/attachments`);
+        const list = document.getElementById('attachments-list');
+        list.innerHTML = attachments.map((att) => `
+          <li>
+            <strong>${att.filename}</strong>
+            <div class="muted">${att.extraction_status}</div>
+            <div class="muted">${att.extraction_error || 'Extraction OK'}</div>
+          </li>
+        `).join('');
+      } catch (error) {
+        const handled = await handleStaleDocumentError(error);
+        if (handled) return;
+        throw error;
+      }
+    }
+
+    document.getElementById('planning-start-btn').addEventListener('click', startPlanningSession);
+    document.getElementById('planning-refresh-btn').addEventListener('click', refreshPlanningSession);
+    document.getElementById('planning-send-btn').addEventListener('click', sendPlanningMessage);
+    document.getElementById('planning-approve-btn').addEventListener('click', approvePlanningPoints);
+    document.getElementById('planning-message-input').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        sendPlanningMessage();
+      }
+    });
+    document.getElementById('create-document-btn').addEventListener('click', createDocument);
+    document.getElementById('create-add-drive-file-btn').addEventListener('click', addCreateDriveFile);
+    document.getElementById('create-browse-drive-files-btn').addEventListener('click', openDrivePicker);
+    document.getElementById('create-drive-picker-search-btn').addEventListener('click', () => loadDrivePickerFiles().catch((e) => alert(e.message)));
+    document.getElementById('create-drive-picker-close-btn').addEventListener('click', closeDrivePicker);
+    document.getElementById('create-add-web-query-btn').addEventListener('click', addCreateWebQuery);
+    document.getElementById('create-quick-connect-drive-btn').addEventListener('click', quickConnectDrive);
+    document.getElementById('create-verify-drive-btn').addEventListener('click', verifyDriveConnection);
+    document.getElementById('refresh-documents-btn').addEventListener('click', loadDocuments);
+    document.getElementById('save-btn').addEventListener('click', () => saveDocument().catch((e) => alert(e.message)));
+    document.getElementById('finalize-btn').addEventListener('click', finalizeDocument);
+    document.getElementById('outline-btn').addEventListener('click', generateOutline);
+    document.getElementById('export-docx-btn').addEventListener('click', exportDocx);
+    document.getElementById('export-drive-btn').addEventListener('click', exportDrive);
+    document.getElementById('ai-full-btn').addEventListener('click', applyAIFullEdit);
+    document.getElementById('ai-selection-btn').addEventListener('click', applyAISelectionEdit);
+    document.getElementById('upload-attachment-btn').addEventListener('click', uploadAttachment);
+    document.getElementById('run-web-research-btn').addEventListener('click', runWebResearchAttachment);
+    document.getElementById('quick-connect-drive-btn').addEventListener('click', quickConnectDrive);
+    document.getElementById('verify-drive-connection-btn').addEventListener('click', verifyDriveConnection);
+    document.getElementById('documents-status-filter').addEventListener('change', loadDocuments);
+    document.getElementById('theme-toggle-btn').addEventListener('click', toggleTheme);
+
+    editorContent.addEventListener('input', () => {
+      editorDirty = true;
+    });
+
+    setInterval(() => {
+      if (!editorDirty || !currentDocument || currentDocument.status !== 'IN_PROGRESS') return;
+      saveDocument().catch((error) => alert(error.message));
+    }, 5000);
+
+    renderCreateDriveFiles();
+    renderCreateWebQueries();
+    renderPlanningSession();
+    initializeTheme();
+    loadDriveSettings({ silent: true });
+    ensurePlanningSessionStarted();
+    activateTab('create');
+  </script>
+</body>
+</html>

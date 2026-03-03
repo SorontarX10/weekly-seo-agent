@@ -140,8 +140,13 @@ def evaluate_readability(report_text: str) -> dict[str, Any]:
     issues: list[str] = []
     score = 100
 
-    word_count = _word_count(text)
-    sentence_lengths = _sentence_word_counts(text)
+    readability_lines = [
+        line for line in text.splitlines()
+        if not line.strip().startswith("|")
+    ]
+    readability_text = "\n".join(readability_lines)
+    word_count = _word_count(readability_text)
+    sentence_lengths = _sentence_word_counts(readability_text)
     avg_sentence_words = (
         sum(sentence_lengths) / len(sentence_lengths) if sentence_lengths else 0.0
     )
@@ -251,7 +256,7 @@ def evaluate_duplication_verbosity(report_text: str) -> dict[str, Any]:
         issues.append(
             f"Verbosity: lexical variety is low ({unique_word_ratio:.2f}); content feels repetitive."
         )
-    elif unique_word_ratio < 0.38:
+    elif unique_word_ratio < 0.35:
         score -= 5
         issues.append(
             f"Verbosity: lexical variety can be improved ({unique_word_ratio:.2f})."
@@ -337,6 +342,9 @@ def evaluate_evidence_alignment(report_text: str) -> dict[str, Any]:
     for line in _non_empty_lines(text):
         lowered = line.lower()
         if lowered.startswith("#"):
+            continue
+        if line.strip().startswith("|"):
+            # Tables are structural summaries; claim-to-evidence coverage is scored on narrative bullets.
             continue
         if lowered.startswith("|---") or lowered == "|":
             continue

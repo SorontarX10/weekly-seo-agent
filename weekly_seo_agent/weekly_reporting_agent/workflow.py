@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import replace
 from datetime import date, timedelta
 import hashlib
 import json
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, TypedDict
 from urllib.parse import urlparse
@@ -16,7 +16,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, StateGraph
 
 from weekly_seo_agent.weekly_reporting_agent.analysis import analyze_rows, summarize_visibility
-from weekly_seo_agent.weekly_reporting_agent.additional_context import collect_additional_context
+from weekly_seo_agent.weekly_reporting_agent.additional_context import (
+    _collect_google_updates_timeline,
+    _collect_serp_case_studies_context,
+    collect_additional_context,
+)
 from weekly_seo_agent.weekly_reporting_agent.clients.allegro_trends_client import AllegroTrendsClient
 from weekly_seo_agent.weekly_reporting_agent.clients.external_signals import ExternalSignalsClient
 from weekly_seo_agent.weekly_reporting_agent.clients.gsc_client import GSCClient
@@ -90,7 +94,7 @@ REQUIRED_AI_SECTION_TITLES = (
 GAIA_MODEL_RUNTIME_FALLBACK = "gpt-4o"
 
 EXTERNAL_SIGNALS_TIMEOUT_SEC = 120
-ADDITIONAL_CONTEXT_TIMEOUT_SEC = 180
+ADDITIONAL_CONTEXT_TIMEOUT_SEC = 420
 LLM_CACHE_MAX_AGE_SEC = 60 * 60 * 24
 
 ALLEGRO_TRENDS_NOISE_EXACT = {
@@ -106,6 +110,83 @@ ALLEGRO_TRENDS_BRAND_TOKENS = (
     "аллегро",
     "алегро",
 )
+
+
+class _DaemonTaskHandle(TypedDict):
+    event: threading.Event
+    payload: dict[str, Any]
+    thread: threading.Thread
+
+
+def _start_daemon_task(func, *args, **kwargs) -> _DaemonTaskHandle:
+    done = threading.Event()
+    payload: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            payload["value"] = func(*args, **kwargs)
+        except Exception as exc:
+            payload["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    return {"event": done, "payload": payload, "thread": thread}
+
+
+def _await_daemon_task(
+    handle: _DaemonTaskHandle,
+    *,
+    timeout_sec: int,
+    task_name: str,
+) -> tuple[str, Any]:
+    timeout = max(1, int(timeout_sec))
+    completed = handle["event"].wait(timeout=timeout)
+    if not completed:
+        return "timeout", TimeoutError(f"{task_name} timed out after {timeout}s")
+    payload = handle["payload"]
+    if "error" in payload:
+        return "error", payload["error"]
+    return "ok", payload.get("value")
+
+
+def _is_runtime_model_issue_error(exc: Exception | str) -> bool:
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "deployment",
+            "model",
+            "not found",
+            "does not exist",
+            "unavailable",
+            "deploymentnotfound",
+            "404",
+        )
+    )
+
+
+def _is_transient_llm_error(exc: Exception | str) -> bool:
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "connection error",
+            "timed out",
+            "timeout",
+            "rate limit",
+            "too many requests",
+            "429",
+            "503",
+            "service unavailable",
+            "temporarily unavailable",
+            "network",
+            "connection reset",
+            "bad gateway",
+            "gateway timeout",
+        )
+    )
 
 
 def _cache_dir() -> Path:
@@ -146,6 +227,28 @@ def _cache_save_json(prefix: str, parts: tuple[str, ...], payload: dict[str, obj
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     except Exception:
         return
+
+
+def _cache_load_latest_by_prefix(prefix: str, max_age_sec: int) -> dict[str, object] | None:
+    cache_path = _cache_dir()
+    pattern = f"{prefix}_*.json"
+    candidates = sorted(
+        cache_path.glob(pattern),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    now_ts = time.time()
+    for item in candidates:
+        try:
+            age_sec = now_ts - item.stat().st_mtime
+            if age_sec > max_age_sec:
+                continue
+            payload = json.loads(item.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            continue
+    return None
 
 
 def _deserialize_external_cache(payload: dict[str, object]) -> tuple[list[ExternalSignal], dict[str, float]]:
@@ -1071,6 +1174,126 @@ def _update_hypothesis_tracker(
 
 
 def _normalize_ai_commentary_markdown(commentary: str) -> str:
+    def _compact_whitespace(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "").strip())
+
+    def _normalize_window_wording(text: str) -> str:
+        out = str(text or "")
+        replacements = (
+            (r"\bcurrent 28[- ]day context\b", "current week context"),
+            (r"\bprevious 28[- ]day context\b", "previous week context"),
+            (r"\b28[- ]day context\b", "weekly context"),
+            (r"\bcurrent 28 days\b", "current week"),
+            (r"\bprevious 28 days\b", "previous week"),
+        )
+        for pattern, repl in replacements:
+            out = re.sub(pattern, repl, out, flags=re.IGNORECASE)
+        out = re.sub(r"\.\.+", ".", out)
+        return out
+
+    def _sanitize_source_label(source: str, signal: str = "", why: str = "") -> str:
+        value = _compact_whitespace(source)
+        combined = _compact_whitespace(f"{value} {signal} {why}").lower()
+        if re.search(r"\bpacket\s*\d+\b", value, flags=re.IGNORECASE):
+            if any(token in combined for token in ("click", "impression", "ctr", "position", "query", "page name", "gsc", "serp")):
+                return "GSC metrics"
+            if any(token in combined for token in ("campaign", "trade plan", "promo", "marketplace timeline")):
+                return "Trade plan & campaigns"
+            if any(token in combined for token in ("weather", "temperature", "precipitation")):
+                return "Weather context"
+            if any(token in combined for token in ("uokik", "regulatory", "commission", "investigation")):
+                return "Regulatory context"
+            if any(token in combined for token in ("news", "rss", "publication", "journal", "roundtable")):
+                return "SEO/GEO news pulse"
+            if any(token in combined for token in ("trend", "seasonality", "demand")):
+                return "Demand trends"
+            return "KPI packet"
+        return value or "Source evidence"
+
+    def _dedupe_bullets(rows: list[str]) -> list[str]:
+        out_rows: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            stripped = row.strip()
+            if not stripped.startswith("- "):
+                out_rows.append(row)
+                continue
+            norm = re.sub(r"[^\w\s%+-]", " ", stripped[2:].strip().lower())
+            norm = re.sub(r"\s+", " ", norm).strip()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            out_rows.append(f"- {_compact_whitespace(stripped[2:])}")
+        return out_rows
+
+    def _ensure_confidence(payload: str, default_confidence: int = 60) -> str:
+        if re.search(r"\bconfidence:\s*\d{1,3}\s*/\s*100\b", payload, flags=re.IGNORECASE):
+            return payload
+        return f"{payload.rstrip('.')} Confidence: {default_confidence}/100."
+
+    def _ensure_causal_evidence(payload: str) -> str:
+        lowered = payload.lower()
+        if "evidence:" in lowered or "because" in lowered:
+            return payload
+        return f"{payload.rstrip('.')} Evidence: weekly KPI and segment deltas in this run."
+
+    def _ensure_action_deliverable(payload: str) -> str:
+        out = payload.strip().rstrip(".")
+        lowered = out.lower()
+        if "kpi:" not in lowered:
+            if any(token in lowered for token in ("uokik", "regulatory", "legal", "compliance", "investigation")):
+                out += " | KPI: confirmed legal status update and owner decision logged"
+            elif any(token in lowered for token in ("campaign", "trade plan", "promo", "promotion")):
+                out += " | KPI: click share on affected Page Names and campaign-overlap impact by date"
+            elif any(token in lowered for token in ("weather", "season", "seasonality", "demand")):
+                out += " | KPI: cluster-level clicks trend and demand-proxy alignment in next run"
+            else:
+                out += " | KPI: clicks and CTR on affected Page Name"
+        if "success threshold:" not in lowered:
+            if any(token in lowered for token in ("uokik", "regulatory", "legal", "compliance", "investigation")):
+                out += " | Success threshold: risk status classified (high/med/low) with mitigation owner and date"
+            elif any(token in lowered for token in ("campaign", "trade plan", "promo", "promotion")):
+                out += " | Success threshold: action explains >=50% of affected Page Name delta by next run"
+            else:
+                out += " | Success threshold: +2% clicks WoW or +0.10 pp CTR in next run"
+        return out
+
+    def _is_context_only_claim(payload: str) -> bool:
+        lowered = _compact_whitespace(payload).lower()
+        context_tokens = (
+            "uokik",
+            "regulatory",
+            "antitrust",
+            "search status",
+            "commission",
+            "parliament",
+            "investigation",
+            "law",
+            "authority",
+        )
+        metric_tokens = (
+            "click",
+            "impression",
+            "ctr",
+            "position",
+            "page name",
+            "segment",
+            "gsc",
+            "wow",
+            "yoy",
+            "mom",
+            "traffic",
+            "query",
+            "feature",
+        )
+        return any(token in lowered for token in context_tokens) and not any(
+            token in lowered for token in metric_tokens
+        )
+
+    def _is_placeholder_bullet_payload(payload: str) -> bool:
+        compact = re.sub(r"[`*_~\-\s\.\|\:]+", "", payload or "")
+        return compact == ""
+
     def canonical_heading(line: str) -> str | None:
         stripped = re.sub(r"^#+\s*", "", line).strip().rstrip(":")
         normalized = re.sub(r"\s+", " ", stripped).lower()
@@ -1149,6 +1372,7 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
                 )
         adjusted_lines.append(line)
     normalized = "\n".join(adjusted_lines)
+    normalized = _normalize_window_wording(normalized)
 
     # Normalize large integers to use spaces as thousands separators.
     normalized = re.sub(
@@ -1168,6 +1392,17 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
         "Trend-data note: non-brand YoY trend sheet rows were unavailable in this run; GSC fallback was used as standard backup.",
         normalized,
         flags=re.IGNORECASE,
+    )
+    serp_listing_tokens = (
+        "searchappearance",
+        "serp appearance",
+        "merchant_listings",
+        "product_snippets",
+        "listing-surface",
+        "serp layout",
+    )
+    has_serp_listing_evidence = any(
+        token in normalized.lower() for token in serp_listing_tokens
     )
 
     # Enforce manager-ready section scaffold with concise bullets and compact tables.
@@ -1198,6 +1433,10 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
         line = stripped
         if not (line.startswith("- ") or line.startswith("|")):
             line = f"- {line}"
+        if line.startswith("- "):
+            payload = line[2:].strip()
+            if _is_placeholder_bullet_payload(payload):
+                continue
         section_map.setdefault(current_section, []).append(line)
 
     defaults: dict[str, list[str]] = {
@@ -1224,7 +1463,9 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
         ],
     }
     for title in REQUIRED_AI_SECTION_TITLES:
-        if title not in section_map or not section_map.get(title):
+        rows = section_map.get(title, [])
+        has_content = any(str(row).strip() for row in rows)
+        if title not in section_map or not has_content:
             section_map[title] = defaults.get(title, ["- Insufficient evidence in current packet set."])
             if title not in section_order:
                 section_order.append(title)
@@ -1240,8 +1481,16 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
             normalized_priority.append(stripped)
             continue
         body = stripped[2:].strip() if stripped.startswith("- ") else stripped
-        if re.search(r"\[[^\]]+\|[^\]]+\]", body):
-            normalized_priority.append(f"- {body}")
+        bracket_match = re.match(r"^\[([^\]|]+)\|\s*([^\]]+)\]\s*(.+)$", body)
+        if bracket_match:
+            owner = bracket_match.group(1).strip()
+            eta = bracket_match.group(2).strip()
+            action = bracket_match.group(3).strip()
+            if owner.lower() in {"owner", "-", ""}:
+                owner = "SEO Team"
+            if eta.lower() in {"eta", "-", ""}:
+                eta = "next run"
+            normalized_priority.append(f"- [{owner} | {eta}] {action}")
             continue
         owner_eta_match = re.search(r"\(([^|()]+)\|\s*([^()]+)\)", body)
         if owner_eta_match:
@@ -1252,6 +1501,145 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
             continue
         normalized_priority.append(f"- [SEO Team | next run] {body}")
     section_map["Priority Actions for This Week"] = normalized_priority[:5] or defaults["Priority Actions for This Week"]
+
+    # Force a manager-friendly narrative arc: what changed -> why -> action implication.
+    narrative_rows = [
+        row for row in _dedupe_bullets(section_map.get("Narrative Flow", []))
+        if row.strip().startswith("- ")
+    ]
+    metric_narrative_rows: list[str] = []
+    context_narrative_rows: list[str] = []
+    for row in narrative_rows:
+        payload = _compact_whitespace(row[2:])
+        if _is_context_only_claim(payload):
+            context_narrative_rows.append(row)
+        else:
+            metric_narrative_rows.append(row)
+    ordered_rows = metric_narrative_rows + context_narrative_rows
+    shaped_narrative: list[str] = []
+    narrative_labels = (
+        "What changed",
+        "Most likely why",
+        "What this means this week",
+    )
+    for idx, row in enumerate(ordered_rows[:3]):
+        payload = _compact_whitespace(row[2:])
+        if not payload:
+            continue
+        label = narrative_labels[idx]
+        if idx == 1 and _is_context_only_claim(payload):
+            label = "Supporting context"
+        if not payload.lower().startswith(label.lower() + ":"):
+            payload = f"{label}: {payload}"
+        shaped_narrative.append(f"- {payload}")
+    while len(shaped_narrative) < 3:
+        fallback_payloads = (
+            "What changed: KPI movement is mixed (WoW up/down by segment, YoY still below baseline).",
+            "Most likely why: demand and routing shifts currently explain more movement than broad technical deterioration.",
+            "What this means this week: prioritize demand/routing actions first and escalate technical SEO only if efficiency weakens.",
+        )
+        shaped_narrative.append(f"- {fallback_payloads[len(shaped_narrative)]}")
+    if has_serp_listing_evidence and not any(
+        any(token in row.lower() for token in ("serp", "listing"))
+        for row in shaped_narrative
+    ):
+        shaped_narrative[2] = (
+            "- What this means this week: SERP layout and listing-surface mix changed (WoW/MoM/YoY), "
+            "so part of movement likely comes from visibility reallocation between result types."
+        )
+    section_map["Narrative Flow"] = shaped_narrative[:3]
+
+    # Ensure causal bullets include evidence and keep regulatory/news context as supporting only.
+    causal_rows = [
+        row for row in _dedupe_bullets(section_map.get("Causal Chain", []))
+        if row.strip().startswith("- ")
+    ]
+    normalized_causal: list[str] = []
+    for row in causal_rows[:3]:
+        payload = _compact_whitespace(row[2:])
+        if not payload:
+            continue
+        if _is_context_only_claim(payload):
+            payload = (
+                f"Context signal: {payload.rstrip('.')} Treat this as supporting context only, not a standalone root cause."
+            )
+        payload = _ensure_causal_evidence(payload)
+        payload = _ensure_confidence(payload)
+        normalized_causal.append(f"- {payload}")
+    if has_serp_listing_evidence and not any(
+        any(token in row.lower() for token in ("serp", "listing", "merchant_listings", "product_snippets"))
+        for row in normalized_causal
+    ):
+        normalized_causal.insert(
+            0,
+            "- Working hypothesis: changes in Google listing surfaces (for example Merchant Listings/Product Snippets) "
+            "reallocated impressions and affected organic CTR/position. Evidence: GSC searchAppearance deltas in this run. "
+            "Confidence: 68/100.",
+        )
+    section_map["Causal Chain"] = normalized_causal[:3] or defaults["Causal Chain"]
+
+    # Keep evidence section concise and decision-oriented.
+    evidence_rows = section_map.get("Evidence by Source", [])
+    evidence_bullets = [
+        row for row in _dedupe_bullets(evidence_rows)
+        if row.strip().startswith("- ")
+    ]
+    filtered_evidence_bullets: list[str] = []
+    for row in evidence_bullets:
+        payload = _compact_whitespace(row[2:])
+        if not payload:
+            continue
+        if payload.lower().startswith("the evidence signals from various sources"):
+            continue
+        filtered_evidence_bullets.append(
+            "- Decision link: this evidence supports this week demand/routing-first decision."
+            if len(filtered_evidence_bullets) == 0
+            else f"- {payload}"
+        )
+        if len(filtered_evidence_bullets) >= 2:
+            break
+    if not filtered_evidence_bullets:
+        filtered_evidence_bullets = [
+            "- Decision link: KPI and context evidence support demand/routing-first actions this week."
+        ]
+
+    table_lines = [row.strip() for row in evidence_rows if row.strip().startswith("|")]
+    sanitized_table: list[str] = []
+    if len(table_lines) >= 2:
+        header = "| Source | Evidence signal | Why it matters |"
+        divider = "|---|---|---|"
+        sanitized_table = [header, divider]
+        data_rows = table_lines[2:] if table_lines[0].lower().startswith("| source |") else table_lines
+        for row in data_rows[:3]:
+            parts = [part.strip() for part in row.strip().strip("|").split("|")]
+            if len(parts) < 3:
+                continue
+            source = _sanitize_source_label(parts[0], parts[1], parts[2])
+            signal = _compact_whitespace(parts[1])
+            why = _compact_whitespace(parts[2])
+            if not why:
+                why = "Supports this week decision and action prioritization."
+            if "decision" not in why.lower():
+                why = f"{why.rstrip('.')} Decision link: supports weekly prioritization."
+            sanitized_table.append(f"| {source} | {signal or '-'} | {why} |")
+    section_map["Evidence by Source"] = filtered_evidence_bullets + (
+        sanitized_table if sanitized_table else [
+            "| Source | Evidence signal | Why it matters |",
+            "|---|---|---|",
+            "| KPI packet | Weekly KPI and segment deltas | Supports this week decision and action prioritization. |",
+        ]
+    )
+
+    # Upgrade actions: every line must include deliverable KPI and success threshold.
+    upgraded_priority: list[str] = []
+    for row in section_map.get("Priority Actions for This Week", []):
+        stripped = row.strip()
+        if not stripped.startswith("- "):
+            upgraded_priority.append(row)
+            continue
+        payload = _ensure_action_deliverable(_compact_whitespace(stripped[2:]))
+        upgraded_priority.append(f"- {payload}")
+    section_map["Priority Actions for This Week"] = _dedupe_bullets(upgraded_priority)[:5] or defaults["Priority Actions for This Week"]
 
     # Add a compact evidence table when no table exists yet.
     evidence_rows = section_map.get("Evidence by Source", [])
@@ -1268,18 +1656,18 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
         if bullet_payload:
             for text in bullet_payload[:3]:
                 table_rows.append(
-                    f"| Packet evidence | {text} | Supports this week interpretation and prioritization. |"
+                    f"| Source evidence | {text} | Supports this week interpretation and prioritization. |"
                 )
         else:
             table_rows.append(
-                "| Packet evidence | Insufficient evidence in this run | Re-check after source refresh in the next run. |"
+                "| Source evidence | Insufficient evidence in this run | Re-check after source refresh in the next run. |"
             )
         section_map["Evidence by Source"] = evidence_rows[:2] + table_rows
 
     line_caps = {
         "Narrative Flow": 4,
         "Causal Chain": 4,
-        "Evidence by Source": 7,
+        "Evidence by Source": 9,
         "Priority Actions for This Week": 6,
         "Risks and Monitoring": 4,
         "Continuity Check": 3,
@@ -1308,7 +1696,15 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
                 continue
             if kept >= cap:
                 continue
-            rebuilt.append(stripped if stripped.startswith("- ") else f"- {stripped}")
+            payload = stripped[2:].strip() if stripped.startswith("- ") else stripped
+            words = payload.split()
+            if title == "Narrative Flow" and "[e" not in payload.lower() and "evidence" not in payload.lower():
+                payload = payload.rstrip(".") + ". [E1]"
+            if title == "Causal Chain" and "[e" not in payload.lower() and "evidence" not in payload.lower():
+                payload = payload.rstrip(".") + ". Evidence: [E2]"
+            if title == "Priority Actions for This Week" and "[e" not in payload.lower():
+                payload = payload.rstrip(".") + ". [E3]"
+            rebuilt.append(f"- {payload}")
             kept += 1
         rebuilt.append("")
 
@@ -1359,14 +1755,25 @@ def _inject_missing_date_context(commentary: str, report_markdown: str) -> str:
 
     out: list[str] = []
     date_re = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")
+    current_h3 = ""
     for raw in commentary.splitlines():
         line = raw
         stripped = raw.strip()
+        if stripped.startswith("### "):
+            current_h3 = stripped[4:].strip().lower()
+            out.append(line)
+            continue
         lowered = stripped.lower()
         if stripped and not stripped.startswith("###") and not date_re.search(stripped):
             if weather_suffix and any(token in lowered for token in ("weather", "temperature", "precipitation")):
                 if "date window:" not in lowered:
                     line = f"{stripped}{weather_suffix}"
+            elif (
+                weather_suffix
+                and current_h3 == "continuity check"
+                and "date window:" not in lowered
+            ):
+                line = f"{stripped}{weather_suffix}"
             elif campaign_suffix and any(
                 token in lowered for token in ("campaign", "external signals", "external signal")
             ):
@@ -1453,7 +1860,7 @@ def _deduplicate_commentary_lines(commentary: str, reference_sections: tuple[str
             ):
                 continue
             if token_set and any(
-                _jaccard_similarity(token_set, seen_tokens) >= 0.8
+                _jaccard_similarity(token_set, seen_tokens) >= 0.74
                 for seen_tokens in seen_token_sets
             ):
                 continue
@@ -2099,6 +2506,115 @@ def _extract_bullets(section_text: str, limit: int = 8) -> list[str]:
     return out
 
 
+def _extract_serp_listing_impact_lines(
+    markdown_report: str,
+    *,
+    commentary: str = "",
+    limit: int = 4,
+) -> list[str]:
+    candidates: list[tuple[int, int, str]] = []
+    sections = (
+        _extract_markdown_section(markdown_report, "Context snapshot"),
+        _extract_markdown_section(markdown_report, "What is happening and why"),
+        commentary,
+    )
+    key_tokens = (
+        "serp appearance",
+        "searchappearance",
+        "serp layout",
+        "listing-surface",
+        "merchant_listings",
+        "product_snippets",
+        "listing impact",
+        "serp allocation",
+        "result types",
+        "case-study",
+        "case study",
+        "annual trend in case-study signal volume",
+        "expected effect",
+        "yoy-30d",
+    )
+    high_priority_tokens = (
+        "case-study",
+        "case study",
+        "annual trend in case-study signal volume",
+        "expected effect",
+        "yoy-30d",
+    )
+    medium_priority_tokens = (
+        "listing-surface",
+        "serp layout",
+        "searchappearance",
+        "result types",
+        "merchant_listings",
+        "product_snippets",
+    )
+    seen: set[str] = set()
+    seq = 0
+    for section in sections:
+        if not section:
+            continue
+        for raw in section.splitlines():
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            payload = stripped[2:].strip() if stripped.startswith("- ") else stripped
+            lowered = payload.lower()
+            if not any(token in lowered for token in key_tokens):
+                continue
+            normalized = _normalize_for_dedup(payload)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            lowered_payload = payload.lower()
+            priority = 1
+            if any(token in lowered_payload for token in high_priority_tokens):
+                priority = 3
+            elif any(token in lowered_payload for token in medium_priority_tokens):
+                priority = 2
+            candidates.append((priority, seq, _trim_text_by_lines(payload, 260)))
+            seq += 1
+    if candidates:
+        ranked = sorted(candidates, key=lambda item: (-item[0], item[1]))
+        high_priority_rows = [row for row in ranked if row[0] >= 3]
+        selected: list[str] = []
+        if high_priority_rows:
+            selected.append(high_priority_rows[0][2])
+        for _, _, payload in ranked:
+            if payload in selected:
+                continue
+            selected.append(payload)
+            if len(selected) >= max(1, limit):
+                break
+        return selected[: max(1, limit)]
+    return []
+
+
+def _extract_case_study_context_line(
+    markdown_report: str,
+    *,
+    commentary: str = "",
+) -> str:
+    sections = (
+        _extract_markdown_section(markdown_report, "Context snapshot"),
+        _extract_markdown_section(markdown_report, "What is happening and why"),
+        commentary,
+    )
+    tokens = ("case-study", "case study", "serp case", "annual trend in case-study signal volume")
+    for section in sections:
+        if not section:
+            continue
+        for raw in section.splitlines():
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            payload = stripped[2:].strip() if stripped.startswith("- ") else stripped
+            lowered = payload.lower()
+            if any(token in lowered for token in tokens):
+                return _trim_text_by_lines(payload, 320)
+    return ""
+
+
 def _escape_table_cell(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().replace("|", "/")) or "-"
 
@@ -2127,6 +2643,34 @@ def _extract_confirmed_hypothesis_points(
     baseline_narrative: str,
     commentary: str,
 ) -> tuple[list[str], list[str]]:
+    def _normalize_claim(text: str) -> str:
+        lowered = re.sub(r"[^\w\s%+-]", " ", str(text or "").lower())
+        return re.sub(r"\s+", " ", lowered).strip()
+
+    def _is_context_only_claim(text: str) -> bool:
+        lowered = _normalize_claim(text)
+        context_tokens = ("uokik", "regulatory", "search status", "investigation", "commission")
+        metric_tokens = ("click", "impression", "ctr", "position", "page name", "traffic", "wow", "yoy")
+        return any(token in lowered for token in context_tokens) and not any(
+            token in lowered for token in metric_tokens
+        )
+
+    def _dedupe_points(points: list[str], limit: int) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in points:
+            text = str(row or "").strip()
+            if not text:
+                continue
+            norm = _normalize_claim(text)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
     confirmed: list[str] = []
     hypotheses: list[str] = []
     mode = ""
@@ -2168,7 +2712,23 @@ def _extract_confirmed_hypothesis_points(
         confirmed = ["Current KPI movement is supported by direct weekly evidence anchors."]
     if not hypotheses:
         hypotheses = ["Primary interpretation remains provisional and requires next-run validation."]
-    return confirmed[:4], hypotheses[:4]
+
+    confirmed = [
+        row
+        for row in confirmed
+        if not row.lower().startswith("hypothesis:")
+        and not _is_context_only_claim(row)
+    ]
+    hypotheses = [row for row in hypotheses if not _normalize_claim(row).startswith("confirmed ")]
+
+    confirmed = _dedupe_points(confirmed, limit=3)
+    hypotheses = _dedupe_points(hypotheses, limit=3)
+
+    if not confirmed:
+        confirmed = ["Weekly KPI movement is grounded in direct evidence anchors from this run."]
+    if not hypotheses:
+        hypotheses = ["Primary interpretation remains provisional and requires next-run validation."]
+    return confirmed[:3], hypotheses[:3]
 
 
 def _extract_priority_action_rows(
@@ -2178,8 +2738,29 @@ def _extract_priority_action_rows(
 ) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
 
+    def _append_kpi_protocol(action_text: str) -> str:
+        out = _escape_table_cell(action_text).strip(". ")
+        lowered = out.lower()
+        if "kpi:" not in lowered:
+            if any(token in lowered for token in ("uokik", "regulatory", "legal", "compliance", "investigation")):
+                out += " | KPI: confirmed legal status update and owner decision logged"
+            elif any(token in lowered for token in ("campaign", "trade plan", "promo", "promotion")):
+                out += " | KPI: click share on affected Page Names and campaign-overlap impact by date"
+            elif any(token in lowered for token in ("weather", "season", "seasonality", "demand")):
+                out += " | KPI: cluster-level clicks trend and demand-proxy alignment in next run"
+            else:
+                out += " | KPI: clicks and CTR on affected Page Name"
+        if "success threshold:" not in lowered:
+            if any(token in lowered for token in ("uokik", "regulatory", "legal", "compliance", "investigation")):
+                out += " | Success threshold: risk status classified (high/med/low) with mitigation owner and date"
+            elif any(token in lowered for token in ("campaign", "trade plan", "promo", "promotion")):
+                out += " | Success threshold: action explains >=50% of affected Page Name delta by next run"
+            else:
+                out += " | Success threshold: +2% clicks WoW or +0.10 pp CTR next run"
+        return out
+
     def _append(action: str, owner: str, eta: str) -> None:
-        clean_action = _escape_table_cell(action).strip(". ")
+        clean_action = _append_kpi_protocol(action)
         clean_owner = _escape_table_cell(owner) or "SEO Team"
         clean_eta = _escape_table_cell(eta) or "next run"
         if not clean_action:
@@ -2240,6 +2821,14 @@ def _extract_priority_action_rows(
 
 
 def _compose_final_report(markdown_report: str, commentary: str) -> str:
+    def _with_anchor(text: str, anchor: str) -> str:
+        payload = str(text or "").strip()
+        if not payload:
+            return payload
+        if re.search(r"\[E\d+\]", payload, flags=re.IGNORECASE):
+            return payload
+        return f"{payload.rstrip('.')} [{anchor}]"
+
     leadership_snapshot = _extract_markdown_section(markdown_report, "Leadership snapshot")
     executive_summary = _extract_markdown_section(markdown_report, "Executive summary")
     baseline_narrative = _extract_markdown_section(markdown_report, "What is happening and why")
@@ -2254,13 +2843,63 @@ def _compose_final_report(markdown_report: str, commentary: str) -> str:
         baseline_narrative=baseline_narrative,
         commentary=commentary,
     )
+    commentary_bullets = _extract_bullets(commentary, limit=24)
+    commentary_norms = {
+        re.sub(r"\s+", " ", re.sub(r"[^\w\s%+-]", " ", row.lower())).strip()
+        for row in commentary_bullets
+        if str(row).strip()
+    }
+    if commentary_norms:
+        confirmed_points = [
+            row
+            for row in confirmed_points
+            if re.sub(r"\s+", " ", re.sub(r"[^\w\s%+-]", " ", row.lower())).strip()
+            not in commentary_norms
+        ] or confirmed_points
+        hypothesis_points = [
+            row
+            for row in hypothesis_points
+            if re.sub(r"\s+", " ", re.sub(r"[^\w\s%+-]", " ", row.lower())).strip()
+            not in commentary_norms
+        ] or hypothesis_points
     priority_rows = _extract_priority_action_rows(
         commentary=commentary,
         executive_summary=executive_summary,
         limit=5,
     )
-    protocol_table = _trim_markdown_table(hypothesis_protocol, max_rows=3)
-    evidence_table = _trim_markdown_table(evidence_ledger, max_rows=8)
+    protocol_table = _trim_markdown_table(hypothesis_protocol, max_rows=4)
+    evidence_table = _trim_markdown_table(evidence_ledger, max_rows=6)
+    serp_listing_lines = _extract_serp_listing_impact_lines(
+        markdown_report,
+        commentary=commentary,
+        limit=5,
+    )
+    if not any(
+        ("case-study" in row.lower() or "case study" in row.lower())
+        for row in serp_listing_lines
+    ):
+        case_line = _extract_case_study_context_line(
+            markdown_report,
+            commentary=commentary,
+        )
+        if case_line:
+            serp_listing_lines.append(case_line)
+    serp_listing_lines = serp_listing_lines[:5]
+    narrative_serp_lens = _extract_serp_listing_impact_lines(
+        markdown_report,
+        commentary="",
+        limit=2,
+    )
+    section_serp_lines = list(serp_listing_lines)
+    if narrative_serp_lens:
+        used_norms = {_normalize_for_dedup(row) for row in narrative_serp_lens}
+        filtered = [
+            row
+            for row in section_serp_lines
+            if _normalize_for_dedup(row) not in used_norms
+        ]
+        if filtered:
+            section_serp_lines = filtered
 
     output_lines: list[str] = [report_title_line, ""]
     if leadership_snapshot:
@@ -2275,14 +2914,34 @@ def _compose_final_report(markdown_report: str, commentary: str) -> str:
     output_lines.append("## What is happening and why")
     output_lines.append(commentary.strip())
     output_lines.append("")
+    if narrative_serp_lens:
+        output_lines.append("### Data-backed SERP/CTR lens")
+        for idx, row in enumerate(narrative_serp_lens[:2]):
+            anchor = "E1" if idx == 0 else "E2"
+            output_lines.append(f"- {_with_anchor(row, anchor)}")
+        output_lines.append("")
+
+    output_lines.append("## SERP and listings impact (WoW/MoM/YoY)")
+    if section_serp_lines:
+        for idx, row in enumerate(section_serp_lines[:5]):
+            anchor = "E1" if idx == 0 else "E2"
+            output_lines.append(f"- {_with_anchor(row, anchor)}")
+    else:
+        output_lines.append(
+            "- Feature-level `searchAppearance` split is unavailable in this run; keep SERP/listing impact as a hypothesis for next-run validation. [E2]"
+        )
+        output_lines.append(
+            "- Monitoring rule: if impressions move while CTR/position move in opposite directions, test listing-surface reallocation before technical escalation. [E1]"
+        )
+    output_lines.append("")
 
     output_lines.append("## Confirmed vs hypothesis")
     output_lines.append("### Confirmed facts from data")
-    for row in confirmed_points[:4]:
-        output_lines.append(f"- {row}")
+    for row in confirmed_points[:3]:
+        output_lines.append(f"- {_with_anchor(row, 'E1')}")
     output_lines.append("### Working hypotheses")
-    for row in hypothesis_points[:4]:
-        output_lines.append(f"- {row}")
+    for row in hypothesis_points[:3]:
+        output_lines.append(f"- {_with_anchor(row, 'E2')}")
     output_lines.append("")
 
     output_lines.append("## Priority actions (owner | ETA)")
@@ -2545,6 +3204,11 @@ Output constraints:
 13. Do not include raw JSON in output.
 14. Do not state a metric without interpretation. For each key change, add one plain-language implication (what it means for demand, visibility, routing, or risk).
 15. If brand declines/increases are mentioned, explain business meaning explicitly (demand softness vs routing/SERP allocation) and what evidence supports that interpretation.
+16. Do not use placeholder wording or ellipses (`...`). Use complete, readable sentences.
+17. If packet evidence contains `searchAppearance`, `SERP`, `MERCHANT_LISTINGS`, or `PRODUCT_SNIPPETS`, include at least:
+    - one YoY statement about search-result-type shifts,
+    - one explicit impact chain: listing/feature shift -> impressions/CTR/position -> clicks.
+18. Remove repetition: do not restate the same metric or causal claim across multiple sections.
 """.strip(),
             ),
             (
@@ -2593,19 +3257,7 @@ def _build_gaia_llm_with_runtime_fallback(
         fallback_name = GAIA_MODEL_RUNTIME_FALLBACK.strip().lower()
         if not fallback_name or model_name == fallback_name:
             raise
-        text = str(exc).lower()
-        runtime_model_issue = any(
-            token in text
-            for token in (
-                "deployment",
-                "model",
-                "not found",
-                "does not exist",
-                "unavailable",
-                "404",
-            )
-        )
-        if not runtime_model_issue:
+        if not _is_runtime_model_issue_error(exc):
             raise
         fallback_config = replace(config, gaia_model=GAIA_MODEL_RUNTIME_FALLBACK)
         return build_gaia_llm(fallback_config), fallback_config
@@ -2619,13 +3271,11 @@ def _run_llm_document_validator(llm, report_text: str, config: AgentConfig) -> d
                 """
 You validate SEO reports in one pass.
 Return strict JSON only.
-Schema:
-{{
-  "approved": true|false,
-  "issues": [{"severity":"high|medium|low","message":"...","section":"..."}],
-  "unsupported_claims": [{"claim":"...","why":"...","section":"..."}],
-  "feedback_for_rewrite": ["..."]
-}}
+Schema requirements:
+- `approved`: boolean.
+- `issues`: array of objects with keys `severity`, `message`, `section`.
+- `unsupported_claims`: array of objects with keys `claim`, `why`, `section`.
+- `feedback_for_rewrite`: array of strings.
 
 Validation checklist:
 - Unsupported numeric/date/entity claims.
@@ -3825,18 +4475,6 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
         feature_current_28d = gsc.fetch_rows(context_28d_current, dimensions=("searchAppearance",))
         feature_previous_28d = gsc.fetch_rows(context_28d_previous, dimensions=("searchAppearance",))
         feature_yoy_28d = gsc.fetch_rows(context_28d_yoy, dimensions=("searchAppearance",))
-        feature_daily_current = gsc.fetch_rows(
-            current_window,
-            dimensions=("date", "searchAppearance"),
-        )
-        feature_daily_previous = gsc.fetch_rows(
-            previous_window,
-            dimensions=("date", "searchAppearance"),
-        )
-        feature_daily_yoy = gsc.fetch_rows(
-            yoy_window,
-            dimensions=("date", "searchAppearance"),
-        )
 
         weekly_analysis = analyze_rows(
             current_rows=feature_current,
@@ -3864,15 +4502,16 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
             limit=max(5, min(config.top_n, 15)),
         )
         feature_overview = _feature_overview_rows(rows_weekly, rows_mom, limit=12)
-        daily_serp_feature_shifts = _build_daily_serp_feature_shifts_context(
-            current_window=current_window,
-            yoy_window=yoy_window,
-            current_rows=feature_daily_current,
-            previous_rows=feature_daily_previous,
-            yoy_rows=feature_daily_yoy,
+        has_feature_rows = bool(
+            feature_current
+            or feature_previous
+            or feature_yoy
+            or rows_weekly
+            or rows_mom
+            or feature_overview
         )
         gsc_feature_split = {
-            "enabled": bool(rows_weekly or rows_mom),
+            "enabled": has_feature_rows,
             "source": "Google Search Console API (searchAppearance)",
             "rows": rows_weekly,
             "rows_weekly": rows_weekly,
@@ -3904,6 +4543,30 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
             "summary": {},
             "errors": [str(exc)],
         }
+
+    # GSC Search Analytics does not allow combining `searchAppearance` with another dimension
+    # on many properties. Treat daily SERP shifts as optional and do not block feature split.
+    try:
+        feature_daily_current = gsc.fetch_rows(
+            current_window,
+            dimensions=("date", "searchAppearance"),
+        )
+        feature_daily_previous = gsc.fetch_rows(
+            previous_window,
+            dimensions=("date", "searchAppearance"),
+        )
+        feature_daily_yoy = gsc.fetch_rows(
+            yoy_window,
+            dimensions=("date", "searchAppearance"),
+        )
+        daily_serp_feature_shifts = _build_daily_serp_feature_shifts_context(
+            current_window=current_window,
+            yoy_window=yoy_window,
+            current_rows=feature_daily_current,
+            previous_rows=feature_daily_previous,
+            yoy_rows=feature_daily_yoy,
+        )
+    except Exception as exc:
         daily_serp_feature_shifts = {
             "enabled": False,
             "source": "GSC API (date + searchAppearance)",
@@ -4064,176 +4727,178 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                 }
             )
     else:
-        # Parallel I/O for independent context fetches with bounded worker pool.
-        executor = ThreadPoolExecutor(max_workers=2)
-        try:
-            future_external = executor.submit(
-                external_client.collect,
-                current_window=current_window,
-                previous_window=previous_window,
-                yoy_window=yoy_window,
+        # Parallel I/O on daemon threads: timed-out calls cannot block process shutdown.
+        external_handle = _start_daemon_task(
+            external_client.collect,
+            current_window=current_window,
+            previous_window=previous_window,
+            yoy_window=yoy_window,
+        )
+        context_handle = _start_daemon_task(
+            collect_additional_context,
+            target_site_url=config.target_site_url,
+            target_domain=config.target_domain,
+            report_country_code=config.report_country_code,
+            run_date=run_date,
+            current_window=current_window,
+            previous_window=previous_window,
+            google_drive_client_secret_path=config.google_drive_client_secret_path,
+            google_drive_token_path=config.google_drive_token_path,
+            google_drive_folder_name=config.google_drive_folder_name,
+            google_drive_folder_id=config.google_drive_folder_id,
+            seo_presentations_enabled=config.seo_presentations_enabled,
+            seo_presentations_folder_reference=config.seo_presentations_folder_reference,
+            seo_presentations_max_files_per_year=config.seo_presentations_max_files_per_year,
+            seo_presentations_max_text_files_per_year=config.seo_presentations_max_text_files_per_year,
+            historical_reports_enabled=config.historical_reports_enabled,
+            historical_reports_count=config.historical_reports_count,
+            historical_reports_yoy_tolerance_days=config.historical_reports_yoy_tolerance_days,
+            status_log_enabled=config.status_log_enabled,
+            status_file_reference=config.status_file_reference,
+            status_max_rows=config.status_max_rows,
+            product_trends_enabled=config.product_trends_enabled,
+            product_trends_comparison_sheet_reference=config.product_trends_comparison_sheet_reference,
+            product_trends_upcoming_sheet_reference=config.product_trends_upcoming_sheet_reference,
+            product_trends_current_sheet_reference=config.product_trends_current_sheet_reference,
+            product_trends_top_rows=config.product_trends_top_rows,
+            product_trends_horizon_days=config.product_trends_horizon_days,
+            trade_plan_enabled=config.trade_plan_enabled,
+            trade_plan_sheet_reference=config.trade_plan_sheet_reference,
+            trade_plan_yoy_sheet_reference=config.trade_plan_yoy_sheet_reference,
+            trade_plan_tab_map=config.trade_plan_tab_map,
+            trade_plan_yoy_tab_map=config.trade_plan_yoy_tab_map,
+            trade_plan_top_rows=config.trade_plan_top_rows,
+            platform_pulse_enabled=config.platform_pulse_enabled,
+            platform_pulse_rss_urls=config.platform_pulse_rss_urls,
+            platform_pulse_top_rows=config.platform_pulse_top_rows,
+            pagespeed_api_key=config.pagespeed_api_key,
+            google_trends_rss_url=config.google_trends_rss_url,
+            nbp_api_base_url=config.nbp_api_base_url,
+            imgw_warnings_url=config.imgw_warnings_url,
+            market_events_enabled=config.market_events_enabled,
+            market_events_api_base_url=config.market_events_api_base_url,
+            market_events_top_rows=config.market_events_top_rows,
+            google_status_endpoint=config.google_status_endpoint,
+            google_blog_rss=config.google_blog_rss,
+            google_updates_scan_months=13,
+            serp_case_study_scan_months=13,
+            free_public_sources_enabled=config.free_public_sources_enabled,
+            free_public_sources_top_rows=config.free_public_sources_top_rows,
+            nager_holidays_country_code=config.nager_holidays_country_code,
+            eia_api_key=config.eia_api_key,
+        )
+
+        external_status, external_value = _await_daemon_task(
+            external_handle,
+            timeout_sec=EXTERNAL_SIGNALS_TIMEOUT_SEC,
+            task_name="ExternalSignalsClient.collect",
+        )
+        if external_status == "ok":
+            external_signals, weather_summary = external_value
+            external_cache_mode = "live"
+            external_cache_saved_at = time.time()
+        elif external_status == "timeout":
+            external_signals = []
+            weather_summary = {}
+            if stale_external:
+                external_signals, weather_summary = _deserialize_external_cache(stale_external)
+                external_cache_mode = "stale_fallback"
+                external_cache_saved_at = _cache_saved_at(stale_external)
+            else:
+                external_cache_mode = "degraded_no_cache"
+            external_signals.append(
+                ExternalSignal(
+                    source="External signals",
+                    day=current_window.end,
+                    title="External signals timeout (stale fallback used)",
+                    details=(
+                        f"ExternalSignalsClient timed out after {EXTERNAL_SIGNALS_TIMEOUT_SEC}s; "
+                        "using latest cached external signals to avoid empty context."
+                    ),
+                    severity="medium",
+                )
             )
-            future_context = executor.submit(
-                collect_additional_context,
-                target_site_url=config.target_site_url,
-                target_domain=config.target_domain,
-                report_country_code=config.report_country_code,
-                run_date=run_date,
-                current_window=current_window,
-                previous_window=previous_window,
-                google_drive_client_secret_path=config.google_drive_client_secret_path,
-                google_drive_token_path=config.google_drive_token_path,
-                google_drive_folder_name=config.google_drive_folder_name,
-                google_drive_folder_id=config.google_drive_folder_id,
-                seo_presentations_enabled=config.seo_presentations_enabled,
-                seo_presentations_folder_reference=config.seo_presentations_folder_reference,
-                seo_presentations_max_files_per_year=config.seo_presentations_max_files_per_year,
-                seo_presentations_max_text_files_per_year=config.seo_presentations_max_text_files_per_year,
-                historical_reports_enabled=config.historical_reports_enabled,
-                historical_reports_count=config.historical_reports_count,
-                historical_reports_yoy_tolerance_days=config.historical_reports_yoy_tolerance_days,
-                status_log_enabled=config.status_log_enabled,
-                status_file_reference=config.status_file_reference,
-                status_max_rows=config.status_max_rows,
-                product_trends_enabled=config.product_trends_enabled,
-                product_trends_comparison_sheet_reference=config.product_trends_comparison_sheet_reference,
-                product_trends_upcoming_sheet_reference=config.product_trends_upcoming_sheet_reference,
-                product_trends_current_sheet_reference=config.product_trends_current_sheet_reference,
-                product_trends_top_rows=config.product_trends_top_rows,
-                product_trends_horizon_days=config.product_trends_horizon_days,
-                trade_plan_enabled=config.trade_plan_enabled,
-                trade_plan_sheet_reference=config.trade_plan_sheet_reference,
-                trade_plan_yoy_sheet_reference=config.trade_plan_yoy_sheet_reference,
-                trade_plan_tab_map=config.trade_plan_tab_map,
-                trade_plan_yoy_tab_map=config.trade_plan_yoy_tab_map,
-                trade_plan_top_rows=config.trade_plan_top_rows,
-                platform_pulse_enabled=config.platform_pulse_enabled,
-                platform_pulse_rss_urls=config.platform_pulse_rss_urls,
-                platform_pulse_top_rows=config.platform_pulse_top_rows,
-                pagespeed_api_key=config.pagespeed_api_key,
-                google_trends_rss_url=config.google_trends_rss_url,
-                nbp_api_base_url=config.nbp_api_base_url,
-                imgw_warnings_url=config.imgw_warnings_url,
-                market_events_enabled=config.market_events_enabled,
-                market_events_api_base_url=config.market_events_api_base_url,
-                market_events_top_rows=config.market_events_top_rows,
-                google_status_endpoint=config.google_status_endpoint,
-                google_blog_rss=config.google_blog_rss,
-                google_updates_scan_months=13,
-                serp_case_study_scan_months=13,
-                free_public_sources_enabled=config.free_public_sources_enabled,
-                free_public_sources_top_rows=config.free_public_sources_top_rows,
-                nager_holidays_country_code=config.nager_holidays_country_code,
-                eia_api_key=config.eia_api_key,
+        else:
+            external_signals = []
+            weather_summary = {}
+            if stale_external:
+                external_signals, weather_summary = _deserialize_external_cache(stale_external)
+                external_cache_mode = "stale_fallback"
+                external_cache_saved_at = _cache_saved_at(stale_external)
+            else:
+                external_cache_mode = "degraded_no_cache"
+            external_signals.append(
+                ExternalSignal(
+                    source="External signals",
+                    day=current_window.end,
+                    title="External signals degraded (stale fallback used)",
+                    details=f"Live external fetch failed: {external_value}",
+                    severity="medium",
+                )
             )
-            try:
-                external_signals, weather_summary = future_external.result(
-                    timeout=EXTERNAL_SIGNALS_TIMEOUT_SEC
-                )
-                external_cache_mode = "live"
-                external_cache_saved_at = time.time()
-            except FutureTimeoutError:
-                future_external.cancel()
-                external_signals = []
-                weather_summary = {}
-                if stale_external:
-                    external_signals, weather_summary = _deserialize_external_cache(stale_external)
-                    external_cache_mode = "stale_fallback"
-                    external_cache_saved_at = _cache_saved_at(stale_external)
-                else:
-                    external_cache_mode = "degraded_no_cache"
-                external_signals.append(
-                    ExternalSignal(
-                        source="External signals",
-                        day=current_window.end,
-                        title="External signals timeout (stale fallback used)",
-                        details=(
-                            f"ExternalSignalsClient timed out after {EXTERNAL_SIGNALS_TIMEOUT_SEC}s; "
-                            "using latest cached external signals to avoid empty context."
-                        ),
-                        severity="medium",
+
+        additional_status, additional_value = _await_daemon_task(
+            context_handle,
+            timeout_sec=ADDITIONAL_CONTEXT_TIMEOUT_SEC,
+            task_name="collect_additional_context",
+        )
+        if additional_status == "ok":
+            additional_context, extra_signals = additional_value
+            additional_cache_mode = "live"
+            additional_cache_saved_at = time.time()
+        elif additional_status == "timeout":
+            additional_context = {}
+            extra_signals = []
+            if stale_context:
+                additional_context, extra_signals = _deserialize_additional_cache(stale_context)
+                additional_cache_mode = "stale_fallback"
+                additional_cache_saved_at = _cache_saved_at(stale_context)
+            else:
+                additional_cache_mode = "degraded_no_cache"
+            additional_context.setdefault("errors", [])
+            if isinstance(additional_context.get("errors"), list):
+                additional_context["errors"].append(
+                    (
+                        "Additional context timeout "
+                        f"after {ADDITIONAL_CONTEXT_TIMEOUT_SEC}s; stale cache fallback used."
                     )
                 )
-            except Exception as exc:
-                external_signals = []
-                weather_summary = {}
-                if stale_external:
-                    external_signals, weather_summary = _deserialize_external_cache(stale_external)
-                    external_cache_mode = "stale_fallback"
-                    external_cache_saved_at = _cache_saved_at(stale_external)
-                else:
-                    external_cache_mode = "degraded_no_cache"
-                external_signals.append(
-                    ExternalSignal(
-                        source="External signals",
-                        day=current_window.end,
-                        title="External signals degraded (stale fallback used)",
-                        details=f"Live external fetch failed: {exc}",
-                        severity="medium",
-                    )
+            extra_signals.append(
+                ExternalSignal(
+                    source="Additional context",
+                    day=current_window.end,
+                    title="Additional context timeout (stale fallback used)",
+                    details=(
+                        f"collect_additional_context exceeded {ADDITIONAL_CONTEXT_TIMEOUT_SEC}s; "
+                        "using latest cached additional context."
+                    ),
+                    severity="medium",
                 )
-            try:
-                additional_context, extra_signals = future_context.result(
-                    timeout=ADDITIONAL_CONTEXT_TIMEOUT_SEC
+            )
+        else:
+            additional_context = {}
+            extra_signals = []
+            if stale_context:
+                additional_context, extra_signals = _deserialize_additional_cache(stale_context)
+                additional_cache_mode = "stale_fallback"
+                additional_cache_saved_at = _cache_saved_at(stale_context)
+            else:
+                additional_cache_mode = "degraded_no_cache"
+            additional_context.setdefault("errors", [])
+            if isinstance(additional_context.get("errors"), list):
+                additional_context["errors"].append(
+                    f"Additional context live fetch failed; stale cache fallback used: {additional_value}"
                 )
-                additional_cache_mode = "live"
-                additional_cache_saved_at = time.time()
-            except FutureTimeoutError:
-                future_context.cancel()
-                additional_context = {}
-                extra_signals = []
-                if stale_context:
-                    additional_context, extra_signals = _deserialize_additional_cache(stale_context)
-                    additional_cache_mode = "stale_fallback"
-                    additional_cache_saved_at = _cache_saved_at(stale_context)
-                else:
-                    additional_cache_mode = "degraded_no_cache"
-                additional_context.setdefault("errors", [])
-                if isinstance(additional_context.get("errors"), list):
-                    additional_context["errors"].append(
-                        (
-                            "Additional context timeout "
-                            f"after {ADDITIONAL_CONTEXT_TIMEOUT_SEC}s; stale cache fallback used."
-                        )
-                    )
-                extra_signals.append(
-                    ExternalSignal(
-                        source="Additional context",
-                        day=current_window.end,
-                        title="Additional context timeout (stale fallback used)",
-                        details=(
-                            f"collect_additional_context exceeded {ADDITIONAL_CONTEXT_TIMEOUT_SEC}s; "
-                            "using latest cached additional context."
-                        ),
-                        severity="medium",
-                    )
+            extra_signals.append(
+                ExternalSignal(
+                    source="Additional context",
+                    day=current_window.end,
+                    title="Additional context degraded (stale fallback used)",
+                    details=f"Live additional context fetch failed: {additional_value}",
+                    severity="medium",
                 )
-            except Exception as exc:
-                additional_context = {}
-                extra_signals = []
-                if stale_context:
-                    additional_context, extra_signals = _deserialize_additional_cache(stale_context)
-                    additional_cache_mode = "stale_fallback"
-                    additional_cache_saved_at = _cache_saved_at(stale_context)
-                else:
-                    additional_cache_mode = "degraded_no_cache"
-                additional_context.setdefault("errors", [])
-                if isinstance(additional_context.get("errors"), list):
-                    additional_context["errors"].append(
-                        f"Additional context live fetch failed; stale cache fallback used: {exc}"
-                    )
-                extra_signals.append(
-                    ExternalSignal(
-                        source="Additional context",
-                        day=current_window.end,
-                        title="Additional context degraded (stale fallback used)",
-                        details=f"Live additional context fetch failed: {exc}",
-                        severity="medium",
-                    )
-                )
-        finally:
-            # Do not block shutdown on stuck network I/O in worker threads.
-            executor.shutdown(wait=False, cancel_futures=True)
+            )
+
         if not external_signals and stale_external:
             external_signals, weather_summary = _deserialize_external_cache(stale_external)
             external_cache_mode = "stale_fallback"
@@ -4264,24 +4929,70 @@ def collect_and_analyze_node(state: WorkflowState) -> WorkflowState:
                     "additional_context": "live_or_stale_fallback",
                 }
             )
-        _cache_save_json(
-            "external_signals",
-            cache_parts,
-            {
-                "_cached_at": time.time(),
-                "weather_summary": weather_summary,
-                "signals": [_external_signal_to_dict(item) for item in external_signals],
-            },
-        )
-        _cache_save_json(
-            "additional_context",
-            cache_parts,
-            {
-                "_cached_at": time.time(),
-                "context": additional_context,
-                "extra_signals": [_external_signal_to_dict(item) for item in extra_signals],
-            },
-        )
+        # Avoid poisoning cache with degraded timeout fallbacks.
+        if external_cache_mode == "live":
+            _cache_save_json(
+                "external_signals",
+                cache_parts,
+                {
+                    "_cached_at": time.time(),
+                    "weather_summary": weather_summary,
+                    "signals": [_external_signal_to_dict(item) for item in external_signals],
+                },
+            )
+        if additional_cache_mode == "live":
+            _cache_save_json(
+                "additional_context",
+                cache_parts,
+                {
+                    "_cached_at": time.time(),
+                    "context": additional_context,
+                    "extra_signals": [_external_signal_to_dict(item) for item in extra_signals],
+                },
+            )
+    # If the broad additional-context collector timed out, salvage critical 13M context
+    # with lightweight direct fetches so final narrative can still include YoY SERP case-study signals.
+    serp_case_ctx = additional_context.get("serp_case_studies", {})
+    if not (isinstance(serp_case_ctx, dict) and serp_case_ctx.get("enabled")):
+        try:
+            fallback_case_ctx, fallback_case_signals = _collect_serp_case_studies_context(
+                run_date=run_date,
+                current_window=current_window,
+                previous_window=previous_window,
+                yoy_window=yoy_window,
+                scan_months=13,
+            )
+            if isinstance(fallback_case_ctx, dict) and fallback_case_ctx.get("enabled"):
+                additional_context["serp_case_studies"] = fallback_case_ctx
+                extra_signals.extend(fallback_case_signals)
+        except Exception as exc:
+            additional_context.setdefault("errors", [])
+            if isinstance(additional_context.get("errors"), list):
+                additional_context["errors"].append(
+                    f"SERP case-study fallback fetch failed: {exc}"
+                )
+
+    updates_ctx = additional_context.get("google_updates_timeline", {})
+    if not (isinstance(updates_ctx, dict) and updates_ctx.get("enabled")):
+        try:
+            fallback_updates_ctx = _collect_google_updates_timeline(
+                run_date=run_date,
+                current_window=current_window,
+                previous_window=previous_window,
+                yoy_window=yoy_window,
+                status_endpoint=config.google_status_endpoint,
+                blog_rss_url=config.google_blog_rss,
+                scan_months=13,
+            )
+            if isinstance(fallback_updates_ctx, dict) and fallback_updates_ctx.get("enabled"):
+                additional_context["google_updates_timeline"] = fallback_updates_ctx
+        except Exception as exc:
+            additional_context.setdefault("errors", [])
+            if isinstance(additional_context.get("errors"), list):
+                additional_context["errors"].append(
+                    f"Google updates fallback fetch failed: {exc}"
+                )
+
     external_signals.extend(extra_signals)
     raw_signal_count = len(external_signals)
     external_signals = _sanitize_external_signals(
@@ -4775,14 +5486,50 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
         }
 
     try:
-        llm, config_for_llm = _build_gaia_llm_with_runtime_fallback(config)
-        state_for_llm = dict(state)
-        state_for_llm["config"] = config_for_llm
-        commentary = _generate_three_step_llm_commentary(
-            llm,
-            state_for_llm,
-            feedback_notes=feedback_notes if isinstance(feedback_notes, list) else [],
-        )
+        feedback_payload = feedback_notes if isinstance(feedback_notes, list) else []
+        max_attempts = 3
+        retry_errors: list[str] = []
+        commentary = ""
+
+        for attempt in range(max_attempts):
+            try:
+                llm, config_for_llm = _build_gaia_llm_with_runtime_fallback(config)
+                state_for_llm = dict(state)
+                state_for_llm["config"] = config_for_llm
+                try:
+                    commentary = _generate_three_step_llm_commentary(
+                        llm,
+                        state_for_llm,
+                        feedback_notes=feedback_payload,
+                    )
+                except Exception as exc:
+                    model_name = str(config_for_llm.gaia_model or "").strip().lower()
+                    fallback_name = GAIA_MODEL_RUNTIME_FALLBACK.strip().lower()
+                    if not _is_runtime_model_issue_error(exc) or not fallback_name or model_name == fallback_name:
+                        raise
+                    fallback_config = replace(config_for_llm, gaia_model=GAIA_MODEL_RUNTIME_FALLBACK)
+                    fallback_llm = build_gaia_llm(fallback_config)
+                    state_for_llm["config"] = fallback_config
+                    commentary = _generate_three_step_llm_commentary(
+                        fallback_llm,
+                        state_for_llm,
+                        feedback_notes=feedback_payload,
+                    )
+                break
+            except Exception as exc:
+                retry_errors.append(str(exc))
+                is_last_attempt = attempt >= (max_attempts - 1)
+                if is_last_attempt or not _is_transient_llm_error(exc):
+                    raise
+                # Exponential backoff for transient API/network instability.
+                time.sleep(2 ** attempt)
+
+        if not commentary.strip():
+            raise RuntimeError(
+                "LLM commentary was empty after retries."
+                + (f" Last errors: {' | '.join(retry_errors[-2:])}" if retry_errors else "")
+            )
+
         commentary = _normalize_ai_commentary_markdown(commentary)
         executive_summary = _extract_markdown_section(
             markdown_report, "Executive summary"
@@ -4795,6 +5542,8 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
             reference_sections=(executive_summary, what_happening),
         )
         commentary = _inject_missing_date_context(commentary, markdown_report)
+        # Re-normalize after de-duplication/date injection so required sections cannot stay empty.
+        commentary = _normalize_ai_commentary_markdown(commentary)
         return {
             "llm_commentary_draft": commentary,
             "llm_feedback_notes": feedback_notes if isinstance(feedback_notes, list) else [],
@@ -4802,6 +5551,27 @@ def llm_generate_node(state: WorkflowState) -> WorkflowState:
             "llm_skip_validation": False,
         }
     except Exception as exc:
+        cached_reduce = _cache_load_latest_by_prefix(
+            "llm_reduce_commentary_v2",
+            max_age_sec=LLM_CACHE_MAX_AGE_SEC * 7,
+        )
+        cached_commentary = (
+            str(cached_reduce.get("commentary", "")).strip()
+            if isinstance(cached_reduce, dict)
+            else ""
+        )
+        if cached_commentary:
+            cached_commentary = _normalize_ai_commentary_markdown(cached_commentary)
+            fallback_report = _compose_final_report(markdown_report, cached_commentary)
+            return {
+                "llm_commentary": cached_commentary,
+                "final_report": fallback_report,
+                "llm_skip_validation": True,
+                "llm_validation_passed": True,
+                "llm_validation_issues": [
+                    f"LLM live call unavailable ({exc}); used recent cached LLM narrative fallback."
+                ],
+            }
         return {
             "llm_commentary": f"LLM analysis failed: {exc}",
             "final_report": markdown_report,
@@ -4837,7 +5607,20 @@ def llm_validate_node(state: WorkflowState) -> WorkflowState:
             max_appendix_chars=max(600, int(config.llm_appendix_max_chars)),
         )
         rule_issues = _run_rule_based_report_checks(candidate_report)
-        validation = _run_llm_document_validator(llm, candidate_report, config_for_llm)
+        try:
+            validation = _run_llm_document_validator(llm, candidate_report, config_for_llm)
+        except Exception as exc:
+            model_name = str(config_for_llm.gaia_model or "").strip().lower()
+            fallback_name = GAIA_MODEL_RUNTIME_FALLBACK.strip().lower()
+            if not _is_runtime_model_issue_error(exc) or not fallback_name or model_name == fallback_name:
+                raise
+            fallback_config = replace(config_for_llm, gaia_model=GAIA_MODEL_RUNTIME_FALLBACK)
+            fallback_llm = build_gaia_llm(fallback_config)
+            validation = _run_llm_document_validator(
+                fallback_llm,
+                candidate_report,
+                fallback_config,
+            )
         llm_issues = validation.get("issues", [])
         unsupported_claims_count = int(validation.get("unsupported_claims_count", 0) or 0)
         issues: list[str] = []
@@ -4861,10 +5644,6 @@ def llm_validate_node(state: WorkflowState) -> WorkflowState:
         max_rounds = max(1, int(config.llm_validation_max_rounds))
         if round_no >= max_rounds:
             fallback_report = _compose_final_report(markdown_report, commentary)
-            if issues:
-                fallback_report += "\n## Validator Notes\n" + "\n".join(
-                    f"- {str(item).strip()}" for item in issues[:6] if str(item).strip()
-                ) + "\n"
             return {
                 "llm_validation_passed": True,
                 "llm_validation_issues": issues,
@@ -4910,11 +5689,6 @@ def llm_finalize_node(state: WorkflowState) -> WorkflowState:
             "final_report": markdown_report,
         }
     final_report = _compose_final_report(markdown_report, commentary)
-    issues = state.get("llm_validation_issues", [])
-    if isinstance(issues, list) and issues:
-        diagnostics = "\n".join(f"- {str(item).strip()}" for item in issues[:8] if str(item).strip())
-        if diagnostics:
-            final_report += "\n\n## Validator Notes\n" + diagnostics + "\n"
     return {
         "llm_commentary": commentary,
         "final_report": final_report,

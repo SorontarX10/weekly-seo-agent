@@ -10,14 +10,21 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "beautifulsoup4>=4.12.3",
+  "fastapi>=0.116.0",
   "google-api-python-client>=2.160.0",
   "google-auth>=2.38.0",
   "google-auth-oauthlib>=1.2.0",
   "langchain-openai>=0.3.0",
   "langgraph>=0.2.75",
+  "openpyxl>=3.1.5",
+  "playwright>=1.52.0",
+  "playwright-stealth>=1.0.6",
+  "pypdf>=5.9.0",
   "python-docx>=1.1.2",
   "python-dotenv>=1.0.1",
+  "python-multipart>=0.0.20",
   "requests>=2.32.3",
+  "uvicorn>=0.35.0",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +40,8 @@ weekly-seo-news-agent = "weekly_seo_agent.weekly_reporting_agent.news_agent:main
 weekly-seo-gmail-token = "weekly_seo_agent.weekly_reporting_agent.tools.gmail_refresh_token:main"
 weekly-people-manager-agent = "weekly_seo_agent.people_manager_agent:main"
 weekly-people-team-agent = "weekly_seo_agent.people_team_agent:main"
+weekly-manager-document-agent-api = "weekly_seo_agent.manager_document_agent.main:main"
+weekly-manager-document-agent-archive-nightly = "weekly_seo_agent.manager_document_agent.nightly_archive:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -41,9 +50,13 @@ addopts = "-q"
 [tool.setuptools]
 packages = [
   "weekly_seo_agent",
+  "weekly_seo_agent.manager_document_agent",
   "weekly_seo_agent.clients",
   "weekly_seo_agent.tools",
   "weekly_seo_agent.weekly_reporting_agent",
   "weekly_seo_agent.weekly_reporting_agent.clients",
   "weekly_seo_agent.weekly_reporting_agent.tools",
 ]
+
+[tool.setuptools.package-data]
+"weekly_seo_agent.manager_document_agent" = ["ui/*.html"]

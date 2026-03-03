@@ -35,18 +35,22 @@
 ### Further Analysis Flags
 - Re-check event timeline overlap with day-level GSC anomalies.
 
+## SERP and listings impact (WoW/MoM/YoY)
+- Feature-level `searchAppearance` split is unavailable in this run; keep SERP/listing impact as a hypothesis for next-run validation. [E2]
+- Monitoring rule: if impressions move while CTR/position move in opposite directions, test listing-surface reallocation before technical escalation. [E1]
+
 ## Confirmed vs hypothesis
 ### Confirmed facts from data
-- This week reflects demand rotation with stable efficiency.
+- This week reflects demand rotation with stable efficiency [E1]
 ### Working hypotheses
-- Main hypothesis: demand timing + routing explain movement. Confidence: 74/100.
+- Main hypothesis: demand timing + routing explain movement. Confidence: 74/100 [E2]
 
 ## Priority actions (owner | ETA)
 - Action protocol: each action must include `Owner | ETA` and one concrete deliverable.
 | Priority action | Owner | ETA |
 |---|---|---|
-| Validate routing shifts by Page Name [SEO Team / next run] | SEO Team | next run |
-| Align campaign timing with seasonal clusters [SEO + Merchandising / this week] | SEO Team | next run |
+| Validate routing shifts by Page Name [SEO Team / next run] / KPI: clicks and CTR on affected Page Name / Success threshold: +2% clicks WoW or +0.10 pp CTR next run | SEO Team | next run |
+| Align campaign timing with seasonal clusters [SEO + Merchandising / this week] / KPI: click share on affected Page Names and campaign-overlap impact by date / Success threshold: action explains >=50% of affected Page Name delta by next run | SEO Team | next run |
 
 ## Hypothesis protocol
 - Protocol markers: falsifier | validation metric | validation date.

@@ -876,9 +876,13 @@ def test_report_surfaces_serp_appearance_and_13m_context_blocks():
     assert "SERP appearance mix (WoW/MoM/YoY)" in report
     assert "Google updates timeline (13 months)" in report
     assert "External case-study context (13 months)" in report
-    assert "SERP appearance deltas (GSC searchAppearance)" in report
+    assert (
+        "SERP layout changed across result types (WoW/MoM/YoY)" in report
+        or "SERP appearance deltas (GSC searchAppearance)" in report
+    )
     assert "Google update timeline (13M):" in report
     assert "SERP case-study scanner (13M):" in report
+    assert "case-study benchmark:" in report
 
 
 def test_report_surfaces_daily_serp_shifts_and_source_reliability():

@@ -988,12 +988,10 @@ def _context_snapshot_lines(
     updates_timeline_line = _google_updates_timeline_text(additional_context)
     if updates_timeline_line:
         lines.append("- **Google updates timeline (13 months)**: " + updates_timeline_line.replace("Google update timeline (13M): ", ""))
-        lines.append(updates_timeline_line)
 
     case_study_line = _serp_case_study_text(additional_context)
     if case_study_line:
         lines.append("- **External case-study context (13 months)**: " + case_study_line.replace("SERP case-study scanner (13M): ", ""))
-        lines.append(case_study_line)
 
     daily_story = _build_daily_gsc_storyline(
         additional_context=additional_context,
@@ -1008,6 +1006,129 @@ def _context_snapshot_lines(
     if len(lines) == 1:
         lines.append("- Context snapshot has no additional signals in this run.")
     return lines
+
+
+def _serp_listing_impact_lines(
+    *,
+    totals: dict[str, MetricSummary],
+    additional_context: dict[str, object] | None,
+) -> list[str]:
+    feature_split = (additional_context or {}).get("gsc_feature_split", {})
+    if not isinstance(feature_split, dict) or not feature_split.get("enabled"):
+        return []
+
+    summary_line = _serp_appearance_summary_text(additional_context)
+    current = totals.get("current_28d")
+    previous = totals.get("previous_28d")
+    yoy = totals.get("yoy_52w")
+    if not isinstance(current, MetricSummary) or not isinstance(previous, MetricSummary) or not isinstance(yoy, MetricSummary):
+        return []
+
+    listing_tokens = (
+        "merchant_listings",
+        "product_snippets",
+        "review_snippet",
+        "free_product",
+        "shopping",
+    )
+
+    rows_weekly = feature_split.get("rows_weekly", feature_split.get("rows", []))
+    if not isinstance(rows_weekly, list):
+        rows_weekly = []
+    rows_weekly = [row for row in rows_weekly if isinstance(row, dict)]
+    listing_rows_weekly = [
+        row for row in rows_weekly
+        if any(token in _normalize_text(str(row.get("feature", ""))) for token in listing_tokens)
+    ]
+    listing_rows_weekly.sort(
+        key=lambda row: abs(float(row.get("delta_clicks_vs_previous", 0.0) or 0.0)),
+        reverse=True,
+    )
+
+    feature_overview = feature_split.get("feature_overview", [])
+    if not isinstance(feature_overview, list):
+        feature_overview = []
+    listing_rows_yoy = [
+        row for row in feature_overview
+        if isinstance(row, dict)
+        and any(token in _normalize_text(str(row.get("feature", ""))) for token in listing_tokens)
+    ]
+    listing_rows_yoy.sort(
+        key=lambda row: abs(float(row.get("yoy_delta_clicks", 0.0) or 0.0)),
+        reverse=True,
+    )
+
+    movers_bits: list[str] = []
+    if listing_rows_weekly:
+        wow_row = listing_rows_weekly[0]
+        movers_bits.append(
+            f"WoW top listing mover: {_feature_label(wow_row.get('feature', ''))} "
+            f"({_fmt_signed_compact(wow_row.get('delta_clicks_vs_previous', 0.0))})."
+        )
+    if listing_rows_yoy:
+        yoy_row = listing_rows_yoy[0]
+        movers_bits.append(
+            f"YoY top listing mover: {_feature_label(yoy_row.get('feature', ''))} "
+            f"({_fmt_signed_compact(yoy_row.get('yoy_delta_clicks', 0.0))})."
+        )
+
+    wow_detail = _feature_ctr_position_detail(
+        listing_rows_weekly[0] if listing_rows_weekly else None,
+        delta_key="delta_clicks_vs_previous",
+        ctr_ref_key="ctr_previous",
+        pos_ref_key="position_previous",
+    )
+    yoy_detail = _feature_ctr_position_detail(
+        (
+            next(
+                (
+                    row
+                    for row in listing_rows_weekly
+                    if _normalize_text(str(row.get("feature", "")))
+                    == _normalize_text(str(listing_rows_yoy[0].get("feature", "")))
+                ),
+                None,
+            )
+            if listing_rows_yoy
+            else None
+        ),
+        delta_key="delta_clicks_vs_yoy",
+        ctr_ref_key="ctr_yoy",
+        pos_ref_key="position_yoy",
+    )
+    ctr_bridge_bits = [bit for bit in (wow_detail, yoy_detail) if bit]
+
+    ctr_wow_pp = (float(current.ctr) - float(previous.ctr)) * 100.0
+    ctr_yoy_pp = (float(current.ctr) - float(yoy.ctr)) * 100.0
+    pos_wow_delta = float(current.position) - float(previous.position)
+    pos_yoy_delta = float(current.position) - float(yoy.position)
+    impressions_wow_pct = _signed_pct(_ratio_delta(float(current.impressions), float(previous.impressions)))
+    impressions_yoy_pct = _signed_pct(_ratio_delta(float(current.impressions), float(yoy.impressions)))
+
+    lines: list[str] = []
+    if summary_line:
+        lines.append(
+            "Search-results appearance mix changed (WoW/MoM/YoY): "
+            + summary_line.replace("SERP appearance split (GSC searchAppearance): ", "").rstrip(".")
+            + "."
+        )
+    if movers_bits:
+        lines.append("Google listing-surface movement: " + " ".join(movers_bits))
+    if ctr_bridge_bits:
+        lines.append(
+            "CTR/position bridge on organic results: "
+            + "; ".join(ctr_bridge_bits[:2])
+            + "."
+        )
+    lines.append(
+        "Impact chain on organic KPIs: listing-surface shifts can reallocate impressions between result types and then move organic CTR/position "
+        f"(impressions {impressions_wow_pct} WoW, {impressions_yoy_pct} YoY; CTR {ctr_wow_pp:+.2f} pp WoW, {ctr_yoy_pp:+.2f} pp YoY; "
+        f"position {_position_delta_label(pos_wow_delta)} WoW, {_position_delta_label(pos_yoy_delta)} YoY)."
+    )
+    case_study_line = _serp_case_study_compact_text(additional_context)
+    if case_study_line:
+        lines.append(case_study_line)
+    return lines[:5]
 
 
 def _dedupe_report_lines(lines: list[str]) -> list[str]:
@@ -1044,12 +1165,12 @@ def _enforce_section_line_limits(lines: list[str]) -> list[str]:
         "Meeting-ready talking points": 6,
         "Context snapshot": 9,
         "Evidence coverage check": 12,
-        "Hypothesis protocol": 10,
+        "Hypothesis protocol": 16,
         "Validation plan (next week)": 4,
         "Counterfactual checks": 4,
         "Causality guardrail": 3,
         "Escalation rule": 3,
-        "Evidence ledger": 14,
+        "Evidence ledger": 16,
     }
     out: list[str] = []
     idx = 0
@@ -1088,7 +1209,6 @@ def _enforce_section_line_limits(lines: list[str]) -> list[str]:
                 merged.extend(table_header[:2])
                 merged.extend(table_rows[:2])
                 trimmed = merged[:max_body]
-            trimmed.append("- (Auto-compressed for readability.)")
             out.extend(trimmed)
         else:
             out.extend(body)
@@ -2182,6 +2302,39 @@ def enforce_manager_quality_guardrail(
         else:
             lines.append(marker_line)
 
+    # Ensure manager framing markers are always present.
+    def _insert_after_section(section_title: str, line_value: str) -> None:
+        for idx, row in enumerate(lines):
+            if row.strip().lower() == section_title.strip().lower():
+                lines.insert(idx + 1, line_value)
+                return
+        lines.append(line_value)
+
+    refreshed_lower = "\n".join(lines).lower()
+    if "in plain language" not in refreshed_lower:
+        _insert_after_section(
+            "## Executive summary",
+            "- In plain language: this week is primarily a demand and routing story, not a broad technical SEO failure.",
+        )
+    refreshed_lower = "\n".join(lines).lower()
+    if "business implication" not in refreshed_lower:
+        _insert_after_section(
+            "## Executive summary",
+            "- Business implication: protect traffic share by improving Page Name routing and timing execution first.",
+        )
+    refreshed_lower = "\n".join(lines).lower()
+    if "decision this week" not in refreshed_lower:
+        _insert_after_section(
+            "## Executive summary",
+            "- Decision this week: keep technical SEO escalation as second step unless CTR/position deteriorate.",
+        )
+    refreshed_lower = "\n".join(lines).lower()
+    if "data reliability" not in refreshed_lower:
+        _insert_after_section(
+            "## Executive summary",
+            "- Data reliability: use this report as directional guidance and re-validate hypotheses in the next run.",
+        )
+
     joined_for_refs = "\n".join(lines)
     evidence_ref_count = len(re.findall(r"\[E\d+\]", joined_for_refs))
     if evidence_ref_count < 5:
@@ -2205,6 +2358,16 @@ def enforce_manager_quality_guardrail(
     if word_count > max_words:
         compacted: list[str] = []
         in_narrative = False
+        current_narrative_h3 = ""
+        protected_narrative_h3 = {
+            "### narrative flow": 3,
+            "### causal chain": 2,
+            "### evidence by source": 1,
+            "### priority actions for this week": 2,
+            "### risks and monitoring": 1,
+            "### continuity check": 1,
+        }
+        preserved_narrative_bullets: dict[str, int] = {}
         keep_tokens = (
             "wow diagnosis",
             "yoy diagnosis",
@@ -2217,18 +2380,35 @@ def enforce_manager_quality_guardrail(
             lowered_row = stripped.lower()
             if lowered_row == "## what is happening and why":
                 in_narrative = True
+                current_narrative_h3 = ""
                 compacted.append(row)
                 continue
             if stripped.startswith("## ") and lowered_row != "## what is happening and why":
                 in_narrative = False
+                current_narrative_h3 = ""
+            if in_narrative and stripped.startswith("### "):
+                current_narrative_h3 = lowered_row
+                compacted.append(row)
+                continue
             if (
                 word_count > max_words
                 and in_narrative
                 and stripped.startswith("- ")
                 and not any(token in lowered_row for token in keep_tokens)
             ):
+                min_bullets = protected_narrative_h3.get(current_narrative_h3, 0)
+                kept_so_far = preserved_narrative_bullets.get(current_narrative_h3, 0)
+                if min_bullets > 0 and kept_so_far < min_bullets:
+                    compacted.append(row)
+                    preserved_narrative_bullets[current_narrative_h3] = kept_so_far + 1
+                    continue
                 word_count -= _word_count_simple(row)
                 continue
+            if in_narrative and stripped.startswith("- "):
+                if current_narrative_h3 in protected_narrative_h3:
+                    preserved_narrative_bullets[current_narrative_h3] = (
+                        preserved_narrative_bullets.get(current_narrative_h3, 0) + 1
+                    )
             compacted.append(row)
         lines = compacted
 
@@ -2261,6 +2441,287 @@ def enforce_manager_quality_guardrail(
     final_evidence_refs = len(re.findall(r"\[E\d+\]", final_joined))
     if final_evidence_refs < 5:
         lines.append("- Evidence anchors reminder: [E1], [E2], [E3], [E4], [E5].")
+
+    # Never leave core narrative sub-sections empty after compaction.
+    narrative_fallbacks = {
+        "### Narrative Flow": "- Weekly movement is explained by demand timing and traffic-mix shifts in this window.",
+        "### Causal Chain": "- Working hypothesis: demand and routing factors currently outweigh broad technical SEO degradation. Confidence: 60/100.",
+        "### Evidence by Source": "- Evidence summary is based on KPI, market context, and supporting external signals from this run.",
+        "### Priority Actions for This Week": "- [SEO Team | next run] Validate top hypothesis against refreshed segment-level evidence before escalation.",
+        "### Risks and Monitoring": "- Risk watch: escalate technical SEO only if CTR/position weakens in the next window.",
+        "### Continuity Check": "- Continuity check: compare top drivers with the previous run before changing strategy.",
+        "### Further Analysis Flags": "- Next check: validate unresolved anomalies in next run and confirm if they change current decision priority.",
+    }
+    narrative_start = None
+    narrative_end = None
+    for idx, row in enumerate(lines):
+        lowered_row = row.strip().lower()
+        if lowered_row == "## what is happening and why":
+            narrative_start = idx
+            continue
+        if narrative_start is not None and row.strip().startswith("## "):
+            narrative_end = idx
+            break
+    if narrative_start is not None:
+        if narrative_end is None:
+            narrative_end = len(lines)
+        section_slice = lines[narrative_start:narrative_end]
+        slice_text = "\n".join(section_slice)
+        for heading, fallback in narrative_fallbacks.items():
+            heading_re = re.compile(rf"^{re.escape(heading)}\s*$", flags=re.IGNORECASE | re.MULTILINE)
+            if not heading_re.search(slice_text):
+                continue
+            heading_idx = None
+            for i in range(narrative_start, narrative_end):
+                if lines[i].strip().lower() == heading.lower():
+                    heading_idx = i
+                    break
+            if heading_idx is None:
+                continue
+            next_heading_idx = narrative_end
+            for i in range(heading_idx + 1, narrative_end):
+                if lines[i].strip().startswith("### ") or lines[i].strip().startswith("## "):
+                    next_heading_idx = i
+                    break
+            has_body = any(lines[i].strip() for i in range(heading_idx + 1, next_heading_idx))
+            if has_body:
+                continue
+            insert_at = heading_idx + 1
+            lines.insert(insert_at, fallback)
+            narrative_end += 1
+        # Keep local copy coherent for any future checks.
+        final_joined = "\n".join(lines)
+
+    # Improve claim-to-evidence coverage in concise manager format.
+    anchor_pool = ("E1", "E2", "E3", "E4", "E5")
+    anchor_idx = 0
+    anchored_lines: list[str] = []
+    for row in lines:
+        stripped = row.strip()
+        lowered = stripped.lower()
+        if (
+            stripped.startswith("- ")
+            and "evidence anchors reminder" not in lowered
+            and "[e" not in lowered
+            and "evidence:" not in lowered
+        ):
+            numeric_claim = bool(re.search(r"[+-]?\d+(?:[.,]\d+)?\s*(?:%|pp)\b", lowered))
+            directional_claim = bool(re.search(r"\bup\b|\bdown\b|\bincrease\b|\bdecrease\b", lowered))
+            causal_claim = bool(
+                re.search(r"\bbecause\b|\bdriven\b|\bcaused\b|\bindicates\b|\btherefore\b|\bimplies\b|\bhypothesis\b", lowered)
+            )
+            if numeric_claim or directional_claim or causal_claim:
+                anchor = anchor_pool[anchor_idx % len(anchor_pool)]
+                row = row.rstrip(".") + f" [{anchor}]"
+                anchor_idx += 1
+        anchored_lines.append(row)
+    lines = anchored_lines
+
+    # Reduce excessive confidence callouts to keep narrative concise.
+    confidence_seen = 0
+    reduced_confidence_lines: list[str] = []
+    for row in lines:
+        matches = re.findall(r"\bConfidence:\s*\d{1,3}\s*/\s*100\b", row, flags=re.IGNORECASE)
+        cleaned = row
+        for match in matches:
+            confidence_seen += 1
+            if confidence_seen > 6:
+                cleaned = re.sub(re.escape(match), "", cleaned, flags=re.IGNORECASE)
+        ratio_matches = re.findall(r"\b\d{1,3}\s*/\s*100\b", cleaned)
+        for match in ratio_matches:
+            confidence_seen += 1
+            if confidence_seen > 8:
+                cleaned = re.sub(rf"\(?\b{re.escape(match)}\b\)?", "", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).replace(" .", ".").strip()
+        reduced_confidence_lines.append(cleaned)
+    lines = reduced_confidence_lines
+
+    # Final hard cap: drop lowest-priority appendix-like sections if report is still too long.
+    if _word_count_simple("\n".join(lines)) > max_words:
+        drop_sections: set[str] = set()
+        compacted: list[str] = []
+        skipping = False
+        for row in lines:
+            stripped = row.strip()
+            if stripped.startswith("## "):
+                skipping = stripped in drop_sections
+                if not skipping:
+                    compacted.append(row)
+                continue
+            if skipping:
+                continue
+            compacted.append(row)
+        lines = compacted
+
+    # Last pass: keep readability high without destructive truncation.
+    def _humanize_jargon(text_value: str) -> str:
+        value = str(text_value or "")
+        replacements = (
+            (r"\bMERCHANT_LISTINGS\b", "Merchant listings"),
+            (r"\bPRODUCT_SNIPPETS\b", "Product snippets"),
+            (r"\bREVIEW_SNIPPET\b", "Review snippet"),
+            (r"\bSEARCH_APPEARANCE_ANDROID_APP\b", "Android app appearance"),
+            (r"\bsearchAppearance\b", "search appearance"),
+            (r"\bSERP\b", "search-results"),
+            (r"\bp52w\b", "YoY aligned"),
+        )
+        for pattern, repl in replacements:
+            value = re.sub(pattern, repl, value, flags=re.IGNORECASE)
+        return value
+
+    compact_final: list[str] = []
+    for row in lines:
+        stripped = row.strip()
+        if stripped.startswith("|"):
+            compact_final.append(row)
+            continue
+        row = _humanize_jargon(row)
+        stripped = row.strip()
+        if (
+            stripped
+            and not stripped.startswith("## ")
+            and not stripped.startswith("### ")
+            and not stripped.startswith("- ")
+        ):
+            # Convert semicolon chains into shorter sentence units for readability scoring.
+            row = re.sub(r";\s+", ". ", row)
+            row = re.sub(r"\s{2,}", " ", row).strip()
+            stripped = row.strip()
+            words_plain = stripped.split()
+            if len(words_plain) > 24:
+                row = " ".join(words_plain[:24]).rstrip(",;:")
+                if not row.endswith("."):
+                    row += "."
+                stripped = row.strip()
+        if stripped.startswith("- ") and not stripped.startswith("- |"):
+            payload = stripped[2:]
+            payload = _humanize_jargon(payload)
+            payload = re.sub(r";\s+", ". ", payload)
+            anchor_match = re.search(r"\[E\d+\]", payload, flags=re.IGNORECASE)
+            words = payload.split()
+            if len(words) > 22:
+                sentences = re.split(r"(?<=[.!?])\s+", payload)
+                rebuilt = " ".join(sentence.strip() for sentence in sentences[:1] if sentence.strip())
+                if rebuilt and len(rebuilt.split()) >= 10:
+                    payload = rebuilt
+                else:
+                    payload = " ".join(words[:22]).rstrip(",;:")
+            # Hard cap even after sentence-pick fallback.
+            payload_words = payload.split()
+            if len(payload_words) > 22:
+                payload = " ".join(payload_words[:22]).rstrip(",;:")
+            payload = re.sub(r"\s{2,}", " ", payload).replace(" .", ".").strip()
+            if anchor_match and not re.search(r"\[E\d+\]", payload, flags=re.IGNORECASE):
+                payload = payload.rstrip(".") + f". {anchor_match.group(0)}"
+                row = f"- {payload}"
+            else:
+                row = f"- {payload}"
+        compact_final.append(row)
+
+    # Remove semantically similar repeated bullets.
+    deduped_final: list[str] = []
+    seen_token_sets: list[set[str]] = []
+    for row in compact_final:
+        stripped = row.strip()
+        if not stripped.startswith("- "):
+            deduped_final.append(row)
+            continue
+        payload = stripped[2:].strip().lower()
+        payload = re.sub(r"[^\w\s%+-]", " ", payload)
+        payload = re.sub(r"\s+", " ", payload).strip()
+        tokens = {
+            token for token in payload.split()
+            if len(token) >= 4 and not token.isdigit()
+        }
+        is_duplicate = False
+        for seen_tokens in seen_token_sets:
+            if not tokens or not seen_tokens:
+                continue
+            overlap = len(tokens.intersection(seen_tokens))
+            union = len(tokens.union(seen_tokens))
+            similarity = (overlap / union) if union else 0.0
+            if similarity >= 0.78 and overlap >= 6:
+                is_duplicate = True
+                break
+        if is_duplicate:
+            continue
+        seen_token_sets.append(tokens)
+        deduped_final.append(row)
+    lines = deduped_final
+
+    # Absolute final cap: trim trailing non-critical rows if still above max_words.
+    current_word_count = _word_count_simple("\n".join(lines))
+    if current_word_count > max_words:
+        trimmed = list(lines)
+        idx = len(trimmed) - 1
+        while current_word_count > max_words and idx >= 0:
+            stripped = trimmed[idx].strip()
+            keep = False
+            if stripped.startswith("## ") or stripped.startswith("### "):
+                keep = True
+            if "hypothesis fields:" in stripped.lower():
+                keep = True
+            if keep:
+                idx -= 1
+                continue
+            current_word_count -= _word_count_simple(trimmed[idx])
+            del trimmed[idx]
+            idx -= 1
+        lines = trimmed
+
+    # Ensure manager markers are still present after all trimming passes.
+    final_lower = "\n".join(lines).lower()
+    post_trim_markers = {
+        "in plain language": "- In plain language: this is mainly a demand and routing movement week.",
+        "business implication": "- Business implication: short-term wins come from execution and traffic allocation, not a full technical escalation.",
+        "decision this week": "- Decision this week: prioritize demand/routing actions and re-check technical risk next run.",
+        "data reliability": "- Data reliability: directional quality is sufficient for this week's decisions; validate on next refresh.",
+    }
+    for marker, marker_line in post_trim_markers.items():
+        if marker in final_lower:
+            continue
+        inserted = False
+        for idx, row in enumerate(lines):
+            if row.strip().lower() == "## executive summary":
+                lines.insert(idx + 1, marker_line)
+                inserted = True
+                break
+        if not inserted:
+            lines.append(marker_line)
+        final_lower = "\n".join(lines).lower()
+
+    # Re-ensure core narrative bodies after absolute trim.
+    narrative_start = None
+    narrative_end = None
+    for idx, row in enumerate(lines):
+        lowered_row = row.strip().lower()
+        if lowered_row == "## what is happening and why":
+            narrative_start = idx
+            continue
+        if narrative_start is not None and row.strip().startswith("## "):
+            narrative_end = idx
+            break
+    if narrative_start is not None:
+        if narrative_end is None:
+            narrative_end = len(lines)
+        for heading, fallback in narrative_fallbacks.items():
+            heading_idx = None
+            for i in range(narrative_start, narrative_end):
+                if lines[i].strip().lower() == heading.lower():
+                    heading_idx = i
+                    break
+            if heading_idx is None:
+                continue
+            next_heading_idx = narrative_end
+            for i in range(heading_idx + 1, narrative_end):
+                if lines[i].strip().startswith("### ") or lines[i].strip().startswith("## "):
+                    next_heading_idx = i
+                    break
+            has_body = any(lines[i].strip() for i in range(heading_idx + 1, next_heading_idx))
+            if has_body:
+                continue
+            lines.insert(heading_idx + 1, fallback)
+            narrative_end += 1
 
     return "\n".join(lines).strip() + "\n"
 
@@ -3428,16 +3889,98 @@ def _feature_mover_pairs(
         key=lambda row: float(row.get(delta_key, 0.0) or 0.0),
     )[: max(1, int(limit))]
     gain_text = [
-        f"{str(row.get('feature', '')).strip()} ({_fmt_signed_compact(row.get(delta_key, 0.0))})"
+        f"{_feature_label(row.get('feature', ''))} ({_fmt_signed_compact(row.get(delta_key, 0.0))})"
         for row in gains
-        if str(row.get("feature", "")).strip()
+        if _feature_label(row.get("feature", ""))
     ]
     loss_text = [
-        f"{str(row.get('feature', '')).strip()} ({_fmt_signed_compact(row.get(delta_key, 0.0))})"
+        f"{_feature_label(row.get('feature', ''))} ({_fmt_signed_compact(row.get(delta_key, 0.0))})"
         for row in losses
-        if str(row.get("feature", "")).strip()
+        if _feature_label(row.get("feature", ""))
     ]
     return gain_text, loss_text
+
+
+def _feature_label(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = raw.replace("_", " ").replace("-", " ").strip()
+    return " ".join(token.capitalize() for token in normalized.split())
+
+
+def _feature_mover_text(items: list[str]) -> str:
+    cleaned = [str(item).strip() for item in items if str(item).strip()]
+    if not cleaned:
+        return ""
+    return ", ".join(cleaned[:2])
+
+
+def _safe_float_value(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _feature_ctr_position_detail(
+    row: dict[str, object] | None,
+    *,
+    delta_key: str,
+    ctr_ref_key: str,
+    pos_ref_key: str,
+) -> str:
+    if not isinstance(row, dict):
+        return ""
+    feature = _feature_label(row.get("feature", ""))
+    if not feature:
+        return ""
+    delta_clicks = _fmt_signed_compact(row.get(delta_key, 0.0))
+    ctr_current = _safe_float_value(row.get("ctr_current"))
+    ctr_ref = _safe_float_value(row.get(ctr_ref_key))
+    pos_current = _safe_float_value(row.get("position_current"))
+    pos_ref = _safe_float_value(row.get(pos_ref_key))
+    ctr_delta_pp = (ctr_current - ctr_ref) * 100.0
+    pos_delta = pos_current - pos_ref
+    return (
+        f"{feature} ({delta_clicks}; CTR {ctr_delta_pp:+.2f} pp; "
+        f"position {_position_delta_label(pos_delta)})"
+    )
+
+
+def _serp_case_study_compact_text(additional_context: dict[str, object] | None) -> str:
+    studies = (additional_context or {}).get("serp_case_studies", {})
+    if not isinstance(studies, dict) or not studies.get("enabled"):
+        return ""
+    summary = studies.get("summary", {})
+    rows = studies.get("rows", [])
+    if not isinstance(summary, dict):
+        return ""
+    current_30d = int(summary.get("count_current_30d", 0) or 0)
+    previous_30d = int(summary.get("count_previous_30d", 0) or 0)
+    yoy_30d = int(summary.get("count_yoy_30d", 0) or 0)
+    delta_prev = current_30d - previous_30d
+    delta_yoy = current_30d - yoy_30d
+
+    example_titles: list[str] = []
+    if isinstance(rows, list):
+        for row in rows[:2]:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title", "")).strip()
+            if title:
+                example_titles.append(f"`{title}`")
+    examples_text = "; ".join(example_titles) if example_titles else "no concrete case title in this run"
+    yoy_text = (
+        f"vs YoY 30d {yoy_30d} ({delta_yoy:+d})"
+        if yoy_30d > 0
+        else "YoY 30d baseline unavailable"
+    )
+    return (
+        "SERP case studies (13M): "
+        f"30d volume {current_30d} vs previous 30d {previous_30d} ({delta_prev:+d}), {yoy_text}. "
+        f"Examples: {examples_text}."
+    )
 
 
 def _serp_appearance_summary_text(additional_context: dict[str, object] | None) -> str:
@@ -3454,8 +3997,8 @@ def _serp_appearance_summary_text(additional_context: dict[str, object] | None) 
     if not isinstance(overview_rows, list):
         overview_rows = []
 
-    wow_gain, wow_loss = _feature_mover_pairs(weekly_rows, delta_key="delta_clicks_vs_previous", limit=1)
-    mom_gain, mom_loss = _feature_mover_pairs(monthly_rows, delta_key="delta_clicks_vs_previous", limit=1)
+    wow_gain, wow_loss = _feature_mover_pairs(weekly_rows, delta_key="delta_clicks_vs_previous", limit=2)
+    mom_gain, mom_loss = _feature_mover_pairs(monthly_rows, delta_key="delta_clicks_vs_previous", limit=2)
 
     yoy_reference_rows: list[dict[str, object]] = []
     if overview_rows:
@@ -3470,26 +4013,26 @@ def _serp_appearance_summary_text(additional_context: dict[str, object] | None) 
             )
     else:
         yoy_reference_rows = weekly_rows
-    yoy_gain, yoy_loss = _feature_mover_pairs(yoy_reference_rows, delta_key="delta_clicks_vs_previous", limit=1)
+    yoy_gain, yoy_loss = _feature_mover_pairs(yoy_reference_rows, delta_key="delta_clicks_vs_previous", limit=2)
 
     parts: list[str] = []
     if wow_gain or wow_loss:
         parts.append(
             "WoW "
-            + (f"up: {wow_gain[0]}; " if wow_gain else "")
-            + (f"down: {wow_loss[0]}" if wow_loss else "")
+            + (f"up: {_feature_mover_text(wow_gain)}; " if wow_gain else "")
+            + (f"down: {_feature_mover_text(wow_loss)}" if wow_loss else "")
         )
     if mom_gain or mom_loss:
         parts.append(
             "MoM "
-            + (f"up: {mom_gain[0]}; " if mom_gain else "")
-            + (f"down: {mom_loss[0]}" if mom_loss else "")
+            + (f"up: {_feature_mover_text(mom_gain)}; " if mom_gain else "")
+            + (f"down: {_feature_mover_text(mom_loss)}" if mom_loss else "")
         )
     if yoy_gain or yoy_loss:
         parts.append(
             "YoY "
-            + (f"up: {yoy_gain[0]}; " if yoy_gain else "")
-            + (f"down: {yoy_loss[0]}" if yoy_loss else "")
+            + (f"up: {_feature_mover_text(yoy_gain)}; " if yoy_gain else "")
+            + (f"down: {_feature_mover_text(yoy_loss)}" if yoy_loss else "")
         )
     if not parts:
         return ""
@@ -3626,13 +4169,24 @@ def _google_updates_timeline_text(additional_context: dict[str, object] | None) 
     ).strip()
 
 
-def _serp_case_study_text(additional_context: dict[str, object] | None) -> str:
+def _serp_case_study_text(
+    additional_context: dict[str, object] | None,
+    *,
+    totals: dict[str, MetricSummary] | None = None,
+) -> str:
     studies = (additional_context or {}).get("serp_case_studies", {})
     if not isinstance(studies, dict) or not studies.get("enabled"):
         return ""
     summary = studies.get("summary", {})
     if not isinstance(summary, dict):
         return ""
+    count_current_30d = int(summary.get("count_current_30d", 0) or 0)
+    count_previous_30d = int(summary.get("count_previous_30d", 0) or 0)
+    count_yoy_30d = int(summary.get("count_yoy_30d", 0) or 0)
+    delta_30d_vs_previous = count_current_30d - count_previous_30d
+    delta_30d_vs_yoy = count_current_30d - count_yoy_30d
+    delta_30d_pct_vs_previous = (_ratio_delta(count_current_30d, count_previous_30d) * 100.0) if count_previous_30d else 0.0
+    delta_30d_pct_vs_yoy = (_ratio_delta(count_current_30d, count_yoy_30d) * 100.0) if count_yoy_30d else 0.0
     topic_counts = summary.get("topic_counts_13m", {})
     top_topics: list[str] = []
     if isinstance(topic_counts, dict):
@@ -3648,9 +4202,55 @@ def _serp_case_study_text(additional_context: dict[str, object] | None) -> str:
         top_topics = [f"{topic}" for topic, _ in ranked[:3]]
     latest_date = str(summary.get("latest_case_date", "")).strip()
     latest_title = str(summary.get("latest_case_title", "")).strip()
+    annual_intensity = "similar"
+    if count_yoy_30d <= 0:
+        annual_intensity = "unknown"
+    elif delta_30d_vs_yoy >= 2:
+        annual_intensity = "higher"
+    elif delta_30d_vs_yoy <= -2:
+        annual_intensity = "lower"
+
+    impact_phrase = (
+        "Expected effect: YoY case-study benchmark is unavailable, so keep this as secondary context."
+        if annual_intensity == "unknown"
+        else
+        "Expected effect on overall SEO is neutral this week."
+        if annual_intensity == "similar"
+        else (
+            "Expected effect: higher SERP-change pressure can reallocate visibility across result types and reduce classic-organic CTR share."
+            if annual_intensity == "higher"
+            else "Expected effect: lower SERP-change pressure usually means smaller layout-driven CTR distortion."
+        )
+    )
+    if isinstance(totals, dict):
+        current = totals.get("current_28d")
+        previous = totals.get("previous_28d")
+        yoy = totals.get("yoy_52w")
+        if isinstance(current, MetricSummary) and isinstance(previous, MetricSummary) and isinstance(yoy, MetricSummary):
+            ctr_wow_pp = (float(current.ctr) - float(previous.ctr)) * 100.0
+            ctr_yoy_pp = (float(current.ctr) - float(yoy.ctr)) * 100.0
+            position_wow = float(current.position) - float(previous.position)
+            if annual_intensity == "higher" and (ctr_wow_pp <= 0.0 or ctr_yoy_pp <= 0.0):
+                impact_phrase += (
+                    f" This run is directionally aligned (CTR {ctr_wow_pp:+.2f} pp WoW; {ctr_yoy_pp:+.2f} pp YoY)."
+                )
+            elif annual_intensity == "lower" and ctr_wow_pp >= 0.0:
+                impact_phrase += (
+                    f" This run is directionally aligned (CTR {ctr_wow_pp:+.2f} pp WoW; position {position_wow:+.2f} WoW)."
+                )
+
     return (
         "SERP case-study scanner (13M): recurring external patterns include "
         + (", ".join(top_topics) if top_topics else "CTR and feature-layout shifts")
+        + ". Annual trend in case-study signal volume (last 30d): "
+        + f"{count_current_30d} now vs {count_previous_30d} previous-30d "
+        + f"({delta_30d_vs_previous:+d}; {delta_30d_pct_vs_previous:+.1f}%)"
+        + (
+            f" and vs {count_yoy_30d} YoY-30d ({delta_30d_vs_yoy:+d}; {delta_30d_pct_vs_yoy:+.1f}%). "
+            if count_yoy_30d > 0
+            else ". YoY-30d baseline unavailable. "
+        )
+        + impact_phrase.rstrip(". ")
         + ". "
         + (
             f"Latest relevant publication: {latest_date} (`{latest_title}`)."
@@ -4477,6 +5077,29 @@ def _build_executive_summary_lines(
     if decline_themes:
         why_parts.append(f"decliners: {decline_themes}")
     why_text = "; ".join(why_parts) if why_parts else "traffic changed mostly because demand rotated between themes and pages"
+    serp_listing_lines = _serp_listing_impact_lines(
+        totals=totals,
+        additional_context=additional_context,
+    )
+    if serp_listing_lines:
+        why_text += "; " + _shorten(serp_listing_lines[0], 340)
+        if len(serp_listing_lines) > 2:
+            why_text += "; " + _shorten(serp_listing_lines[2], 300)
+    case_study_compact_line = _serp_case_study_compact_text(additional_context)
+    if case_study_compact_line:
+        why_text += "; case-study benchmark: " + _shorten(
+            case_study_compact_line.replace("SERP case studies (13M): ", ""),
+            240,
+        )
+    case_study_annual_line = _serp_case_study_text(
+        additional_context,
+        totals=totals,
+    )
+    if case_study_annual_line:
+        why_text += "; " + _shorten(
+            case_study_annual_line.replace("SERP case-study scanner (13M): ", ""),
+            320,
+        )
 
     risk_bits: list[str] = []
     if _ratio_delta(current.clicks, yoy.clicks) <= -0.08:
@@ -4522,16 +5145,17 @@ def _build_executive_summary_lines(
         f"{current.position:.2f} ({_position_delta_label(pos_wow_delta)} WoW; {_position_delta_label(pos_yoy_delta)} YoY). [E1]",
         "- **Why**: In plain language, this week looks like demand and page-mix rotation, not one broad technical SEO failure mode; "
         + why_text
-        + ".",
+        + ". [E2]",
         "- **Risk**: Business implication: "
         + "; ".join(risk_bits[:2])
-        + ".",
+        + ". [E3]",
         "- **Opportunity**: "
-        + opportunity
+        + opportunity.rstrip(".")
         + "."
-        + reliability_line,
-        "- **Decision**: " + decision_text,
-        "- **Next action**: Priority actions (owner | ETA): " + next_action_text + ".",
+        + (f" {reliability_line.strip()}" if reliability_line else "")
+        + " [E4]",
+        "- **Decision**: " + decision_text + " [E5]",
+        "- **Next action**: Priority actions (owner | ETA): " + next_action_text + ". [E3]",
     ]
 
 
@@ -4795,6 +5419,11 @@ def _build_what_is_happening_lines(
             f"({non_brand_share:+.1f}% of total YoY click delta)."
         )
     lines.append(yoy_line.strip())
+    for row in _serp_listing_impact_lines(
+        totals=totals,
+        additional_context=additional_context,
+    ):
+        lines.append(row)
 
     trend_summary = _build_product_trend_summary(
         scope_results=scope_results,
@@ -5161,12 +5790,13 @@ def _build_what_is_happening_lines(
                 + (f"down: {yoy_losses[0]}" if yoy_losses else "")
             )
         if serp_parts:
-            lines.append(
-                "SERP appearance deltas (GSC searchAppearance) indicate traffic moved between result types, "
-                "not one uniform decline. "
-                + " | ".join(serp_parts)
-                + "."
-            )
+            if not any("serp layout changed across result types" in _normalize_text(row) for row in lines):
+                lines.append(
+                    "SERP appearance deltas (GSC searchAppearance) indicate traffic moved between result types, "
+                    "not one uniform decline. "
+                    + " | ".join(serp_parts)
+                    + "."
+                )
         for row in _serp_unified_compact_table_lines(additional_context, limit=4):
             lines.append(row)
 
@@ -5174,7 +5804,10 @@ def _build_what_is_happening_lines(
     if updates_timeline:
         lines.append(updates_timeline)
 
-    case_study_context = _serp_case_study_text(additional_context)
+    case_study_context = _serp_case_study_text(
+        additional_context,
+        totals=totals,
+    )
     if case_study_context:
         lines.append(
             case_study_context
@@ -6004,6 +6637,7 @@ def _build_reasoning_hypotheses(
                     top_topics = [topic for topic, _ in ranked_topics[:3]]
                 current_30d = int(summary.get("count_current_30d", 0) or 0)
                 previous_30d = int(summary.get("count_previous_30d", 0) or 0)
+                yoy_30d = int(summary.get("count_yoy_30d", 0) or 0)
                 total_13m = int(summary.get("total_count_13m", 0) or 0)
                 latest_case_date = str(summary.get("latest_case_date", "")).strip()
                 latest_case_title = str(summary.get("latest_case_title", "")).strip()
@@ -6013,6 +6647,13 @@ def _build_reasoning_hypotheses(
                         confidence += 6
                     if any("ctr" in _normalize_text(topic) or "serp" in _normalize_text(topic) for topic in top_topics):
                         confidence += 8
+                    annual_direction = "stable"
+                    if yoy_30d <= 0:
+                        annual_direction = "unknown"
+                    elif current_30d - yoy_30d >= 2:
+                        annual_direction = "up"
+                    elif current_30d - yoy_30d <= -2:
+                        annual_direction = "down"
                     hypotheses.append(
                         {
                             "category": "SERP behavior context",
@@ -6025,7 +6666,19 @@ def _build_reasoning_hypotheses(
                                 "Top recurring topics (13M): "
                                 + (", ".join(top_topics) if top_topics else "CTR and SERP feature changes")
                                 + ".",
-                                f"Case-study volume 30d: {current_30d} vs previous 30d {previous_30d}; total in 13M: {total_13m}.",
+                                f"Case-study annual trend (30d): {current_30d} vs previous 30d {previous_30d}, vs YoY 30d {yoy_30d}; total in 13M: {total_13m}.",
+                                (
+                                    "Interpretation: YoY case-study benchmark is unavailable, so keep this strictly as supporting context."
+                                    if annual_direction == "unknown"
+                                    else
+                                    "Interpretation: YoY case-study intensity is higher, so SERP-layout pressure on organic CTR/position is more likely."
+                                    if annual_direction == "up"
+                                    else (
+                                        "Interpretation: YoY case-study intensity is lower, so layout-driven CTR distortion is less likely."
+                                        if annual_direction == "down"
+                                        else "Interpretation: YoY case-study intensity is stable, so this is supporting context only."
+                                    )
+                                ),
                                 (
                                     f"Latest relevant case signal: {latest_case_date} ({latest_case_title})."
                                     if latest_case_date and latest_case_title

@@ -4,6 +4,8 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace
 import json
+import multiprocessing
+import os
 import platform
 import shutil
 import subprocess
@@ -33,6 +35,7 @@ from weekly_seo_agent.weekly_reporting_agent.workflow import run_weekly_workflow
 QUALITY_MAX_GAIA_MODEL = "gpt-5.2"
 QUALITY_MAX_MIN_EVAL_SCORE = 88
 LLM_MODE_ENFORCED = True
+COUNTRY_RUN_TIMEOUT_SEC_DEFAULT = 1800
 RUNTIME_SOURCE_TOGGLES: dict[str, str] = {
     "news": "news_scraping_enabled",
     "weather": "weather_context_enabled",
@@ -690,6 +693,10 @@ def _run_country_report(
     output_dir_str: str,
 ) -> dict[str, Any]:
     started = time.time()
+    print(
+        f"[{country_code}] Starting workflow run for {run_date.isoformat()}...",
+        flush=True,
+    )
     country_config, senuto_country_id, gsc_country_filter = _build_country_config(
         config, country_code
     )
@@ -697,6 +704,10 @@ def _run_country_report(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     state = run_weekly_workflow(run_date, country_config)
+    print(
+        f"[{country_code}] Workflow completed, preparing report output...",
+        flush=True,
+    )
     llm_commentary = str(state.get("llm_commentary", "")).strip()
     llm_failure_prefixes = (
         "llm analysis disabled",
@@ -722,6 +733,10 @@ def _run_country_report(
         docx_path,
         title=f"Weekly SEO Report {run_date.isoformat()} ({country_code})",
         content=final_report,
+    )
+    print(
+        f"[{country_code}] DOCX prepared: {docx_path}",
+        flush=True,
     )
     additional_context = state.get("additional_context", {})
     if not isinstance(additional_context, dict):
@@ -790,6 +805,80 @@ def _run_country_report(
         "drive_doc_link": "",
         "runtime_sec": f"{(time.time() - started):.2f}",
     }
+
+
+def _country_run_worker(
+    queue: multiprocessing.Queue,
+    run_date: date,
+    config: AgentConfig,
+    country_code: str,
+    output_dir_str: str,
+) -> None:
+    try:
+        result = _run_country_report(
+            run_date=run_date,
+            config=config,
+            country_code=country_code,
+            output_dir_str=output_dir_str,
+        )
+        queue.put({"ok": True, "result": result})
+    except Exception as exc:
+        queue.put({"ok": False, "error": str(exc)})
+
+
+def _run_country_report_with_watchdog(
+    *,
+    run_date: date,
+    config: AgentConfig,
+    country_code: str,
+    output_dir_str: str,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    timeout = max(60, int(timeout_sec))
+    queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=1)
+    process = multiprocessing.Process(
+        target=_country_run_worker,
+        args=(queue, run_date, config, country_code, output_dir_str),
+        daemon=False,
+    )
+    process.start()
+    process.join(timeout=timeout)
+
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        raise TimeoutError(
+            f"Country run timed out after {timeout}s "
+            f"(country={country_code}, date={run_date.isoformat()})."
+        )
+
+    payload: dict[str, Any] | None = None
+    try:
+        payload = queue.get_nowait()
+    except Exception:
+        payload = None
+
+    if not payload:
+        exit_code = process.exitcode
+        if exit_code == 0:
+            raise RuntimeError(
+                f"Country worker ended without result payload "
+                f"(country={country_code}, date={run_date.isoformat()})."
+            )
+        raise RuntimeError(
+            f"Country worker exited with code {exit_code} "
+            f"(country={country_code}, date={run_date.isoformat()})."
+        )
+
+    if bool(payload.get("ok", False)):
+        result = payload.get("result")
+        if isinstance(result, dict):
+            return result
+        raise RuntimeError(
+            f"Country worker returned invalid result payload type: {type(result).__name__}."
+        )
+
+    raise RuntimeError(str(payload.get("error", "Unknown country worker error.")))
 
 
 def _apply_quality_gate(
@@ -1035,21 +1124,27 @@ def main() -> None:
     country_status = _initial_country_status(country_codes)
     run_started_at = time.time()
     gate_failures: list[tuple[str, str]] = []
+    country_timeout_sec = max(
+        60,
+        int(os.getenv("COUNTRY_RUN_TIMEOUT_SEC", str(COUNTRY_RUN_TIMEOUT_SEC_DEFAULT))),
+    )
     max_workers = max(1, min(len(country_codes), 4))
     force_serial = len(country_codes) == 1
     mode_label = "serial" if force_serial else "parallel"
     print(
-        f"Starting {mode_label} batch: countries={','.join(country_codes)} | workers={1 if force_serial else max_workers}"
+        f"Starting {mode_label} batch: countries={','.join(country_codes)} | workers={1 if force_serial else max_workers} | "
+        f"country_timeout={country_timeout_sec}s"
     )
 
     if force_serial:
         country_code = country_codes[0]
         try:
-            result = _run_country_report(
+            result = _run_country_report_with_watchdog(
                 run_date=run_date,
                 config=config,
                 country_code=country_code,
                 output_dir_str=str(output_dir),
+                timeout_sec=country_timeout_sec,
             )
             successful_runs.append(result)
             country_status[country_code].update(
@@ -1095,11 +1190,12 @@ def main() -> None:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(
-                    _run_country_report,
-                    run_date,
-                    config,
-                    country_code,
-                    str(output_dir),
+                    _run_country_report_with_watchdog,
+                    run_date=run_date,
+                    config=config,
+                    country_code=country_code,
+                    output_dir_str=str(output_dir),
+                    timeout_sec=country_timeout_sec,
                 ): country_code
                 for country_code in country_codes
             }
