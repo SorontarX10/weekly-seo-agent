@@ -1892,6 +1892,14 @@ def collect_additional_context(
     eia_api_key: str = "",
 ) -> tuple[dict[str, Any], list[ExternalSignal]]:
     country_code = report_country_code.strip().upper() or "PL"
+    def _ctx_log(step: str, status: str, started_at: float | None = None, extra: str = "") -> None:
+        suffix = ""
+        if isinstance(started_at, (int, float)):
+            suffix += f" | duration={time.time() - float(started_at):.2f}s"
+        if extra.strip():
+            suffix += f" | {extra.strip()}"
+        print(f"[CTX][{country_code}][{step}] {status}{suffix}", flush=True)
+
     yoy_window = DateWindow(
         name="YoY aligned (52 weeks ago)",
         start=current_window.start - timedelta(weeks=52),
@@ -1922,6 +1930,10 @@ def collect_additional_context(
     }
     signals: list[ExternalSignal] = []
 
+    t0 = time.time()
+    _ctx_log("collect_additional_context", "START")
+
+    step_started = time.time()
     try:
         pagespeed: dict[str, Any] = {}
         pagespeed_source = ""
@@ -1978,7 +1990,9 @@ def collect_additional_context(
             )
         else:
             context["errors"].append(f"CrUX/PageSpeed fetch failed: {exc}")
+    _ctx_log("pagespeed", "DONE", started_at=step_started)
 
+    step_started = time.time()
     try:
         brand_context = _fetch_google_trends_brand_context(
             country_code=country_code,
@@ -2007,7 +2021,9 @@ def collect_additional_context(
                 )
     except Exception as exc:
         context["errors"].append(f"Google Trends brand fetch failed: {exc}")
+    _ctx_log("google_trends_brand", "DONE", started_at=step_started)
 
+    step_started = time.time()
     try:
         campaign_signals = _fetch_campaign_tracker_signals(
             since=previous_window.start,
@@ -2027,8 +2043,10 @@ def collect_additional_context(
         signals.extend(campaign_signals)
     except Exception as exc:
         context["errors"].append(f"Campaign tracker fetch failed: {exc}")
+    _ctx_log("campaign_tracker", "DONE", started_at=step_started)
 
     # Dedicated competitor promo radar (separate from generic campaign tracker).
+    step_started = time.time()
     try:
         market = _market_meta(country_code)
         country_terms = market["country_terms"]
@@ -2060,8 +2078,10 @@ def collect_additional_context(
         signals.extend(competitor_promo_signals)
     except Exception as exc:
         context["errors"].append(f"Competitor promo radar fetch failed: {exc}")
+    _ctx_log("competitor_promo_radar", "DONE", started_at=step_started)
 
     # Operational risk feed: logistics and payment disruptions.
+    step_started = time.time()
     try:
         market = _market_meta(country_code)
         country_terms = market["country_terms"]
@@ -2118,8 +2138,10 @@ def collect_additional_context(
         signals.extend(payment_signals)
     except Exception as exc:
         context["errors"].append(f"Operational risk fetch failed: {exc}")
+    _ctx_log("operational_risks", "DONE", started_at=step_started)
 
     # Country-level macro backdrop (annual, source of longer-term demand pressure).
+    step_started = time.time()
     try:
         macro_backdrop = _fetch_macro_backdrop(country_code=country_code)
         context["macro_backdrop"] = macro_backdrop
@@ -2154,7 +2176,9 @@ def collect_additional_context(
                 )
     except Exception as exc:
         context["errors"].append(f"Macro backdrop fetch failed: {exc}")
+    _ctx_log("macro_backdrop", "DONE", started_at=step_started)
 
+    step_started = time.time()
     if country_code == "PL":
         try:
             macro, macro_signals = _fetch_macro_context(
@@ -2173,7 +2197,9 @@ def collect_additional_context(
             "country_code": country_code,
             "note": "NBP/IMGW sources are PL-only and are skipped for this market.",
         }
+    _ctx_log("macro_country_specific", "DONE", started_at=step_started)
 
+    step_started = time.time()
     if market_events_enabled:
         market_context: dict[str, Any] = {
             "enabled": True,
@@ -2250,7 +2276,9 @@ def collect_additional_context(
             market_context.setdefault("errors", []).append(str(exc))
             context["errors"].append(f"Market event calendar fetch failed: {exc}")
         context["market_event_calendar"] = market_context
+    _ctx_log("market_event_calendar", "DONE", started_at=step_started)
 
+    step_started = time.time()
     if platform_pulse_enabled:
         try:
             pulse_rows = _fetch_platform_regulatory_pulse(
@@ -2289,7 +2317,9 @@ def collect_additional_context(
                 "errors": [str(exc)],
             }
             context["errors"].append(f"Platform/regulatory pulse fetch failed: {exc}")
+    _ctx_log("platform_regulatory_pulse", "DONE", started_at=step_started)
 
+    step_started = time.time()
     parallel_context_tasks: dict[Any, str] = {}
     with ThreadPoolExecutor(max_workers=3) as pool:
         parallel_context_tasks[
@@ -2350,8 +2380,10 @@ def collect_additional_context(
                     context["errors"].append(f"SERP case-study scanner failed: {exc}")
                 elif task_name == "free_public_source_hub":
                     context["errors"].append(f"Free public source hub fetch failed: {exc}")
+    _ctx_log("parallel_context_bundle", "DONE", started_at=step_started)
 
     # DuckDuckGo as fallback-only context source: run only when stronger sources are sparse.
+    step_started = time.time()
     stronger_signal_count = sum(
         1
         for row in signals
@@ -2407,7 +2439,9 @@ def collect_additional_context(
             "errors": [],
             "note": "Skipped by policy because stronger sources were available.",
         }
+    _ctx_log("duckduckgo_fallback", "DONE", started_at=step_started)
 
+    step_started = time.time()
     if seo_presentations_enabled and seo_presentations_folder_reference:
         try:
             presentations_client = SEOPresentationsClient(
@@ -2421,6 +2455,7 @@ def collect_additional_context(
             context["seo_presentations"] = seo_context
         except Exception as exc:
             context["errors"].append(f"SEO presentations fetch failed: {exc}")
+    _ctx_log("seo_presentations", "DONE", started_at=step_started)
 
     trend_context_requested = bool(
         product_trends_enabled
@@ -2440,6 +2475,7 @@ def collect_additional_context(
         or trend_context_requested
         or trade_plan_requested
     ) and google_drive_client_secret_path:
+        step_started = time.time()
         continuity_client = ContinuityClient(
             client_secret_path=google_drive_client_secret_path,
             token_path=google_drive_token_path,
@@ -2558,8 +2594,15 @@ def collect_additional_context(
                         context["errors"].append(f"Trade plan fetch failed: {errors[0]}")
             except Exception as exc:
                 context["errors"].append(f"Trade plan fetch failed: {exc}")
+        _ctx_log("continuity_bundle", "DONE", started_at=step_started)
 
     signals.sort(key=lambda row: (row.day, row.source), reverse=True)
+    _ctx_log(
+        "collect_additional_context",
+        "DONE",
+        started_at=t0,
+        extra=f"signals={len(signals)} errors={len(context.get('errors', []))}",
+    )
     return context, signals
 
 

@@ -87,6 +87,7 @@ AI_SECTION_TITLES = (
     "Segment Interpretation",
     "Continuity Check",
     "Further Analysis Flags",
+    "Cross-Source Dependency Map",
     "Status-Log Updates",
 )
 
@@ -98,6 +99,7 @@ REQUIRED_AI_SECTION_TITLES = (
     "Risks and Monitoring",
     "Continuity Check",
     "Further Analysis Flags",
+    "Cross-Source Dependency Map",
 )
 
 GAIA_MODEL_RUNTIME_FALLBACK = "gpt-4o"
@@ -1477,6 +1479,9 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
         "Further Analysis Flags": [
             "- Validate segment-level deltas (Page Name, brand/non-brand, device) against campaign timing and trade-plan overlap."
         ],
+        "Cross-Source Dependency Map": [
+            "- Dependency: GSC searchAppearance shifts -> CTR/position movement -> weekly clicks. Evidence: KPI and feature-split packets."
+        ],
     }
     for title in REQUIRED_AI_SECTION_TITLES:
         rows = section_map.get(title, [])
@@ -1689,6 +1694,7 @@ def _normalize_ai_commentary_markdown(commentary: str) -> str:
         "Risks and Monitoring": 4,
         "Continuity Check": 3,
         "Further Analysis Flags": 3,
+        "Cross-Source Dependency Map": 4,
     }
 
     rebuilt: list[str] = []
@@ -2281,8 +2287,7 @@ def _extract_key_data_packets(
     def _market_pack() -> dict[str, str]:
         data: dict[str, object] = {
             "policy_note": (
-                "Detailed trend/status/history/senuto blocks are used for hypothesis generation only "
-                "and intentionally excluded from direct narrative packets."
+                "All available source blocks are included for narrative grounding and cross-source dependency reasoning."
             ),
             "allegro_trends": _compact_ctx_rows(
                 additional_context.get("allegro_trends", {}) if isinstance(additional_context, dict) else {},
@@ -2363,6 +2368,26 @@ def _extract_key_data_packets(
             "serp_case_studies": _compact_ctx_rows(
                 additional_context.get("serp_case_studies", {}) if isinstance(additional_context, dict) else {},
                 top_n=12,
+            ),
+            "seo_presentations": _compact_ctx_rows(
+                additional_context.get("seo_presentations", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
+            ),
+            "historical_reports": _compact_ctx_rows(
+                additional_context.get("historical_reports", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
+            ),
+            "status_log": _compact_ctx_rows(
+                additional_context.get("status_log", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
+            ),
+            "product_trends": _compact_ctx_rows(
+                additional_context.get("product_trends", {}) if isinstance(additional_context, dict) else {},
+                top_n=12,
+            ),
+            "senuto_intelligence": _compact_ctx_rows(
+                additional_context.get("senuto_intelligence", {}) if isinstance(additional_context, dict) else {},
+                top_n=10,
             ),
         }
         payload = json.dumps(data, ensure_ascii=False, default=str)
@@ -3112,6 +3137,38 @@ def _generate_three_step_llm_commentary(
     feedback_block = "\n".join(
         f"- {note.strip()}" for note in (feedback_notes or []) if str(note).strip()
     ) or "- none"
+    additional_context = state.get("additional_context", {})
+    source_requirements: list[str] = []
+    if isinstance(additional_context, dict):
+        if bool((additional_context.get("gsc_feature_split", {}) or {}).get("enabled")):
+            source_requirements.append("GSC searchAppearance (SERP layout/feature shifts)")
+        if bool((additional_context.get("serp_case_studies", {}) or {}).get("enabled")):
+            source_requirements.append("SERP case-study scanner (13M)")
+        if bool((additional_context.get("seo_presentations", {}) or {}).get("enabled")):
+            source_requirements.append("SEO specialist weekly reports archive (Drive Docs/Slides, 13M)")
+        if bool((additional_context.get("trade_plan", {}) or {}).get("enabled")):
+            source_requirements.append("Trade plan")
+        if bool((additional_context.get("product_trends", {}) or {}).get("enabled")):
+            source_requirements.append("Product trends sheets")
+        if bool((additional_context.get("google_updates_timeline", {}) or {}).get("enabled")):
+            source_requirements.append("Google updates timeline (13M)")
+        if bool((additional_context.get("platform_regulatory_pulse", {}) or {}).get("enabled")):
+            source_requirements.append("Platform/regulatory pulse")
+        if bool((additional_context.get("weekly_news_digest", {}) or {}).get("enabled")):
+            source_requirements.append("Weekly SEO/GEO news digest")
+        if bool((additional_context.get("weather_forecast", {}) or {}).get("enabled")):
+            source_requirements.append("Weather context")
+        if bool((additional_context.get("senuto_intelligence", {}) or {}).get("enabled")):
+            source_requirements.append("Senuto intelligence")
+        if bool((additional_context.get("historical_reports", {}) or {}).get("enabled")):
+            source_requirements.append("Historical continuity reports")
+        if bool((additional_context.get("status_log", {}) or {}).get("enabled")):
+            source_requirements.append("Status log updates")
+    source_requirements_text = (
+        "\n".join(f"- {item}" for item in source_requirements)
+        if source_requirements
+        else "- No additional source requirements detected."
+    )
 
     # Step 2: run multiple focused LLM summaries over compressed packets.
     map_prompt = ChatPromptTemplate.from_messages(
@@ -3267,6 +3324,7 @@ Output constraints:
 - `### Risks and Monitoring`
 - `### Continuity Check`
 - `### Further Analysis Flags`
+ - `### Cross-Source Dependency Map`
 3. Use concise `-` bullets under each heading.
 4. In `### Evidence by Source`, add one compact markdown table after bullets with columns:
    `| Source | Evidence signal | Why it matters |`.
@@ -3287,7 +3345,10 @@ Output constraints:
     - one YoY statement about search-result-type shifts,
     - one explicit impact chain: listing/feature shift -> impressions/CTR/position -> clicks.
 18. Remove repetition: do not restate the same metric or causal claim across multiple sections.
-""".strip(),
+19. In `### Cross-Source Dependency Map`, provide at least 3 bullets in format:
+    `- Dependency: [Source A] -> [Source B] -> [Business effect]. Evidence: ... Confidence: x/100.`
+20. Every source listed in "Required source coverage" below must appear at least once in narrative or dependency map.
+	""".strip(),
             ),
             (
                 "user",
@@ -3295,6 +3356,9 @@ Output constraints:
 Create final narrative by merging the compressed packet summaries below.
 Validator feedback to address (if any):
 {feedback}
+
+Required source coverage:
+{required_source_coverage}
 
 <compressed_packet_summaries>
 {compressed_packet_summaries}
@@ -3306,6 +3370,7 @@ Validator feedback to address (if any):
     reduce_chain = reduce_prompt | llm | StrOutputParser()
     reduce_payload = {
         "feedback": feedback_block,
+        "required_source_coverage": source_requirements_text,
         "compressed_packet_summaries": "\n\n".join(partial_summaries),
     }
     cached_reduce = _cache_load_json(
@@ -3476,6 +3541,8 @@ def _run_rule_based_report_checks(report_text: str) -> list[str]:
         issues.append("[high] Missing `### Evidence by Source` section in narrative.")
     if "### Priority Actions for This Week" not in report_text:
         issues.append("[medium] Missing `### Priority Actions for This Week` section in narrative.")
+    if "### Cross-Source Dependency Map" not in report_text:
+        issues.append("[high] Missing `### Cross-Source Dependency Map` section in narrative.")
 
     # Data consistency heuristics.
     if "## KPI summary" in report_text and "## Main deltas" in report_text:
@@ -3514,6 +3581,14 @@ def _run_rule_based_report_checks(report_text: str) -> list[str]:
         )
         if not has_quant:
             issues.append("[high] SERP/listings section lacks quantified WoW/MoM/YoY evidence.")
+
+    lowered = report_text.lower()
+    if not re.search(r"serp case-study scanner|serp case studies|case-study benchmark", lowered):
+        issues.append("[high] Missing explicit SERP case-study impact context in narrative.")
+    if not re.search(r"seo specialist weekly reports|seo weekly reports archive|seo team presentations", lowered):
+        issues.append("[high] Missing explicit SEO specialist archive insights in narrative.")
+    if not re.search(r"searchappearance|merchant_listings|product_snippets|listing-surface", lowered):
+        issues.append("[high] Missing explicit SERP layout/listing impact evidence in narrative.")
 
     return issues[:20]
 

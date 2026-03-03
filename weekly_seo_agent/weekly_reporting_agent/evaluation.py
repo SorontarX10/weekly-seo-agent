@@ -10,6 +10,12 @@ REQUIRED_SECTIONS = (
     "Confirmed vs hypothesis",
 )
 
+REQUIRED_CROSS_SOURCE_MARKERS = (
+    "cross-source dependency map",
+    "serp case-study scanner",
+    "seo specialist weekly reports",
+)
+
 HYPOTHESIS_MARKERS = (
     "falsifier",
     "validation metric",
@@ -446,6 +452,17 @@ def _evaluate_structure_and_actions(report_text: str) -> dict[str, Any]:
         score -= 10
         issues.append(f"YoY coverage is too limited ({yoy_mentions} mentions).")
 
+    missing_cross_source = [
+        marker for marker in REQUIRED_CROSS_SOURCE_MARKERS if marker not in text_lower
+    ]
+    if missing_cross_source:
+        score -= 12
+        issues.append(
+            "Cross-source reasoning coverage is incomplete (missing: "
+            + ", ".join(missing_cross_source)
+            + ")."
+        )
+
     score = max(0, min(100, score))
     return {
         "score": score,
@@ -454,6 +471,7 @@ def _evaluate_structure_and_actions(report_text: str) -> dict[str, Any]:
             "has_governance_section": has_governance,
             "action_marker_hits": action_marker_hits,
             "yoy_mentions": yoy_mentions,
+            "missing_cross_source_markers": missing_cross_source,
             "missing_required_sections": missing_required_sections,
             "required_sections_ok": not missing_required_sections,
         },
