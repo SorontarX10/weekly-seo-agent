@@ -129,7 +129,38 @@ jobs:
       - name: Run weekly report agent
         if: github.event_name == 'workflow_dispatch' || steps.gate.outputs.should_run == 'true'
         run: |
-          weekly-seo-agent
+          set -euo pipefail
+          report_glob="SEO Weekly Reports/*_seo_weekly_report.docx"
+          attempt=1
+          max_attempts=3
+          run_ok=0
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "Starting weekly-seo-agent attempt ${attempt}/${max_attempts}..."
+            if weekly-seo-agent; then
+              run_ok=1
+              break
+            fi
+            echo "weekly-seo-agent failed on attempt ${attempt}/${max_attempts}."
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              sleep_seconds=$((attempt * 45))
+              echo "Retrying in ${sleep_seconds}s..."
+              sleep "$sleep_seconds"
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          if [ "$run_ok" -ne 1 ]; then
+            echo "weekly-seo-agent failed after ${max_attempts} attempts."
+            exit 1
+          fi
+
+          shopt -s nullglob
+          reports=( $report_glob )
+          if [ "${#reports[@]}" -eq 0 ]; then
+            echo "Run completed but no report DOCX files were generated in 'SEO Weekly Reports'."
+            exit 1
+          fi
+          echo "Generated ${#reports[@]} report file(s)."
 
       - name: Evaluate generated reports (quality gate)
         if: github.event_name == 'workflow_dispatch' || steps.gate.outputs.should_run == 'true'
